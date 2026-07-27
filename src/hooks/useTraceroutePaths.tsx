@@ -10,10 +10,8 @@
  * selectedNodeTraceroute useMemo blocks in App.tsx.
  */
 
-import React, { useMemo, useState } from 'react';
-import { Popup } from 'react-leaflet';
+import React, { useMemo } from 'react';
 import { DraggablePopup } from '../components/DraggablePopup';
-import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
 import { calculateDistance, formatDistance } from '../utils/distance';
 import { getSegmentSnrOpacity, weightByUsage, tracerouteSegmentWeight, type SnrColorScale } from '../utils/mapHelpers';
 import {
@@ -28,110 +26,10 @@ import {
   type TracerouteRenderSegment,
 } from '../utils/tracerouteSegments';
 import { TraceroutePathsLayer } from '../components/map/layers/TraceroutePathsLayer';
+import RouteSegmentPopup from '../components/map/popups/RouteSegmentPopup';
 import { darkOverlayColors } from '../config/overlayColors';
 import { logger } from '../utils/logger';
 import type { DistanceUnit } from '../contexts/SettingsContext';
-
-/** Small component for route segment SNR chart with time-of-day / chronological toggle */
-function SegmentSnrChart({ chartData }: {
-  chartData: Array<{ timeDecimal: number; timeLabel: string; snr: number; fullTimestamp: number }>;
-}) {
-  const [mode, setMode] = useState<'timeOfDay' | 'chronological'>('timeOfDay');
-
-  const chronoData = useMemo(() =>
-    [...chartData].sort((a, b) => a.fullTimestamp - b.fullTimestamp).map(d => {
-      const date = new Date(d.fullTimestamp);
-      const month = (date.getMonth() + 1).toString().padStart(2, '0');
-      const day = date.getDate().toString().padStart(2, '0');
-      const hours = date.getHours().toString().padStart(2, '0');
-      const minutes = date.getMinutes().toString().padStart(2, '0');
-      return { ...d, chronoLabel: `${month}/${day} ${hours}:${minutes}`, chronoTime: d.fullTimestamp };
-    }), [chartData]);
-
-  return (
-    <div className="snr-timeline-chart">
-      <div style={{ display: 'flex', gap: '4px', marginBottom: '6px' }}>
-        <button
-          className={`node-popup-tab ${mode === 'timeOfDay' ? 'active' : ''}`}
-          style={{ fontSize: '10px', padding: '2px 8px', border: '1px solid var(--ctp-surface2)', borderRadius: '4px', cursor: 'pointer', background: mode === 'timeOfDay' ? 'var(--ctp-blue)' : 'var(--ctp-surface0)', color: mode === 'timeOfDay' ? 'var(--ctp-base)' : 'var(--ctp-subtext1)' }}
-          onClick={e => { e.stopPropagation(); setMode('timeOfDay'); }}
-        >
-          Time of Day
-        </button>
-        <button
-          className={`node-popup-tab ${mode === 'chronological' ? 'active' : ''}`}
-          style={{ fontSize: '10px', padding: '2px 8px', border: '1px solid var(--ctp-surface2)', borderRadius: '4px', cursor: 'pointer', background: mode === 'chronological' ? 'var(--ctp-blue)' : 'var(--ctp-surface0)', color: mode === 'chronological' ? 'var(--ctp-base)' : 'var(--ctp-subtext1)' }}
-          onClick={e => { e.stopPropagation(); setMode('chronological'); }}
-        >
-          Over Time
-        </button>
-      </div>
-      <ResponsiveContainer width="100%" height={150}>
-        {mode === 'timeOfDay' ? (
-          <LineChart data={chartData} margin={{ top: 10, right: 10, left: -20, bottom: 5 }}>
-            <CartesianGrid strokeDasharray="3 3" stroke="var(--ctp-surface2)" />
-            <XAxis
-              dataKey="timeDecimal"
-              type="number"
-              domain={[0, 24]}
-              ticks={[0, 6, 12, 18, 24]}
-              tickFormatter={value => {
-                const hours = Math.floor(value);
-                const minutes = Math.round((value - hours) * 60);
-                return `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}`;
-              }}
-              tick={{ fill: 'var(--ctp-subtext1)', fontSize: 10 }}
-              stroke="var(--ctp-surface2)"
-            />
-            <YAxis
-              tick={{ fill: 'var(--ctp-subtext1)', fontSize: 10 }}
-              stroke="var(--ctp-surface2)"
-              label={{ value: 'SNR (dB)', angle: -90, position: 'insideLeft', style: { fill: 'var(--ctp-subtext1)', fontSize: 10 } }}
-            />
-            <Tooltip
-              contentStyle={{ backgroundColor: 'var(--ctp-surface0)', border: '1px solid var(--ctp-surface2)', borderRadius: '4px', fontSize: '12px' }}
-              labelStyle={{ color: 'var(--ctp-text)' }}
-              labelFormatter={value => {
-                const item = chartData.find(d => d.timeDecimal === value);
-                return item ? item.timeLabel : String(value);
-              }}
-            />
-            <Line type="monotone" dataKey="snr" stroke="var(--ctp-mauve)" strokeWidth={2} dot={{ fill: 'var(--ctp-mauve)', r: 3 }} />
-          </LineChart>
-        ) : (
-          <LineChart data={chronoData} margin={{ top: 10, right: 10, left: -20, bottom: 5 }}>
-            <CartesianGrid strokeDasharray="3 3" stroke="var(--ctp-surface2)" />
-            <XAxis
-              dataKey="chronoTime"
-              type="number"
-              domain={['dataMin', 'dataMax']}
-              tickFormatter={value => {
-                const date = new Date(value);
-                return `${(date.getMonth() + 1).toString().padStart(2, '0')}/${date.getDate().toString().padStart(2, '0')}`;
-              }}
-              tick={{ fill: 'var(--ctp-subtext1)', fontSize: 10 }}
-              stroke="var(--ctp-surface2)"
-            />
-            <YAxis
-              tick={{ fill: 'var(--ctp-subtext1)', fontSize: 10 }}
-              stroke="var(--ctp-surface2)"
-              label={{ value: 'SNR (dB)', angle: -90, position: 'insideLeft', style: { fill: 'var(--ctp-subtext1)', fontSize: 10 } }}
-            />
-            <Tooltip
-              contentStyle={{ backgroundColor: 'var(--ctp-surface0)', border: '1px solid var(--ctp-surface2)', borderRadius: '4px', fontSize: '12px' }}
-              labelStyle={{ color: 'var(--ctp-text)' }}
-              labelFormatter={value => {
-                const item = chronoData.find(d => d.chronoTime === value);
-                return item ? item.chronoLabel : String(value);
-              }}
-            />
-            <Line type="monotone" dataKey="snr" stroke="var(--ctp-mauve)" strokeWidth={2} dot={{ fill: 'var(--ctp-mauve)', r: 3 }} />
-          </LineChart>
-        )}
-      </ResponsiveContainer>
-    </div>
-  );
-}
 
 /**
  * Minimal node data needed for traceroute rendering
@@ -509,8 +407,8 @@ export function useTraceroutePaths({
     const nodeByNum = new Map<number, NodePositionDigest>();
     for (const n of nodesPositionDigest) nodeByNum.set(n.nodeNum, n);
 
-    // Popup content (recharts SegmentSnrChart moves in verbatim) — a single
-    // render-prop reading hop identity straight off the segment.
+    // Shared popup content — this surface supplies the existing interactive
+    // node/route callbacks, while Dashboard uses the same component read-only.
     const renderBasePopup = (seg: TracerouteRenderSegment): React.ReactNode => {
       const nodeNum1 = seg.fromNodeNum;
       const nodeNum2 = seg.toNodeNum;
@@ -528,7 +426,6 @@ export function useTraceroutePaths({
           ? '(unknown)'
           : node2?.user?.longName || node2?.user?.shortName || `!${nodeNum2.toString(16)}`;
 
-      // Calculate distance if both nodes have position data
       let segmentDistanceKm = 0;
       if (
         node1?.position?.latitude &&
@@ -544,167 +441,51 @@ export function useTraceroutePaths({
         );
       }
 
-      // Calculate SNR statistics
-      const snrData = seg.snrSamples ?? [];
-      let snrStats: { min: string; max: string; avg: string; count: number } | null = null;
-      let chartData: Array<{
-        timeDecimal: number;
-        timeLabel: string;
-        snr: number;
-        fullTimestamp: number;
-      }> | null = null;
-
-      if (snrData.length > 0) {
-        const snrValues = snrData.map(d => d.snr);
-        const minSNR = Math.min(...snrValues);
-        const maxSNR = Math.max(...snrValues);
-        const avgSNR = snrValues.reduce((sum, val) => sum + val, 0) / snrValues.length;
-        snrStats = {
-          min: minSNR.toFixed(1),
-          max: maxSNR.toFixed(1),
-          avg: avgSNR.toFixed(1),
-          count: snrData.length,
-        };
-
-        // Prepare chart data for 3+ samples (sorted by time of day). Every
-        // base-layer sample is pushed with a timestamp (see the aggregation
-        // loop above) — the `?? 0` only satisfies `snrSamples`' structurally
-        // optional `timestamp` field (shared across all `TracerouteRenderSegment`
-        // consumers, some of which don't always have one).
-        if (snrData.length >= 3) {
-          chartData = snrData
-            .map(d => {
-              const ts = d.timestamp ?? 0;
-              const date = new Date(ts);
-              const hours = date.getHours();
-              const minutes = date.getMinutes();
-              // Convert to decimal hours (0-24) for continuous time axis
-              const timeDecimal = hours + minutes / 60;
-              return {
-                timeDecimal,
-                timeLabel: `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}`,
-                snr: parseFloat(d.snr.toFixed(1)),
-                fullTimestamp: ts,
-              };
-            })
-            .sort((a, b) => a.timeDecimal - b.timeDecimal);
-        }
-      }
-
       return (
-        <Popup>
-          <div className="route-popup">
-            <h4>Route Segment</h4>
-            {isMqttSegment && (
-              <div className="mqtt-badge">via IP</div>
-            )}
-            <div className="route-endpoints">
-              <strong
-                className={node1?.user?.id ? 'route-node-link' : undefined}
-                onClick={e => {
-                  e.stopPropagation();
-                  const freshNode = nodesPositionDigest.find(n => n.nodeNum === nodeNum1);
-                  if (freshNode?.user?.id && freshNode?.position?.latitude && freshNode?.position?.longitude) {
+        <RouteSegmentPopup
+          segment={seg}
+          fromName={node1Name}
+          toName={node2Name}
+          distanceKm={segmentDistanceKm}
+          distanceUnit={distanceUnit}
+          usageCount={usage}
+          isMqtt={isMqttSegment}
+          onFromNodeClick={
+            node1?.user?.id
+              ? () => {
+                  const freshNode = nodesPositionDigest.find((node) => node.nodeNum === nodeNum1);
+                  if (
+                    freshNode?.user?.id &&
+                    freshNode?.position?.latitude &&
+                    freshNode?.position?.longitude
+                  ) {
                     callbacks.onSelectNode(freshNode.user.id, [
                       freshNode.position.latitude,
                       freshNode.position.longitude,
                     ]);
                   }
-                }}
-                title={node1?.user?.id ? 'Click to select and center on this node' : ''}
-              >
-                {node1Name}
-              </strong>
-              {' ↔ '}
-              <strong
-                className={node2?.user?.id ? 'route-node-link' : undefined}
-                onClick={e => {
-                  e.stopPropagation();
-                  const freshNode = nodesPositionDigest.find(n => n.nodeNum === nodeNum2);
-                  if (freshNode?.user?.id && freshNode?.position?.latitude && freshNode?.position?.longitude) {
+                }
+              : undefined
+          }
+          onToNodeClick={
+            node2?.user?.id
+              ? () => {
+                  const freshNode = nodesPositionDigest.find((node) => node.nodeNum === nodeNum2);
+                  if (
+                    freshNode?.user?.id &&
+                    freshNode?.position?.latitude &&
+                    freshNode?.position?.longitude
+                  ) {
                     callbacks.onSelectNode(freshNode.user.id, [
                       freshNode.position.latitude,
                       freshNode.position.longitude,
                     ]);
                   }
-                }}
-                title={node2?.user?.id ? 'Click to select and center on this node' : ''}
-              >
-                {node2Name}
-              </strong>
-            </div>
-            <div className="route-usage">
-              Used in{' '}
-              <strong
-                onClick={e => {
-                  e.stopPropagation();
-                  callbacks.onSelectRouteSegment(nodeNum1, nodeNum2);
-                }}
-                style={{ cursor: 'pointer', color: 'var(--ctp-blue)', textDecoration: 'underline' }}
-                title="Click to view all traceroutes using this segment"
-              >
-                {usage}
-              </strong>{' '}
-              traceroute{usage !== 1 ? 's' : ''}
-            </div>
-            {segmentDistanceKm > 0 && (
-              <div className="route-usage">
-                Distance: <strong>{formatDistance(segmentDistanceKm, distanceUnit)}</strong>
-              </div>
-            )}
-            {snrStats && (
-              <div className="route-snr-stats">
-                {snrStats.count === 1 ? (
-                  <>
-                    <h5>SNR:</h5>
-                    <div className="snr-stat-row">
-                      <span className="stat-value">{snrStats.min} dB</span>
-                    </div>
-                  </>
-                ) : snrStats.count === 2 ? (
-                  <>
-                    <h5>SNR Statistics:</h5>
-                    <div className="snr-stat-row">
-                      <span className="stat-label">Min:</span>
-                      <span className="stat-value">{snrStats.min} dB</span>
-                    </div>
-                    <div className="snr-stat-row">
-                      <span className="stat-label">Max:</span>
-                      <span className="stat-value">{snrStats.max} dB</span>
-                    </div>
-                    <div className="snr-stat-row">
-                      <span className="stat-label">Samples:</span>
-                      <span className="stat-value">{snrStats.count}</span>
-                    </div>
-                  </>
-                ) : (
-                  <>
-                    <h5>SNR Statistics:</h5>
-                    <div className="snr-stat-row">
-                      <span className="stat-label">Min:</span>
-                      <span className="stat-value">{snrStats.min} dB</span>
-                    </div>
-                    <div className="snr-stat-row">
-                      <span className="stat-label">Max:</span>
-                      <span className="stat-value">{snrStats.max} dB</span>
-                    </div>
-                    <div className="snr-stat-row">
-                      <span className="stat-label">Average:</span>
-                      <span className="stat-value">{snrStats.avg} dB</span>
-                    </div>
-                    <div className="snr-stat-row">
-                      <span className="stat-label">Samples:</span>
-                      <span className="stat-value">{snrStats.count}</span>
-                    </div>
-                    {chartData && (
-                      <SegmentSnrChart chartData={chartData} />
-                    )}
-                  </>
-                )}
-              </div>
-            )}
-          </div>
-        </Popup>
+                }
+              : undefined
+          }
+          onUsageClick={() => callbacks.onSelectRouteSegment(nodeNum1, nodeNum2)}
+        />
       );
     };
 

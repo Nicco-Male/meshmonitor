@@ -53,9 +53,11 @@ import { useCsrfFetch } from '../../hooks/useCsrfFetch';
 import { BaseMap } from '../map/BaseMap';
 import { MapLoadingOverlay } from '../map/MapLoadingOverlay';
 import { TraceroutePathsLayer } from '../map/layers/TraceroutePathsLayer';
+import RouteSegmentPopup from '../map/popups/RouteSegmentPopup';
 import { NeighborLinksLayer, type NeighborLinkDescriptor } from '../map/layers/NeighborLinksLayer';
 import { AccuracyRegionsLayer, type AccuracyRegionDescriptor } from '../map/layers/AccuracyRegionsLayer';
 import { snrToNeighborOpacity, dedupByUnorderedPair } from '../../utils/neighborLinks';
+import { calculateDistance } from '../../utils/distance';
 import { UiIcon } from '../icons';
 import {
   parseSnapshotRoutePositions,
@@ -95,6 +97,30 @@ export interface DashboardMapProps {
    * Defaults to false so existing callers/tests are unaffected.
    */
   isLoading?: boolean;
+}
+
+interface DashboardTraceroutePopupAggregate {
+  sourceId: string | null;
+  usageCount: number;
+  snrSamples: Array<{ snr: number; timestamp?: number }>;
+  hasMqtt: boolean;
+  latestTimestamp: number | null;
+}
+
+interface DashboardTracerouteRenderSegment extends TracerouteRenderSegment {
+  popupAggregate: DashboardTraceroutePopupAggregate;
+}
+
+interface PendingDashboardTracerouteSegment extends TracerouteRenderSegment {
+  popupAggregateKey: string;
+}
+
+interface DashboardTraceroutePopupAccumulator {
+  sourceId: string | null;
+  traceIds: Set<string>;
+  snrSamples: Array<{ snr: number; timestamp?: number }>;
+  hasMqtt: boolean;
+  latestTimestamp: number | null;
 }
 
 /** Extract lat/lng from a node — handles both flat (API) and nested (position) shapes. */
@@ -168,6 +194,7 @@ export default function DashboardMap({
     defaultMapCenterLat,
     defaultMapCenterLon,
     defaultMapCenterZoom,
+    distanceUnit,
   } = useSettings();
 
   // A Default Map Center is only "configured" when all three parts are set.
@@ -429,25 +456,34 @@ export default function DashboardMap({
   // traceroute's own key is prefixed onto the util's per-hop key
   // (`"forward:123-456"`) since multiple traceroute records can repeat the
   // same node pair and the util itself only decomposes one record at a time.
-  const tracerouteRenderSegments = useMemo<TracerouteRenderSegment[]>(() => {
+  const tracerouteRenderSegments = useMemo<DashboardTracerouteRenderSegment[]>(() => {
     if (!showPaths && !showRoute) return [];
     // Map Features age slider (#3322): hide traceroutes/route segments older
     // than the chosen age. Default (slider at max) keeps the prior behavior.
     const trCutoffMs = Date.now() - effectiveMaxAge * 60 * 60 * 1000;
-    const segs: TracerouteRenderSegment[] = [];
-    for (const tr of (traceroutes ?? [])) {
+    const pendingSegments: PendingDashboardTracerouteSegment[] = [];
+    const popupAggregates = new Map<string, DashboardTraceroutePopupAccumulator>();
+
+    for (const [trIndex, tr] of (traceroutes ?? []).entries()) {
       const trTimestamp = Number(tr?.timestamp ?? tr?.createdAt ?? 0);
       if (trTimestamp && trTimestamp < trCutoffMs) continue;
       const fromNum = Number(tr?.fromNodeNum);
       const toNum = Number(tr?.toNodeNum);
       if (!Number.isFinite(fromNum) || !Number.isFinite(toNum)) continue;
+      const traceSourceId =
+        typeof tr?.sourceId === 'string' && tr.sourceId.length > 0
+          ? tr.sourceId
+          : !isUnified && sourceId
+            ? sourceId
+            : null;
+      const traceIdentity = String(tr?.id ?? tr?.packetId ?? trIndex);
       const snapshot = parseSnapshotRoutePositions(tr?.routePositions);
       // #4162: gate on the rendered-marker map (`positionByNodeNum` is built
       // from `nodesWithPosition`, which excludes hidden/aged nodes) so route
       // segments never dangle to a node that has no marker.
       const resolvePosition = (nodeNum: number): [number, number] | null =>
         resolveSegmentPosition(nodeNum, snapshot, positionByNodeNum, true);
-      const keyPrefix = `tr-${tr.sourceId ?? 'x'}-${tr.id}`;
+      const keyPrefix = `tr-${traceSourceId ?? 'x'}-${traceIdentity}`;
       const decomposed = decomposeTraceroute(
         {
           fromNodeNum: fromNum,
@@ -462,11 +498,120 @@ export default function DashboardMap({
         { resolvePosition },
       );
       for (const seg of decomposed) {
-        segs.push({ ...seg, key: `${keyPrefix}-${seg.key}` });
+        const lowNodeNum = Math.min(seg.fromNodeNum, seg.toNodeNum);
+        const highNodeNum = Math.max(seg.fromNodeNum, seg.toNodeNum);
+        // Source is part of the aggregate key: Unified popups must never mix
+        // observations from different radios for the same physical node pair.
+        const popupAggregateKey = `${traceSourceId ?? 'legacy'}:${lowNodeNum}:${highNodeNum}`;
+        let aggregate = popupAggregates.get(popupAggregateKey);
+        if (!aggregate) {
+          aggregate = {
+            sourceId: traceSourceId,
+            traceIds: new Set<string>(),
+            snrSamples: [],
+            hasMqtt: false,
+            latestTimestamp: null,
+          };
+          popupAggregates.set(popupAggregateKey, aggregate);
+        }
+
+        aggregate.traceIds.add(traceIdentity);
+        if (seg.avgSnr !== null && Number.isFinite(seg.avgSnr)) {
+          aggregate.snrSamples.push({
+            snr: seg.avgSnr,
+            timestamp: trTimestamp > 0 ? trTimestamp : undefined,
+          });
+        }
+        aggregate.hasMqtt ||= seg.isMqtt;
+        if (
+          trTimestamp > 0 &&
+          (aggregate.latestTimestamp == null || trTimestamp > aggregate.latestTimestamp)
+        ) {
+          aggregate.latestTimestamp = trTimestamp;
+        }
+
+        pendingSegments.push({
+          ...seg,
+          key: `${keyPrefix}-${seg.key}`,
+          popupAggregateKey,
+        });
       }
     }
-    return segs;
-  }, [traceroutes, positionByNodeNum, showPaths, showRoute, effectiveMaxAge]);
+
+    return pendingSegments.map(({ popupAggregateKey, ...segment }) => {
+      const aggregate = popupAggregates.get(popupAggregateKey);
+      return {
+        ...segment,
+        popupAggregate: {
+          sourceId: aggregate?.sourceId ?? null,
+          usageCount: aggregate?.traceIds.size ?? 1,
+          snrSamples: aggregate?.snrSamples ?? [],
+          hasMqtt: aggregate?.hasMqtt ?? segment.isMqtt,
+          latestTimestamp: aggregate?.latestTimestamp ?? null,
+        },
+      };
+    });
+  }, [
+    traceroutes,
+    positionByNodeNum,
+    showPaths,
+    showRoute,
+    effectiveMaxAge,
+    isUnified,
+    sourceId,
+  ]);
+
+  const tracerouteNodeNameByNum = new Map<number, string>();
+  for (const { node } of nodesWithPosition) {
+    if (typeof node?.nodeNum !== 'number') continue;
+    tracerouteNodeNameByNum.set(
+      node.nodeNum,
+      node.longName ??
+        node.user?.longName ??
+        node.shortName ??
+        node.user?.shortName ??
+        `!${node.nodeNum.toString(16)}`,
+    );
+  }
+
+  const renderDashboardTraceroutePopup = (segment: TracerouteRenderSegment) => {
+    const dashboardSegment = segment as DashboardTracerouteRenderSegment;
+    const { popupAggregate } = dashboardSegment;
+    const fromName =
+      tracerouteNodeNameByNum.get(segment.fromNodeNum) ??
+      (segment.fromNodeNum === 0xffffffff
+        ? '(unknown)'
+        : `!${segment.fromNodeNum.toString(16)}`);
+    const toName =
+      tracerouteNodeNameByNum.get(segment.toNodeNum) ??
+      (segment.toNodeNum === 0xffffffff
+        ? '(unknown)'
+        : `!${segment.toNodeNum.toString(16)}`);
+    const distanceKm = calculateDistance(
+      segment.from[0],
+      segment.from[1],
+      segment.to[0],
+      segment.to[1],
+    );
+    const popupSourceName = popupAggregate.sourceId
+      ? sourceNameById.get(popupAggregate.sourceId) ?? popupAggregate.sourceId
+      : null;
+
+    return (
+      <RouteSegmentPopup
+        segment={segment}
+        fromName={fromName}
+        toName={toName}
+        distanceKm={distanceKm}
+        distanceUnit={distanceUnit}
+        usageCount={popupAggregate.usageCount}
+        snrSamples={popupAggregate.snrSamples}
+        isMqtt={popupAggregate.hasMqtt}
+        sourceName={popupSourceName}
+        lastSeen={popupAggregate.latestTimestamp}
+      />
+    );
+  };
 
   const hasNodes = nodesWithPosition.length > 0;
 
@@ -676,6 +821,7 @@ export default function DashboardMap({
             weight={2}
             opacity={0.85}
             dashMode="mqtt-unknown"
+            renderPopup={renderDashboardTraceroutePopup}
           />
         )}
 
@@ -690,6 +836,7 @@ export default function DashboardMap({
             weight={4}
             opacity={0.6}
             dashMode="never"
+            renderPopup={renderDashboardTraceroutePopup}
           />
         )}
 

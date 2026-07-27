@@ -3,7 +3,7 @@
  */
 import { useEffect, useRef } from 'react';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen, fireEvent } from '@testing-library/react';
+import { render, screen, fireEvent, within } from '@testing-library/react';
 import DashboardMap from './DashboardMap';
 import { darkOverlayColors } from '../../config/overlayColors';
 
@@ -18,7 +18,22 @@ const mocks = vi.hoisted(() => ({
     defaultMapCenterLat: null as number | null,
     defaultMapCenterLon: null as number | null,
     defaultMapCenterZoom: null as number | null,
+    distanceUnit: 'km' as 'km' | 'mi',
   },
+  mapContext: {
+    showPaths: false,
+    showRoute: false,
+    showAccuracyRegions: false,
+    showRfNodes: true,
+    showUdpNodes: true,
+    showMqttNodes: true,
+    showNeighborInfo: true,
+    showWaypoints: false,
+    showAtakContacts: false,
+    showPolarGrid: false,
+    mapMaxAgeHours: null as number | null,
+  },
+  sources: [] as Array<{ id: string; name: string; type: string }>,
 }));
 
 // ---------------------------------------------------------------------------
@@ -57,8 +72,14 @@ vi.mock('react-leaflet', () => ({
   // #4042: expose resolved positions so tests can assert a neighbor line
   // terminates at a node's rendered marker position (not the link's raw
   // embedded lat/lng) — mirrors NeighborLinksLayer.test.tsx's mock.
-  Polyline: ({ positions }: any) => (
-    <div data-testid="map-polyline" data-positions={JSON.stringify(positions)} />
+  Polyline: ({ positions, pathOptions, children }: any) => (
+    <div
+      data-testid="map-polyline"
+      data-positions={JSON.stringify(positions)}
+      data-color={pathOptions?.color}
+    >
+      {children}
+    </div>
   ),
   Rectangle: () => <div data-testid="map-rectangle" />,
   useMap: () => ({ fitBounds: mocks.fitBounds, setView: vi.fn() }),
@@ -70,24 +91,18 @@ vi.mock('react-leaflet', () => ({
 // filtering doesn't drop existing fixture nodes), traceroute/accuracy off.
 vi.mock('../../contexts/MapContext', () => ({
   useMapContext: () => ({
-    showPaths: false,
+    ...mocks.mapContext,
     setShowPaths: vi.fn(),
-    showRoute: false,
     setShowRoute: vi.fn(),
-    showAccuracyRegions: false,
     setShowAccuracyRegions: vi.fn(),
-    showRfNodes: true,
     setShowRfNodes: vi.fn(),
-    showUdpNodes: true,
     setShowUdpNodes: vi.fn(),
-    showMqttNodes: true,
     setShowMqttNodes: vi.fn(),
-    showNeighborInfo: true,
     setShowNeighborInfo: vi.fn(),
-    showWaypoints: false,
     setShowWaypoints: vi.fn(),
-    showPolarGrid: false,
+    setShowAtakContacts: vi.fn(),
     setShowPolarGrid: vi.fn(),
+    setMapMaxAgeHours: vi.fn(),
   }),
 }));
 
@@ -96,7 +111,7 @@ vi.mock('../../contexts/MapContext', () => ({
 // without a QueryClient/AuthProvider; empty data ⇒ no grid, existing assertions
 // (marker/polyline counts) are unaffected.
 vi.mock('../../hooks/useDashboardData', () => ({
-  useDashboardSources: () => ({ data: [] }),
+  useDashboardSources: () => ({ data: mocks.sources }),
   useSourceStatuses: () => new Map(),
   UNIFIED_SOURCE_ID: '__unified__',
 }));
@@ -308,6 +323,21 @@ describe('DashboardMap', () => {
     mocks.settings.defaultMapCenterLat = null;
     mocks.settings.defaultMapCenterLon = null;
     mocks.settings.defaultMapCenterZoom = null;
+    mocks.settings.distanceUnit = 'km';
+    Object.assign(mocks.mapContext, {
+      showPaths: false,
+      showRoute: false,
+      showAccuracyRegions: false,
+      showRfNodes: true,
+      showUdpNodes: true,
+      showMqttNodes: true,
+      showNeighborInfo: true,
+      showWaypoints: false,
+      showAtakContacts: false,
+      showPolarGrid: false,
+      mapMaxAgeHours: null,
+    });
+    mocks.sources = [];
   });
 
   // --- Default Map Center vs auto-fit (issue #4125) ---------------------------
@@ -557,6 +587,188 @@ describe('DashboardMap', () => {
     );
     const markers = screen.getAllByTestId('map-marker');
     expect(markers.length).toBe(1);
+  });
+
+  // --- Dashboard traceroute popups -------------------------------------------
+
+  const tracerouteNodeA = {
+    nodeNum: 1,
+    sourceId: 'source-a',
+    user: { id: '!00000001', shortName: 'A', longName: 'Alpha' },
+    position: { latitude: 35.0, longitude: -80.0 },
+    hopsAway: 1,
+    role: 1,
+    lastHeard: recent,
+  };
+  const tracerouteNodeB = {
+    nodeNum: 2,
+    sourceId: 'source-a',
+    user: { id: '!00000002', shortName: 'B', longName: 'Bravo' },
+    position: { latitude: 35.1, longitude: -80.1 },
+    hopsAway: 1,
+    role: 1,
+    lastHeard: recent,
+  };
+  const tracerouteRecord = {
+    id: 10,
+    sourceId: 'source-a',
+    fromNodeNum: 1,
+    toNodeNum: 2,
+    route: '[]',
+    routeBack: '',
+    snrTowards: '[20]',
+    snrBack: '',
+    timestamp: recent * 1000,
+    createdAt: recent * 1000,
+  };
+
+  it('attaches the advanced popup to Route Segments', () => {
+    mocks.mapContext.showPaths = true;
+    mocks.sources = [{ id: 'source-a', name: 'Source Alpha', type: 'tcp' }];
+
+    const { container } = render(
+      <DashboardMap
+        {...defaultProps}
+        sourceId="source-a"
+        nodes={[tracerouteNodeA, tracerouteNodeB]}
+        traceroutes={[tracerouteRecord]}
+      />,
+    );
+
+    const popups = container.querySelectorAll('.route-popup');
+    expect(popups).toHaveLength(1);
+    expect(popups[0]).toHaveTextContent('Alpha');
+    expect(popups[0]).toHaveTextContent('Bravo');
+    expect(popups[0]).toHaveTextContent('5.0 dB');
+    expect(popups[0]).toHaveTextContent('Source Alpha');
+    expect(popups[0]).toHaveTextContent('Last traced:');
+  });
+
+  it('attaches the same advanced popup to the yellow Traceroute overlay', () => {
+    mocks.mapContext.showRoute = true;
+
+    const { container } = render(
+      <DashboardMap
+        {...defaultProps}
+        sourceId="source-a"
+        nodes={[tracerouteNodeA, tracerouteNodeB]}
+        traceroutes={[tracerouteRecord]}
+      />,
+    );
+
+    expect(container.querySelectorAll('.route-popup')).toHaveLength(1);
+  });
+
+  it('keeps popups available when both traceroute layers are enabled', () => {
+    mocks.mapContext.showPaths = true;
+    mocks.mapContext.showRoute = true;
+
+    const { container } = render(
+      <DashboardMap
+        {...defaultProps}
+        sourceId="source-a"
+        nodes={[tracerouteNodeA, tracerouteNodeB]}
+        traceroutes={[tracerouteRecord]}
+      />,
+    );
+
+    // Each layer gets the same popup renderer; the yellow layer is on top and
+    // therefore remains clickable when both are drawn.
+    expect(container.querySelectorAll('.route-popup')).toHaveLength(2);
+  });
+
+  it('aggregates popup history per source without mixing Unified statistics', () => {
+    mocks.mapContext.showPaths = true;
+    mocks.sources = [
+      { id: 'source-a', name: 'Source Alpha', type: 'tcp' },
+      { id: 'source-b', name: 'Source Bravo', type: 'tcp' },
+    ];
+    const traces = [
+      tracerouteRecord,
+      {
+        ...tracerouteRecord,
+        id: 11,
+        snrTowards: '[8]', // 2 dB
+        timestamp: (recent + 1) * 1000,
+      },
+      {
+        ...tracerouteRecord,
+        id: 12,
+        sourceId: 'source-b',
+        snrTowards: '[-20]', // -5 dB
+        timestamp: (recent + 2) * 1000,
+      },
+    ];
+
+    const { container } = render(
+      <DashboardMap
+        {...defaultProps}
+        sourceId="__unified__"
+        nodes={[tracerouteNodeA, tracerouteNodeB]}
+        traceroutes={traces}
+      />,
+    );
+
+    const popups = Array.from(container.querySelectorAll<HTMLElement>('.route-popup'));
+    const sourceAPopup = popups.find((popup) => popup.textContent?.includes('Source Alpha'));
+    const sourceBPopup = popups.find((popup) => popup.textContent?.includes('Source Bravo'));
+    expect(sourceAPopup).toBeDefined();
+    expect(sourceBPopup).toBeDefined();
+
+    expect(sourceAPopup).toHaveTextContent('Used in 2 traceroutes');
+    expect(within(sourceAPopup!).getByText('2.0 dB')).toBeInTheDocument();
+    expect(within(sourceAPopup!).getByText('5.0 dB')).toBeInTheDocument();
+    expect(sourceBPopup).toHaveTextContent('Used in 1 traceroute');
+    expect(within(sourceBPopup!).getByText('-5.0 dB')).toBeInTheDocument();
+    expect(within(sourceBPopup!).queryByText('5.0 dB')).not.toBeInTheDocument();
+  });
+
+  it('falls back to the hexadecimal node id when a traceroute endpoint has no name', () => {
+    mocks.mapContext.showPaths = true;
+    const unnamedNode = {
+      ...tracerouteNodeB,
+      user: undefined,
+      shortName: undefined,
+      longName: undefined,
+    };
+
+    const { container } = render(
+      <DashboardMap
+        {...defaultProps}
+        sourceId="source-a"
+        nodes={[tracerouteNodeA, unnamedNode]}
+        traceroutes={[tracerouteRecord]}
+      />,
+    );
+
+    const popup = container.querySelector('.route-popup');
+    expect(popup).toHaveTextContent('!2');
+  });
+
+  it('keeps legacy Unified traceroutes readable without source or timestamp metadata', () => {
+    mocks.mapContext.showPaths = true;
+    const legacyTraceroute = {
+      ...tracerouteRecord,
+      sourceId: undefined,
+      timestamp: undefined,
+      createdAt: undefined,
+    };
+
+    const { container } = render(
+      <DashboardMap
+        {...defaultProps}
+        sourceId="__unified__"
+        nodes={[tracerouteNodeA, tracerouteNodeB]}
+        traceroutes={[legacyTraceroute]}
+      />,
+    );
+
+    const popup = container.querySelector<HTMLElement>('.route-popup');
+    expect(popup).not.toBeNull();
+    expect(popup).toHaveTextContent('Alpha');
+    expect(popup).toHaveTextContent('Bravo');
+    expect(within(popup!).queryByText('Source:')).not.toBeInTheDocument();
+    expect(within(popup!).queryByText('Last traced:')).not.toBeInTheDocument();
   });
 
   // --- MeshCore neighbor links ------------------------------------------------
