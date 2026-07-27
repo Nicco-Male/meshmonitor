@@ -51,6 +51,12 @@ interface TelemetryGraphsProps {
   temperatureUnit?: TemperatureUnit;
   telemetryHours?: number;
   baseUrl?: string;
+  /** Explicit source for global/report views that do not have SourceContext. */
+  sourceId?: string | null;
+  /** Consumer-provided display names keyed by exact telemetry type. */
+  labelOverrides?: Record<string, string>;
+  /** Hide mutation and display-mode controls in analytical reports. */
+  readOnly?: boolean;
   /**
    * When true, render a row of time-range buttons (15m … 7d) above the graphs
    * that let the user choose how much history to load. The chosen range is
@@ -162,6 +168,7 @@ interface TelemetryGraphWidgetProps {
   timeFormat: TimeFormat;
   t: (key: string, opts?: Record<string, unknown>) => string;
   canEditSettings: boolean;
+  readOnly: boolean;
 }
 
 const TelemetryGraphWidget: React.FC<TelemetryGraphWidgetProps> = ({
@@ -191,9 +198,11 @@ const TelemetryGraphWidget: React.FC<TelemetryGraphWidgetProps> = ({
   timeFormat,
   t,
   canEditSettings,
+  readOnly,
 }) => {
   const [mode, setMode] = useWidgetMode(nodeId, type, baseUrl);
   const [range, setRange] = useWidgetRange(nodeId, type, baseUrl);
+  const displayMode = readOnly ? 'chart' : mode;
 
   const isTemperature = isTemperatureType(type);
   const chartData = prepareChartData(data, isTemperature, globalMinTime);
@@ -244,7 +253,7 @@ const TelemetryGraphWidget: React.FC<TelemetryGraphWidgetProps> = ({
           {label} {unit && `(${unit})`}
         </h4>
         <div className="graph-actions">
-          {canEditSettings && (
+          {canEditSettings && !readOnly && (
             <div className="mode-toggle-group" role="group" aria-label="Display mode">
               <button
                 className={`mode-toggle-btn ${mode === 'chart' ? 'active' : ''}`}
@@ -282,39 +291,43 @@ const TelemetryGraphWidget: React.FC<TelemetryGraphWidgetProps> = ({
               <UiIcon name={getSolarVisibility(type) ? 'sun' : 'visibilityOff'} size={15} />
             </button>
           )}
-          <button
-            className={`favorite-btn ${favorites.has(type) ? 'favorited' : ''}`}
-            onClick={createToggleFavorite(type)}
-            aria-label={favorites.has(type) ? t('telemetry.remove_favorite') : t('telemetry.add_favorite')}
-          >
-            <UiIcon name={favorites.has(type) ? 'favorite' : 'favoriteOff'} size={15} />
-          </button>
-          <button
-            className="graph-menu-btn"
-            onClick={e => handleMenuClick(e, type)}
-            aria-label={t('telemetry.more_options')}
-          >
-            ⋯
-          </button>
-          {openMenu === type && menuPosition && (
-            <div
-              className="telemetry-context-menu"
-              style={{
-                position: 'fixed',
-                top: `${menuPosition.y}px`,
-                left: `${menuPosition.x}px`,
-              }}
-              onClick={e => e.stopPropagation()}
-            >
-              <button className="context-menu-item" onClick={() => handlePurgeData(type)}>
-                {t('telemetry.purge_data')}
+          {!readOnly && (
+            <>
+              <button
+                className={`favorite-btn ${favorites.has(type) ? 'favorited' : ''}`}
+                onClick={createToggleFavorite(type)}
+                aria-label={favorites.has(type) ? t('telemetry.remove_favorite') : t('telemetry.add_favorite')}
+              >
+                <UiIcon name={favorites.has(type) ? 'favorite' : 'favoriteOff'} size={15} />
               </button>
-            </div>
+              <button
+                className="graph-menu-btn"
+                onClick={e => handleMenuClick(e, type)}
+                aria-label={t('telemetry.more_options')}
+              >
+                ⋯
+              </button>
+              {openMenu === type && menuPosition && (
+                <div
+                  className="telemetry-context-menu"
+                  style={{
+                    position: 'fixed',
+                    top: `${menuPosition.y}px`,
+                    left: `${menuPosition.x}px`,
+                  }}
+                  onClick={e => e.stopPropagation()}
+                >
+                  <button className="context-menu-item" onClick={() => handlePurgeData(type)}>
+                    {t('telemetry.purge_data')}
+                  </button>
+                </div>
+              )}
+            </>
           )}
         </div>
       </div>
 
-      {mode === 'gauge' ? (
+      {displayMode === 'gauge' ? (
         latest ? (
           <TelemetryGauge
             value={toDisplayTemp(latest.value)}
@@ -325,12 +338,12 @@ const TelemetryGraphWidget: React.FC<TelemetryGraphWidgetProps> = ({
             timestamp={latest.timestamp}
             nodeId={nodeId}
             onRangeChange={handleRangeChange}
-            canEditRange={canEditSettings}
+            canEditRange={canEditSettings && !readOnly}
           />
         ) : (
           <div className="telemetry-no-data">{t('telemetry.no_data')}</div>
         )
-      ) : mode === 'numeric' ? (
+      ) : displayMode === 'numeric' ? (
         latest ? (
           <TelemetryNumericLabel
             value={toDisplayTemp(latest.value)}
@@ -444,14 +457,24 @@ const TelemetryGraphWidget: React.FC<TelemetryGraphWidgetProps> = ({
 };
 
 const TelemetryGraphs: React.FC<TelemetryGraphsProps> = React.memo(
-  ({ nodeId, temperatureUnit = 'C', telemetryHours = 24, baseUrl = '', showTimeRangeSelector = false }) => {
+  ({
+    nodeId,
+    temperatureUnit = 'C',
+    telemetryHours = 24,
+    baseUrl = '',
+    sourceId: sourceIdProp,
+    labelOverrides,
+    readOnly = false,
+    showTimeRangeSelector = false,
+  }) => {
     const { t } = useTranslation();
     const csrfFetch = useCsrfFetch();
     const { showToast } = useToast();
     const { solarMonitoringEnabled, timeFormat } = useSettings();
     const { hasPermission } = useAuth();
     const canEditSettings = hasPermission('settings', 'write');
-    const { sourceId } = useSource();
+    const { sourceId: contextSourceId } = useSource();
+    const sourceId = sourceIdProp ?? contextSourceId;
     const [openMenu, setOpenMenu] = useState<string | null>(null);
     const [menuPosition, setMenuPosition] = useState<{
       x: number;
@@ -479,6 +502,10 @@ const TelemetryGraphs: React.FC<TelemetryGraphsProps> = React.memo(
     });
 
     const effectiveHours = showTimeRangeSelector ? selectedHours : telemetryHours;
+    const getDisplayLabel = useCallback(
+      (type: string) => labelOverrides?.[type]?.trim() || getTelemetryLabel(type),
+      [labelOverrides],
+    );
 
     const handleSelectRange = useCallback((hours: number) => {
       setSelectedHours(hours);
@@ -932,7 +959,7 @@ const TelemetryGraphs: React.FC<TelemetryGraphsProps> = React.memo(
       // telemetry update — making it hard to track a specific graph. New
       // metrics now slot into their alphabetical position instead of jumping
       // around.
-      .sort(([typeA], [typeB]) => compareTelemetryGraphs(typeA, typeB, favorites, getTelemetryLabel));
+      .sort(([typeA], [typeB]) => compareTelemetryGraphs(typeA, typeB, favorites, getDisplayLabel));
 
     // Sub-hour windows (e.g. the 15-minute preset) read awkwardly as
     // fractional hours, so render those with a minutes-based title instead.
@@ -988,12 +1015,13 @@ const TelemetryGraphs: React.FC<TelemetryGraphsProps> = React.memo(
               menuPosition={menuPosition}
               handlePurgeData={handlePurgeData}
               chartColors={chartColors}
-              getTelemetryLabel={getTelemetryLabel}
+              getTelemetryLabel={getDisplayLabel}
               getColor={getColor}
               prepareChartData={prepareChartData}
               timeFormat={timeFormat}
               t={t as (key: string, opts?: Record<string, unknown>) => string}
               canEditSettings={canEditSettings}
+              readOnly={readOnly}
             />
           ))}
         </div>

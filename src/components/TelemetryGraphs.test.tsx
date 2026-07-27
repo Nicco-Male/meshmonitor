@@ -155,6 +155,56 @@ describe('TelemetryGraphs Component', () => {
     });
   });
 
+  it('uses an explicit report source and channel label override in read-only mode', async () => {
+    (global.fetch as Mock).mockImplementation((url: string) => {
+      if (url.includes('/api/settings')) {
+        return Promise.resolve({ ok: true, json: async () => ({}) });
+      }
+      if (url.includes('/api/solar/estimates')) {
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({ count: 0, estimates: [] }),
+        });
+      }
+      if (url.includes('/api/csrf-token')) {
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({ token: 'test-csrf-token' }),
+        });
+      }
+      return Promise.resolve({
+        ok: true,
+        json: async () => [
+          {
+            nodeId: mockNodeId,
+            telemetryType: 'ch1Voltage',
+            timestamp: Date.now(),
+            value: 4.2,
+            unit: 'V',
+          },
+        ],
+      });
+    });
+
+    renderWithProviders(
+      <TelemetryGraphs
+        nodeId={mockNodeId}
+        sourceId="src-report"
+        labelOverrides={{ ch1Voltage: 'Solar panel · Voltage' }}
+        readOnly
+      />,
+    );
+
+    await waitFor(() => {
+      expect(global.fetch).toHaveBeenCalledWith(
+        `/api/telemetry/${mockNodeId}?hours=24&sourceId=src-report`,
+      );
+    });
+    expect(await screen.findByText(/Solar panel · Voltage/)).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'telemetry.add_favorite' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'telemetry.more_options' })).not.toBeInTheDocument();
+  });
+
   it('should display telemetry title when data is available', async () => {
     renderWithProviders(<TelemetryGraphs nodeId={mockNodeId} />);
 

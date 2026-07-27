@@ -222,6 +222,9 @@ export const VALID_SETTINGS_KEYS = [
   'activeMapStyleId',
   'telemetryWidgetModes',
   'telemetryWidgetRanges',
+  // Global display names for ch1…ch8 current/voltage pairs, keyed by
+  // source + node. Stored as JSON and edited from Reports > Node Telemetry.
+  'telemetryChannelLabels',
   'autoHeapManagementEnabled',
   'autoHeapManagementThresholdBytes',
   'tracerouteFilterLastHeardEnabled',

@@ -1,0 +1,204 @@
+.report {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+.controlsPanel {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.controlsGrid {
+  display: grid;
+  grid-template-columns: minmax(160px, 0.65fr) minmax(220px, 1fr) minmax(320px, 1.8fr);
+  gap: 14px;
+  align-items: end;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+  color: var(--ctp-subtext0);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.field input,
+.field select,
+.channelCard input {
+  width: 100%;
+  box-sizing: border-box;
+  min-height: 38px;
+  padding: 8px 10px;
+  color: var(--ctp-text);
+  background: var(--ctp-base);
+  border: 1px solid var(--ctp-surface1);
+  border-radius: 7px;
+  font: inherit;
+}
+
+.field input:focus,
+.field select:focus,
+.channelCard input:focus {
+  outline: none;
+  border-color: var(--ctp-blue);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--ctp-blue) 22%, transparent);
+}
+
+.field select:disabled,
+.channelCard input:disabled {
+  opacity: 0.65;
+  cursor: not-allowed;
+}
+
+.nodeField {
+  min-width: 0;
+}
+
+.resultCount {
+  color: var(--ctp-overlay1);
+  font-size: 11px;
+}
+
+.nodeSummary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.nodeSummary > div {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.nodeSummary strong {
+  font-size: 16px;
+}
+
+.nodeSummary > div span {
+  color: var(--ctp-subtext0);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+}
+
+.sourceBadge {
+  padding: 4px 10px;
+  border: 1px solid color-mix(in srgb, var(--ctp-blue) 55%, var(--ctp-surface1));
+  border-radius: 999px;
+  color: var(--ctp-blue);
+  background: color-mix(in srgb, var(--ctp-blue) 10%, var(--ctp-mantle));
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.labelsPanel {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.labelsHeader {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.labelsHeader h3 {
+  margin: 0;
+  font-size: 15px;
+}
+
+.labelsHeader p {
+  margin: 4px 0 0;
+  max-width: 680px;
+  color: var(--ctp-subtext0);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.channelGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 10px;
+}
+
+.channelCard {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  padding: 12px;
+  border: 1px solid var(--ctp-surface0);
+  border-radius: 9px;
+  background: var(--ctp-base);
+}
+
+.channelHeading {
+  color: var(--ctp-text);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.metricBadges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.metricBadges span {
+  padding: 2px 7px;
+  border-radius: 999px;
+  color: var(--ctp-mauve);
+  background: color-mix(in srgb, var(--ctp-mauve) 12%, var(--ctp-mantle));
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.noChannels,
+.readOnlyHint {
+  color: var(--ctp-subtext0);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.saveSuccess,
+.saveError {
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.saveSuccess {
+  color: var(--ctp-green);
+}
+
+.saveError {
+  color: var(--ctp-red);
+}
+
+@media (max-width: 880px) {
+  .controlsGrid {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 600px) {
+  .labelsHeader,
+  .nodeSummary {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .labelsHeader button {
+    align-self: flex-start;
+  }
+
+  .sourceBadge {
+    align-self: flex-start;
+  }
+}
