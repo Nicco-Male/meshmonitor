@@ -12,7 +12,7 @@
 
 .controlsGrid {
   display: grid;
-  grid-template-columns: minmax(160px, 0.65fr) minmax(220px, 1fr) minmax(320px, 1.8fr);
+  grid-template-columns: minmax(180px, 0.65fr) minmax(320px, 2.8fr);
   gap: 14px;
   align-items: end;
 }
@@ -49,6 +49,7 @@
   box-shadow: 0 0 0 2px color-mix(in srgb, var(--ctp-blue) 22%, transparent);
 }
 
+.field input:disabled,
 .field select:disabled,
 .channelCard input:disabled {
   opacity: 0.65;
@@ -56,7 +57,120 @@
 }
 
 .nodeField {
+  position: relative;
   min-width: 0;
+}
+
+.nodePickerInput {
+  position: relative;
+}
+
+.nodePickerInput input {
+  padding-right: 38px;
+}
+
+.clearNodePicker {
+  position: absolute;
+  top: 50%;
+  right: 7px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  color: var(--ctp-subtext0);
+  background: transparent;
+  border: 0;
+  border-radius: 5px;
+  cursor: pointer;
+  transform: translateY(-50%);
+}
+
+.clearNodePicker:hover,
+.clearNodePicker:focus-visible {
+  color: var(--ctp-text);
+  background: var(--ctp-surface0);
+  outline: none;
+}
+
+.nodeResults {
+  position: absolute;
+  z-index: 30;
+  top: calc(100% + 7px);
+  right: 0;
+  left: 0;
+  max-height: 340px;
+  overflow-y: auto;
+  padding: 5px;
+  background: var(--ctp-mantle);
+  border: 1px solid var(--ctp-surface1);
+  border-radius: 9px;
+  box-shadow: 0 14px 34px color-mix(in srgb, var(--ctp-crust) 65%, transparent);
+}
+
+.nodeResult {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  width: 100%;
+  padding: 9px 10px;
+  color: var(--ctp-text);
+  text-align: left;
+  background: transparent;
+  border: 0;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.nodeResult:hover,
+.nodeResult:focus-visible,
+.nodeResultSelected {
+  background: var(--ctp-surface0);
+  outline: none;
+}
+
+.nodeResultSelected {
+  box-shadow: inset 3px 0 0 var(--ctp-blue);
+}
+
+.nodeResultName {
+  overflow: hidden;
+  font-size: 13px;
+  font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.nodeResultMeta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px 10px;
+  color: var(--ctp-subtext0);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+}
+
+.nodeResultMeta span:last-child {
+  color: var(--ctp-blue);
+  font-family: inherit;
+  font-weight: 700;
+}
+
+.noNodeResults,
+.nodeResultsHint {
+  padding: 11px 10px;
+  color: var(--ctp-subtext0);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.noNodeResults {
+  text-align: center;
+}
+
+.nodeResultsHint {
+  border-top: 1px solid var(--ctp-surface0);
 }
 
 .resultCount {

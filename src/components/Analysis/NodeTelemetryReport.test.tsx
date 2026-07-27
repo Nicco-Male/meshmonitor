@@ -74,6 +74,17 @@ function renderReport() {
 
 const nodeKey = telemetryChannelLabelKey('source-a', '!e1820fa0');
 
+async function selectLineaGoticaNode() {
+  const nodeSearch = await screen.findByRole('combobox', {
+    name: 'Search and select node',
+  });
+  fireEvent.change(nodeSearch, { target: { value: 'Linea Gotica' } });
+  const option = await screen.findByRole('option', {
+    name: /Linea Gotica sixt.*!e1820fa0.*NiccoPisa/i,
+  });
+  fireEvent.click(option);
+}
+
 describe('NodeTelemetryReport', () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -126,14 +137,10 @@ describe('NodeTelemetryReport', () => {
   it('selects one source-scoped node and applies saved channel names to its charts', async () => {
     renderReport();
 
-    const nodeSelect = await screen.findByLabelText('Node');
-    await screen.findByRole('option', {
-      name: 'Linea Gotica sixt · !e1820fa0 · NiccoPisa',
-    });
-    expect(nodeSelect).toBeEnabled();
-    fireEvent.change(nodeSelect, { target: { value: nodeKey } });
+    await selectLineaGoticaNode();
 
     expect(await screen.findByDisplayValue('Solar panel')).toBeInTheDocument();
+    expect(screen.getByText('1 node found')).toBeInTheDocument();
     expect(screen.getByText('Voltage')).toBeInTheDocument();
     expect(screen.getByText('Current')).toBeInTheDocument();
     expect(screen.getByTestId('telemetry-graphs')).toHaveTextContent('!e1820fa0');
@@ -152,13 +159,7 @@ describe('NodeTelemetryReport', () => {
   it('persists a renamed current/voltage channel in the global setting', async () => {
     renderReport();
 
-    const nodeSelect = await screen.findByLabelText('Node');
-    await screen.findByRole('option', {
-      name: 'Linea Gotica sixt · !e1820fa0 · NiccoPisa',
-    });
-    fireEvent.change(nodeSelect, {
-      target: { value: nodeKey },
-    });
+    await selectLineaGoticaNode();
     const channelInput = await screen.findByLabelText('Channel 1 name');
     fireEvent.change(channelInput, { target: { value: 'Battery bank' } });
     fireEvent.click(screen.getByRole('button', { name: 'Save' }));
@@ -173,5 +174,28 @@ describe('NodeTelemetryReport', () => {
       [nodeKey]: { 1: 'Battery bank' },
     });
     expect(await screen.findByText('Channel names saved.')).toBeInTheDocument();
+  });
+
+  it('filters the searchable node picker by node ID and selects the matching result', async () => {
+    renderReport();
+
+    const nodeSearch = await screen.findByRole('combobox', {
+      name: 'Search and select node',
+    });
+    fireEvent.change(nodeSearch, { target: { value: 'Other 00000002' } });
+
+    expect(
+      screen.queryByRole('option', { name: /Linea Gotica sixt/i }),
+    ).not.toBeInTheDocument();
+    const matchingNode = await screen.findByRole('option', {
+      name: /Other node.*!00000002.*Nicco Berry Pisa/i,
+    });
+    fireEvent.click(matchingNode);
+
+    expect(screen.getByTestId('telemetry-graphs')).toHaveTextContent('!00000002');
+    expect(mocks.telemetryProps).toMatchObject({
+      nodeId: '!00000002',
+      sourceId: 'source-b',
+    });
   });
 });

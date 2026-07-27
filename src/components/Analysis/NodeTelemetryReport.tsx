@@ -1,4 +1,11 @@
-import { useEffect, useMemo, useState } from 'react';
+import {
+  useEffect,
+  useId,
+  useMemo,
+  useRef,
+  useState,
+  type KeyboardEvent,
+} from 'react';
 import { useMutation, useQuery } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import api from '../../services/api';
@@ -38,6 +45,12 @@ interface ReportNode {
 
 interface SettingsPayload {
   telemetryChannelLabels?: string;
+}
+
+const MAX_VISIBLE_NODE_RESULTS = 50;
+
+function formatNodeLabel(node: ReportNode): string {
+  return `${node.displayName} · ${node.nodeId} · ${node.sourceName}`;
 }
 
 function buildReportNodes(entries: UnifiedTelemetryEntry[]): ReportNode[] {
@@ -81,9 +94,13 @@ export default function NodeTelemetryReport() {
   const [sourceFilter, setSourceFilter] = useState('');
   const [search, setSearch] = useState('');
   const [selectedNodeKey, setSelectedNodeKey] = useState('');
+  const [nodePickerOpen, setNodePickerOpen] = useState(false);
   const [storedLabels, setStoredLabels] = useState<TelemetryChannelLabels>({});
   const [draftLabels, setDraftLabels] = useState<TelemetryChannelLabels>({});
   const [saveMessage, setSaveMessage] = useState('');
+  const pickerId = useId();
+  const pickerInputRef = useRef<HTMLInputElement>(null);
+  const nodeOptionRefs = useRef<Array<HTMLButtonElement | null>>([]);
 
   const nodesQuery = useQuery({
     queryKey: ['reports', 'node-telemetry', 'nodes'],
@@ -122,16 +139,22 @@ export default function NodeTelemetryReport() {
   }, [reportNodes]);
 
   const filteredNodes = useMemo(() => {
-    const normalizedSearch = search.trim().toLowerCase();
+    const searchTerms = search
+      .trim()
+      .toLowerCase()
+      .replaceAll('·', ' ')
+      .split(/\s+/)
+      .filter(Boolean);
     return reportNodes.filter((node) => {
       if (sourceFilter && node.sourceId !== sourceFilter) return false;
-      if (!normalizedSearch) return true;
-      return [node.displayName, node.nodeId, node.sourceName]
+      if (searchTerms.length === 0) return true;
+      const searchableNode = [node.displayName, node.nodeId, node.sourceName]
         .join(' ')
-        .toLowerCase()
-        .includes(normalizedSearch);
+        .toLowerCase();
+      return searchTerms.every((term) => searchableNode.includes(term));
     });
   }, [reportNodes, search, sourceFilter]);
+  const visibleNodes = filteredNodes.slice(0, MAX_VISIBLE_NODE_RESULTS);
 
   const selectedNode = reportNodes.find((node) => node.key === selectedNodeKey) ?? null;
   const powerChannels = selectedNode
@@ -204,6 +227,59 @@ export default function NodeTelemetryReport() {
     saveMutation.mutate(nextLabels);
   };
 
+  const selectNode = (node: ReportNode) => {
+    setSelectedNodeKey(node.key);
+    setSearch(formatNodeLabel(node));
+    setNodePickerOpen(false);
+    setSaveMessage('');
+  };
+
+  const handlePickerKeyDown = (event: KeyboardEvent<HTMLInputElement>) => {
+    if (event.key === 'ArrowDown' && visibleNodes.length > 0) {
+      event.preventDefault();
+      setNodePickerOpen(true);
+      window.setTimeout(() => nodeOptionRefs.current[0]?.focus(), 0);
+      return;
+    }
+
+    if (event.key === 'Enter' && nodePickerOpen && visibleNodes.length > 0) {
+      event.preventDefault();
+      selectNode(visibleNodes[0]);
+      return;
+    }
+
+    if (event.key === 'Escape') {
+      setNodePickerOpen(false);
+    }
+  };
+
+  const handleNodeOptionKeyDown = (
+    event: KeyboardEvent<HTMLButtonElement>,
+    index: number,
+  ) => {
+    if (event.key === 'ArrowDown') {
+      event.preventDefault();
+      nodeOptionRefs.current[Math.min(index + 1, visibleNodes.length - 1)]?.focus();
+      return;
+    }
+
+    if (event.key === 'ArrowUp') {
+      event.preventDefault();
+      if (index === 0) {
+        pickerInputRef.current?.focus();
+      } else {
+        nodeOptionRefs.current[index - 1]?.focus();
+      }
+      return;
+    }
+
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      setNodePickerOpen(false);
+      pickerInputRef.current?.focus();
+    }
+  };
+
   return (
     <div className={styles.report}>
       <div>
@@ -228,6 +304,8 @@ export default function NodeTelemetryReport() {
               onChange={(event) => {
                 setSourceFilter(event.target.value);
                 setSelectedNodeKey('');
+                setSearch('');
+                setNodePickerOpen(false);
               }}
             >
               <option value="">
@@ -241,46 +319,125 @@ export default function NodeTelemetryReport() {
             </select>
           </label>
 
-          <label className={styles.field}>
-            <span>{t('analysis.node_telemetry.search', 'Search nodes')}</span>
-            <input
-              type="search"
-              value={search}
-              onChange={(event) => setSearch(event.target.value)}
-              placeholder={t(
-                'analysis.node_telemetry.search_placeholder',
-                'Name or node ID',
+          <div
+            className={`${styles.field} ${styles.nodeField}`}
+            onBlur={(event) => {
+              if (!event.currentTarget.contains(event.relatedTarget)) {
+                setNodePickerOpen(false);
+              }
+            }}
+          >
+            <span id={`${pickerId}-label`}>
+              {t('analysis.node_telemetry.node_search', 'Search and select node')}
+            </span>
+            <div className={styles.nodePickerInput}>
+              <input
+                ref={pickerInputRef}
+                type="search"
+                role="combobox"
+                aria-labelledby={`${pickerId}-label`}
+                aria-controls={`${pickerId}-listbox`}
+                aria-expanded={nodePickerOpen}
+                aria-autocomplete="list"
+                autoComplete="off"
+                value={search}
+                onFocus={() => setNodePickerOpen(true)}
+                onKeyDown={handlePickerKeyDown}
+                onChange={(event) => {
+                  setSearch(event.target.value);
+                  setSelectedNodeKey('');
+                  setSaveMessage('');
+                  setNodePickerOpen(true);
+                }}
+                placeholder={
+                  nodesQuery.isLoading
+                    ? t('analysis.node_telemetry.loading_nodes', 'Loading nodes…')
+                    : t(
+                        'analysis.node_telemetry.search_placeholder',
+                        'Type a node name or ID…',
+                      )
+                }
+                disabled={nodesQuery.isLoading}
+              />
+              {(search || selectedNode) && (
+                <button
+                  type="button"
+                  className={styles.clearNodePicker}
+                  aria-label={t(
+                    'analysis.node_telemetry.clear_node_search',
+                    'Clear node search',
+                  )}
+                  onClick={() => {
+                    setSearch('');
+                    setSelectedNodeKey('');
+                    setSaveMessage('');
+                    setNodePickerOpen(true);
+                    pickerInputRef.current?.focus();
+                  }}
+                >
+                  <UiIcon name="close" size={14} />
+                </button>
               )}
-            />
-          </label>
+            </div>
 
-          <label className={`${styles.field} ${styles.nodeField}`}>
-            <span>{t('analysis.node_telemetry.node', 'Node')}</span>
-            <select
-              value={selectedNodeKey}
-              onChange={(event) => {
-                setSelectedNodeKey(event.target.value);
-                setSaveMessage('');
-              }}
-              disabled={nodesQuery.isLoading || filteredNodes.length === 0}
-            >
-              <option value="">
-                {nodesQuery.isLoading
-                  ? t('analysis.node_telemetry.loading_nodes', 'Loading nodes…')
-                  : t('analysis.node_telemetry.select_node', 'Select a node…')}
-              </option>
-              {filteredNodes.map((node) => (
-                <option key={node.key} value={node.key}>
-                  {node.displayName} · {node.nodeId} · {node.sourceName}
-                </option>
-              ))}
-            </select>
-          </label>
+            {nodePickerOpen && !nodesQuery.isLoading && (
+              <div
+                id={`${pickerId}-listbox`}
+                className={styles.nodeResults}
+                role="listbox"
+                aria-labelledby={`${pickerId}-label`}
+              >
+                {visibleNodes.length === 0 ? (
+                  <div className={styles.noNodeResults} role="status">
+                    {t(
+                      'analysis.node_telemetry.no_nodes_found',
+                      'No nodes match this search.',
+                    )}
+                  </div>
+                ) : (
+                  visibleNodes.map((node, index) => (
+                    <button
+                      key={node.key}
+                      ref={(element) => {
+                        nodeOptionRefs.current[index] = element;
+                      }}
+                      type="button"
+                      role="option"
+                      aria-selected={node.key === selectedNodeKey}
+                      className={`${styles.nodeResult} ${
+                        node.key === selectedNodeKey ? styles.nodeResultSelected : ''
+                      }`}
+                      onClick={() => selectNode(node)}
+                      onKeyDown={(event) => handleNodeOptionKeyDown(event, index)}
+                    >
+                      <span className={styles.nodeResultName}>{node.displayName}</span>
+                      <span className={styles.nodeResultMeta}>
+                        <span>{node.nodeId}</span>
+                        <span>{node.sourceName}</span>
+                      </span>
+                    </button>
+                  ))
+                )}
+                {filteredNodes.length > MAX_VISIBLE_NODE_RESULTS && (
+                  <div className={styles.nodeResultsHint}>
+                    {t('analysis.node_telemetry.refine_search', {
+                      defaultValue:
+                        'Showing the first {{count}} results. Keep typing to narrow the list.',
+                      count: MAX_VISIBLE_NODE_RESULTS,
+                    })}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
         </div>
         {!nodesQuery.isLoading && (
           <div className={styles.resultCount}>
             {t('analysis.node_telemetry.nodes_found', {
-              defaultValue: '{{count}} nodes found',
+              defaultValue:
+                filteredNodes.length === 1
+                  ? '{{count}} node found'
+                  : '{{count}} nodes found',
               count: filteredNodes.length,
             })}
           </div>
