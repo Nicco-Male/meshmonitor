@@ -9,7 +9,10 @@
  * MySQL: requires test container on port 3307 (skipped if unavailable)
  */
 import { describe, it, expect, beforeEach, afterEach, afterAll, beforeAll } from 'vitest';
-import { TraceroutesRepository } from './traceroutes.js';
+import {
+  TraceroutesRepository,
+  normalizeTracerouteResponseEndpoints,
+} from './traceroutes.js';
 import { ALL_SOURCES } from './base.js';
 import {
   TestBackend,
@@ -130,6 +133,39 @@ function makeSegment(overrides: Partial<DbRouteSegment> = {}): DbRouteSegment {
     ...overrides,
   };
 }
+
+describe('normalizeTracerouteResponseEndpoints', () => {
+  it('keeps pending requester -> responder rows unchanged', () => {
+    const pending = makeTraceroute({
+      fromNodeNum: 1001,
+      toNodeNum: 2002,
+      fromNodeId: '!000003e9',
+      toNodeId: '!000007d2',
+    });
+
+    expect(normalizeTracerouteResponseEndpoints(pending)).toBe(pending);
+  });
+
+  it('normalizes a completed response from responder -> requester', () => {
+    const response = makeTraceroute({
+      fromNodeNum: 2002,
+      toNodeNum: 1001,
+      fromNodeId: '!000007d2',
+      toNodeId: '!000003e9',
+      route: '[1500]',
+      snrTowards: '[20,16]',
+    });
+
+    expect(normalizeTracerouteResponseEndpoints(response)).toMatchObject({
+      fromNodeNum: 1001,
+      toNodeNum: 2002,
+      fromNodeId: '!000003e9',
+      toNodeId: '!000007d2',
+      route: '[1500]',
+      snrTowards: '[20,16]',
+    });
+  });
+});
 
 /**
  * Shared test suite that runs against any backend.
@@ -544,6 +580,83 @@ describe('TraceroutesRepository - SQLite Backend', () => {
 
   afterEach(async () => {
     await backend.close();
+  });
+
+  it('stores an uncorrelated response in canonical requester -> responder order', async () => {
+    const repo = new TraceroutesRepository(backend.drizzleDb, backend.dbType);
+    const now = Date.now();
+    repo.upsertTracerouteSync(
+      makeTraceroute({
+        fromNodeNum: 2002,
+        toNodeNum: 1001,
+        fromNodeId: '!000007d2',
+        toNodeId: '!000003e9',
+        route: '[1500]',
+        routeBack: '[1600]',
+        snrTowards: '[20,16]',
+        snrBack: '[12,8]',
+        timestamp: now,
+        createdAt: now,
+      }),
+      5 * 60 * 1000,
+      10,
+      'mqtt',
+    );
+
+    const rows = await repo.getAllTraceroutes(10, 'mqtt');
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      fromNodeNum: 1001,
+      toNodeNum: 2002,
+      fromNodeId: '!000003e9',
+      toNodeId: '!000007d2',
+      route: '[1500]',
+      routeBack: '[1600]',
+    });
+  });
+
+  it('updates a pending canonical row without changing its endpoint order', async () => {
+    const repo = new TraceroutesRepository(backend.drizzleDb, backend.dbType);
+    const now = Date.now();
+    repo.upsertTracerouteSync(
+      makeTraceroute({
+        fromNodeNum: 1001,
+        toNodeNum: 2002,
+        fromNodeId: '!000003e9',
+        toNodeId: '!000007d2',
+        timestamp: now,
+        createdAt: now,
+      }),
+      0,
+      10,
+      'mqtt',
+    );
+    repo.upsertTracerouteSync(
+      makeTraceroute({
+        fromNodeNum: 2002,
+        toNodeNum: 1001,
+        fromNodeId: '!000007d2',
+        toNodeId: '!000003e9',
+        route: '[1500]',
+        routeBack: '[1600]',
+        snrTowards: '[20,16]',
+        snrBack: '[12,8]',
+        timestamp: now + 1,
+        createdAt: now + 1,
+      }),
+      5 * 60 * 1000,
+      10,
+      'mqtt',
+    );
+
+    const rows = await repo.getAllTraceroutes(10, 'mqtt');
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      fromNodeNum: 1001,
+      toNodeNum: 2002,
+      route: '[1500]',
+      routeBack: '[1600]',
+    });
   });
 
   runTraceroutesTests(() => backend);
