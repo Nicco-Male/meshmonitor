@@ -9,6 +9,37 @@ import { BaseRepository, DrizzleDatabase, SourceScope } from './base.js';
 import { DatabaseType, DbTraceroute, DbRouteSegment } from '../types.js';
 
 /**
+ * Completed TRACEROUTE_APP packets arrive with packet endpoints in response
+ * order (responder -> requester), while `route` is ordered along the request
+ * path (requester -> responder). Persist completed rows in one canonical
+ * requester -> responder orientation so every consumer can safely build
+ * `[fromNodeNum, ...route, toNodeNum]`.
+ *
+ * Pending rows are already created in requester -> responder order and carry
+ * no route/SNR payload, so they must not be swapped.
+ */
+export function normalizeTracerouteResponseEndpoints(
+  tracerouteData: DbTraceroute,
+): DbTraceroute {
+  const hasResponsePayload = [
+    tracerouteData.route,
+    tracerouteData.routeBack,
+    tracerouteData.snrTowards,
+    tracerouteData.snrBack,
+  ].some((value) => value !== null && value !== undefined);
+
+  if (!hasResponsePayload) return tracerouteData;
+
+  return {
+    ...tracerouteData,
+    fromNodeNum: tracerouteData.toNodeNum,
+    toNodeNum: tracerouteData.fromNodeNum,
+    fromNodeId: tracerouteData.toNodeId,
+    toNodeId: tracerouteData.fromNodeId,
+  };
+}
+
+/**
  * Repository for traceroute operations
  */
 export class TraceroutesRepository extends BaseRepository {
@@ -470,12 +501,13 @@ export class TraceroutesRepository extends BaseRepository {
     const { traceroutes } = this.tables;
     const nowTs = this.now();
     const pendingSince = nowTs - pendingTimeoutMs;
+    const normalizedData = normalizeTracerouteResponseEndpoints(tracerouteData);
 
     db.transaction((tx) => {
-      // Step 1: find pending (inverse direction) within timeout window
+      // Step 1: find the canonical requester -> responder pending row.
       const pendingConditions = [
-        eq(traceroutes.fromNodeNum, tracerouteData.toNodeNum),
-        eq(traceroutes.toNodeNum, tracerouteData.fromNodeNum),
+        eq(traceroutes.fromNodeNum, normalizedData.fromNodeNum),
+        eq(traceroutes.toNodeNum, normalizedData.toNodeNum),
         isNull(traceroutes.route),
         gte(traceroutes.timestamp, pendingSince),
       ];
@@ -494,28 +526,28 @@ export class TraceroutesRepository extends BaseRepository {
         const id = Number((pendingRows[0] as any).id);
         tx.update(traceroutes)
           .set({
-            route: tracerouteData.route || null,
-            routeBack: tracerouteData.routeBack || null,
-            snrTowards: tracerouteData.snrTowards || null,
-            snrBack: tracerouteData.snrBack || null,
-            packetId: tracerouteData.packetId ?? null,
-            timestamp: tracerouteData.timestamp,
+            route: normalizedData.route || null,
+            routeBack: normalizedData.routeBack || null,
+            snrTowards: normalizedData.snrTowards || null,
+            snrBack: normalizedData.snrBack || null,
+            packetId: normalizedData.packetId ?? null,
+            timestamp: normalizedData.timestamp,
           })
           .where(eq(traceroutes.id, id))
           .run();
       } else {
         const values: any = {
-          fromNodeNum: tracerouteData.fromNodeNum,
-          toNodeNum: tracerouteData.toNodeNum,
-          fromNodeId: tracerouteData.fromNodeId,
-          toNodeId: tracerouteData.toNodeId,
-          route: tracerouteData.route || null,
-          routeBack: tracerouteData.routeBack || null,
-          snrTowards: tracerouteData.snrTowards || null,
-          snrBack: tracerouteData.snrBack || null,
-          packetId: tracerouteData.packetId ?? null,
-          timestamp: tracerouteData.timestamp,
-          createdAt: tracerouteData.createdAt,
+          fromNodeNum: normalizedData.fromNodeNum,
+          toNodeNum: normalizedData.toNodeNum,
+          fromNodeId: normalizedData.fromNodeId,
+          toNodeId: normalizedData.toNodeId,
+          route: normalizedData.route || null,
+          routeBack: normalizedData.routeBack || null,
+          snrTowards: normalizedData.snrTowards || null,
+          snrBack: normalizedData.snrBack || null,
+          packetId: normalizedData.packetId ?? null,
+          timestamp: normalizedData.timestamp,
+          createdAt: normalizedData.createdAt,
           sourceId: sourceId ?? null,
         };
         tx.insert(traceroutes).values(values).run();
@@ -524,8 +556,8 @@ export class TraceroutesRepository extends BaseRepository {
       // Step 3: prune — keep only the most recent `historyLimit` rows for
       // this (fromNodeNum, toNodeNum[, sourceId]) pair.
       const scopeConditions = [
-        eq(traceroutes.fromNodeNum, tracerouteData.fromNodeNum),
-        eq(traceroutes.toNodeNum, tracerouteData.toNodeNum),
+        eq(traceroutes.fromNodeNum, normalizedData.fromNodeNum),
+        eq(traceroutes.toNodeNum, normalizedData.toNodeNum),
       ];
       if (sourceId !== undefined) {
         scopeConditions.push(eq(traceroutes.sourceId, sourceId));
