@@ -127,6 +127,7 @@ describe('NodeTelemetryReport', () => {
             sourceId: 'source-b',
             sourceName: 'Nicco Berry Pisa',
             nodeLongName: 'Other node',
+            nodeShortName: 'OTHR',
           },
         ]);
       }
@@ -197,5 +198,41 @@ describe('NodeTelemetryReport', () => {
       nodeId: '!00000002',
       sourceId: 'source-b',
     });
+  });
+
+  it('does not match nodes by source name', async () => {
+    renderReport();
+
+    const nodeSearch = await screen.findByRole('combobox', {
+      name: 'Search and select node',
+    });
+    fireEvent.change(nodeSearch, { target: { value: 'nicco' } });
+
+    expect(
+      await screen.findByText('No nodes match this search.'),
+    ).toBeInTheDocument();
+    expect(screen.getByText('0 nodes found')).toBeInTheDocument();
+    expect(
+      screen.queryByRole('option', { name: /Linea Gotica sixt/i }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole('option', { name: /Other node/i }),
+    ).not.toBeInTheDocument();
+  });
+
+  it('matches a node by its short name', async () => {
+    renderReport();
+
+    const nodeSearch = await screen.findByRole('combobox', {
+      name: 'Search and select node',
+    });
+    fireEvent.change(nodeSearch, { target: { value: 'OTHR' } });
+
+    expect(
+      await screen.findByRole('option', {
+        name: /Other node.*!00000002.*Nicco Berry Pisa/i,
+      }),
+    ).toBeInTheDocument();
+    expect(screen.getByText('1 node found')).toBeInTheDocument();
   });
 });
