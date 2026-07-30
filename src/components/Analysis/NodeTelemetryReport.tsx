@@ -39,6 +39,8 @@ interface ReportNode {
   nodeId: string;
   sourceId: string;
   sourceName: string;
+  nodeLongName?: string | null;
+  nodeShortName?: string | null;
   displayName: string;
   telemetryTypes: string[];
 }
@@ -50,11 +52,16 @@ interface SettingsPayload {
 const MAX_VISIBLE_NODE_RESULTS = 50;
 
 function formatNodeLabel(node: ReportNode): string {
-  return `${node.displayName} · ${node.nodeId} · ${node.sourceName}`;
+  return `${node.displayName} · ${node.nodeId}`;
 }
 
 function buildReportNodes(entries: UnifiedTelemetryEntry[]): ReportNode[] {
-  const nodes = new Map<string, Omit<ReportNode, 'telemetryTypes'> & { telemetryTypes: Set<string> }>();
+  const nodes = new Map<
+    string,
+    Omit<ReportNode, 'displayName' | 'telemetryTypes'> & {
+      telemetryTypes: Set<string>;
+    }
+  >();
 
   for (const entry of entries) {
     if (!entry.nodeId || !entry.sourceId || !entry.telemetryType) continue;
@@ -62,6 +69,8 @@ function buildReportNodes(entries: UnifiedTelemetryEntry[]): ReportNode[] {
     const existing = nodes.get(key);
     if (existing) {
       existing.telemetryTypes.add(entry.telemetryType);
+      existing.nodeLongName ||= entry.nodeLongName?.trim() || null;
+      existing.nodeShortName ||= entry.nodeShortName?.trim() || null;
       continue;
     }
 
@@ -70,13 +79,18 @@ function buildReportNodes(entries: UnifiedTelemetryEntry[]): ReportNode[] {
       nodeId: entry.nodeId,
       sourceId: entry.sourceId,
       sourceName: entry.sourceName || entry.sourceId,
-      displayName: entry.nodeLongName || entry.nodeShortName || entry.nodeId,
+      nodeLongName: entry.nodeLongName?.trim() || null,
+      nodeShortName: entry.nodeShortName?.trim() || null,
       telemetryTypes: new Set([entry.telemetryType]),
     });
   }
 
   return [...nodes.values()]
-    .map((node) => ({ ...node, telemetryTypes: [...node.telemetryTypes] }))
+    .map((node) => ({
+      ...node,
+      displayName: node.nodeLongName || node.nodeShortName || node.nodeId,
+      telemetryTypes: [...node.telemetryTypes],
+    }))
     .sort(
       (a, b) =>
         a.sourceName.localeCompare(b.sourceName) ||
@@ -148,7 +162,12 @@ export default function NodeTelemetryReport() {
     return reportNodes.filter((node) => {
       if (sourceFilter && node.sourceId !== sourceFilter) return false;
       if (searchTerms.length === 0) return true;
-      const searchableNode = [node.displayName, node.nodeId, node.sourceName]
+      const searchableNode = [
+        node.nodeLongName,
+        node.nodeShortName,
+        node.nodeId,
+      ]
+        .filter(Boolean)
         .join(' ')
         .toLowerCase();
       return searchTerms.every((term) => searchableNode.includes(term));
