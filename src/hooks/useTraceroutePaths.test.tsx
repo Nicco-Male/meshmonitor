@@ -312,4 +312,120 @@ describe('useTraceroutePaths - Route Segment Filtering', () => {
       expect(result.current.tracerouteBounds).toBeNull();
     });
   });
+
+  describe('real-hop selected traceroute rendering', () => {
+    const nodes: NodePositionDigest[] = [
+      { nodeNum: 100, position: { latitude: 43.7, longitude: 10.4 }, user: { id: '!64', longName: 'Source' } },
+      { nodeNum: 200, position: { latitude: 43.8, longitude: 10.5 }, user: { id: '!c8', longName: 'Destination' } },
+    ];
+    const themeColors: ThemeColors = {
+      mauve: '#c6a0f6',
+      red: '#ed8796',
+      blue: '#8aadf4',
+      overlay0: '#6e738d',
+    };
+    const callbacks = { onSelectNode: () => {}, onSelectRouteSegment: () => {} };
+
+    it('does not draw a source-to-destination line when an anonymous hop is present', () => {
+      const traceroutes: TracerouteDigest[] = [{
+        fromNodeNum: 100,
+        toNodeNum: 200,
+        fromNodeId: '!64',
+        toNodeId: '!c8',
+        route: '[4294967295]',
+        routeBack: '',
+        snrTowards: '[28,16]',
+        timestamp: Date.now(),
+      }];
+      const { result } = renderHook(() => useTraceroutePaths({
+        showPaths: false,
+        showRoute: true,
+        selectedNodeId: '!c8',
+        currentNodeId: '!local',
+        nodesPositionDigest: nodes,
+        traceroutesDigest: traceroutes,
+        distanceUnit: 'metric',
+        maxNodeAgeHours: 24,
+        themeColors,
+        callbacks,
+        visibleNodeNums: new Set([100, 200]),
+      }));
+
+      const layer = result.current.selectedNodeTraceroute?.[0] as any;
+      expect(layer).toBeDefined();
+      expect(layer.props.segments).toHaveLength(2);
+      expect(layer.props.segments.map((segment: any) => [
+        segment.fromNodeNum,
+        segment.toNodeNum,
+      ])).toEqual([
+        [100, 4294967295],
+        [4294967295, 200],
+      ]);
+      expect(layer.props.showEstimatedHopMarkers).toBe(true);
+    });
+
+    it('assigns a different color to each distinct physical hop', () => {
+      const traceroutes: TracerouteDigest[] = [{
+        fromNodeNum: 100,
+        toNodeNum: 200,
+        fromNodeId: '!64',
+        toNodeId: '!c8',
+        route: '[4294967295]',
+        routeBack: '',
+        snrTowards: '[28,16]',
+        timestamp: Date.now(),
+      }];
+      const { result } = renderHook(() => useTraceroutePaths({
+        showPaths: false,
+        showRoute: true,
+        selectedNodeId: '!c8',
+        currentNodeId: '!local',
+        nodesPositionDigest: nodes,
+        traceroutesDigest: traceroutes,
+        distanceUnit: 'metric',
+        maxNodeAgeHours: 24,
+        themeColors,
+        callbacks,
+        visibleNodeNums: new Set([100, 200]),
+      }));
+
+      const layer = result.current.selectedNodeTraceroute?.[0] as any;
+      const [first, second] = layer.props.segments;
+      expect(layer.props.colorMode).toBe('custom');
+      expect(layer.props.segmentColor(first)).not.toBe(layer.props.segmentColor(second));
+    });
+
+    it('keeps the direct line only for a genuinely zero-intermediate-hop trace', () => {
+      const traceroutes: TracerouteDigest[] = [{
+        fromNodeNum: 100,
+        toNodeNum: 200,
+        fromNodeId: '!64',
+        toNodeId: '!c8',
+        route: '[]',
+        routeBack: '',
+        snrTowards: '[28]',
+        timestamp: Date.now(),
+      }];
+      const { result } = renderHook(() => useTraceroutePaths({
+        showPaths: false,
+        showRoute: true,
+        selectedNodeId: '!c8',
+        currentNodeId: '!local',
+        nodesPositionDigest: nodes,
+        traceroutesDigest: traceroutes,
+        distanceUnit: 'metric',
+        maxNodeAgeHours: 24,
+        themeColors,
+        callbacks,
+        visibleNodeNums: new Set([100, 200]),
+      }));
+
+      const layer = result.current.selectedNodeTraceroute?.[0] as any;
+      expect(layer.props.segments).toHaveLength(1);
+      expect(layer.props.segments[0]).toMatchObject({
+        fromNodeNum: 100,
+        toNodeNum: 200,
+      });
+    });
+  });
 });

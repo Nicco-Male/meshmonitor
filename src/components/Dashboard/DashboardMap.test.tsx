@@ -81,6 +81,10 @@ vi.mock('react-leaflet', () => ({
       {children}
     </div>
   ),
+  CircleMarker: ({ center, children }: any) => (
+    <div data-testid="map-circle-marker" data-center={JSON.stringify(center)}>{children}</div>
+  ),
+  Tooltip: ({ children }: any) => <div data-testid="map-tooltip">{children}</div>,
   Rectangle: () => <div data-testid="map-rectangle" />,
   useMap: () => ({ fitBounds: mocks.fitBounds, setView: vi.fn() }),
 }));
@@ -122,7 +126,10 @@ vi.mock('../../hooks/useCsrfFetch', () => ({
   useCsrfFetch: () => vi.fn().mockResolvedValue({ ok: true }),
 }));
 vi.mock('../../services/api', () => ({
-  default: { getBaseUrl: vi.fn().mockResolvedValue('') },
+  default: {
+    get: vi.fn().mockResolvedValue([]),
+    getBaseUrl: vi.fn().mockResolvedValue(''),
+  },
 }));
 
 // The marker popup (DashboardNodePopup) reads time/date format from
@@ -657,6 +664,71 @@ describe('DashboardMap', () => {
     );
 
     expect(container.querySelectorAll('.route-popup')).toHaveLength(1);
+  });
+
+  it('keeps an anonymous relay as two real hops and inserts an estimated marker', () => {
+    mocks.mapContext.showPaths = true;
+    const traceWithAnonymousHop = {
+      ...tracerouteRecord,
+      id: 13,
+      route: '[4294967295]',
+      snrTowards: '[20, 12]',
+    };
+
+    const { container } = render(
+      <DashboardMap
+        {...defaultProps}
+        sourceId="source-a"
+        nodes={[tracerouteNodeA, tracerouteNodeB]}
+        traceroutes={[traceWithAnonymousHop]}
+      />,
+    );
+
+    const lines = screen.getAllByTestId('map-polyline');
+    expect(lines).toHaveLength(2);
+    expect(screen.getAllByTestId('map-circle-marker')).toHaveLength(1);
+    expect(screen.getByText('Unknown hop (estimated)')).toBeInTheDocument();
+
+    const popups = Array.from(container.querySelectorAll<HTMLElement>('.route-popup'));
+    // There must be no fabricated Alpha↔Bravo segment when an anonymous relay
+    // exists between them.
+    expect(popups.some((popup) =>
+      popup.textContent?.includes('Alpha') && popup.textContent?.includes('Bravo')
+    )).toBe(false);
+    expect(popups.some((popup) => popup.textContent?.includes('Alpha') && popup.textContent?.includes('Unknown hop'))).toBe(true);
+    expect(popups.some((popup) => popup.textContent?.includes('Unknown hop') && popup.textContent?.includes('Bravo'))).toBe(true);
+  });
+
+  it('estimates a known intermediate node that has no reported position', () => {
+    mocks.mapContext.showPaths = true;
+    const unpositionedHop = {
+      nodeNum: 300,
+      sourceId: 'source-a',
+      user: { id: '!0000012c', shortName: 'HOP', longName: 'Relay Without GPS' },
+      position: null,
+      hopsAway: 1,
+      role: 1,
+      lastHeard: recent,
+    };
+    const traceViaUnpositionedHop = {
+      ...tracerouteRecord,
+      id: 14,
+      route: '[300]',
+      snrTowards: '[28, 16]',
+    };
+
+    render(
+      <DashboardMap
+        {...defaultProps}
+        sourceId="source-a"
+        nodes={[tracerouteNodeA, unpositionedHop, tracerouteNodeB]}
+        traceroutes={[traceViaUnpositionedHop]}
+      />,
+    );
+
+    expect(screen.getAllByTestId('map-polyline')).toHaveLength(2);
+    expect(screen.getAllByTestId('map-circle-marker')).toHaveLength(1);
+    expect(screen.getByText('Relay Without GPS (estimated)')).toBeInTheDocument();
   });
 
   it('keeps popups available when both traceroute layers are enabled', () => {

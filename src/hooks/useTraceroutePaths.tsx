@@ -126,6 +126,26 @@ export interface UseTraceroutePathsResult {
 
 const BROADCAST_ADDR = 4294967295;
 
+/** Stable unordered identity for one physical hop. Anonymous relay placeholders
+ * carry trace-scoped hop keys from `decomposeTraceroute`, so they never merge
+ * with an unrelated hidden relay from another trace. */
+function segmentPairKey(segment: TracerouteRenderSegment): string {
+  const fromKey = segment.fromHopKey ?? `node:${segment.fromNodeNum}`;
+  const toKey = segment.toHopKey ?? `node:${segment.toNodeNum}`;
+  return fromKey < toKey ? `${fromKey}~${toKey}` : `${toKey}~${fromKey}`;
+}
+
+const SELECTED_HOP_COLORS = [
+  '#3b82f6',
+  '#f97316',
+  '#22c55e',
+  '#a855f7',
+  '#ef4444',
+  '#06b6d4',
+  '#eab308',
+  '#ec4899',
+];
+
 /**
  * Fallback SNR color scale for the (structurally optional) `ThemeColors.snrColors`
  * field. In practice App.tsx always supplies a real scheme-derived scale
@@ -176,18 +196,14 @@ export function useTraceroutePaths({
   const traceroutePathsElements = useMemo(() => {
     if (!showPaths) return null;
 
-    // Calculate segment usage counts and collect SNR values with timestamps
-    const segmentUsage = new Map<string, number>();
+    // Calculate per-physical-hop traceroute usage and collect directional SNR
+    // observations. Anonymous hops use trace-scoped identities, never the
+    // shared 0xffffffff placeholder, so unrelated hidden relays cannot merge.
+    const segmentTraceIds = new Map<string, Set<number>>();
     const segmentSNRs = new Map<string, Array<{ snr: number; timestamp: number }>>();
-    // Track segments that have MQTT/unknown hops (SNR sentinel indicates MQTT gateway or unknown)
     const segmentHasMqtt = new Map<string, boolean>();
-    // Track most recent timestamp per segment for temporal fade
     const segmentLatestTimestamp = new Map<string, number>();
-    const segmentsList: Array<{
-      key: string;
-      positions: [number, number][];
-      nodeNums: [number, number];
-    }> = [];
+    const segmentsList: TracerouteRenderSegment[] = [];
 
     // Filter traceroutes by age using the same maxNodeAgeHours setting
     const cutoffTime = Date.now() - maxNodeAgeHours * 60 * 60 * 1000;
@@ -215,139 +231,58 @@ export function useTraceroutePaths({
     const deduplicatedTraceroutes = Array.from(tracerouteMap.values());
 
     deduplicatedTraceroutes.forEach((tr, idx) => {
-      try {
-        // Skip traceroutes with null or invalid route data (failed traceroutes)
-        if (
-          !tr.route ||
-          tr.route === 'null' ||
-          tr.route === '' ||
-          !tr.routeBack ||
-          tr.routeBack === 'null' ||
-          tr.routeBack === ''
-        ) {
-          return; // Skip this traceroute - no valid route data to display
+      const timestamp = tr.timestamp || tr.createdAt || Date.now();
+      const snapshotPositions = parseSnapshotRoutePositions(tr.routePositions);
+      const resolvePosition = (nodeNum: number): [number, number] | null =>
+        resolveSegmentPosition(nodeNum, snapshotPositions, liveNodePositions);
+      const canEstimateHop = (nodeNum: number): boolean =>
+        !isValidRouteNode(nodeNum) || !visibleNodeNums || visibleNodeNums.has(nodeNum);
+
+      const decomposed = decomposeTraceroute(
+        tr,
+        {
+          resolvePosition,
+          estimateMissingHops: true,
+          canEstimateHop,
+          traceKey: `nodes-${idx}-${timestamp}`,
+        },
+      );
+
+      for (const segment of decomposed) {
+        const aggregateKey = segmentPairKey(segment);
+        let traceIds = segmentTraceIds.get(aggregateKey);
+        if (!traceIds) {
+          traceIds = new Set<number>();
+          segmentTraceIds.set(aggregateKey, traceIds);
         }
+        traceIds.add(idx);
 
-        // Process forward path - filter out invalid node numbers
-        const rawRouteForward = JSON.parse(tr.route);
-        const rawRouteBack = JSON.parse(tr.routeBack);
-        const routeForward = rawRouteForward.filter(isValidRouteNode);
-        const routeBack = rawRouteBack.filter(isValidRouteNode);
+        if (segment.avgSnr !== null && Number.isFinite(segment.avgSnr)) {
+          const samples = segmentSNRs.get(aggregateKey) ?? [];
+          samples.push({ snr: segment.avgSnr, timestamp });
+          segmentSNRs.set(aggregateKey, samples);
+        }
+        if (segment.isMqtt) segmentHasMqtt.set(aggregateKey, true);
+        const existingTimestamp = segmentLatestTimestamp.get(aggregateKey) ?? 0;
+        if (timestamp > existingTimestamp) segmentLatestTimestamp.set(aggregateKey, timestamp);
 
-        // Note: Empty arrays are valid (direct path with no intermediate hops)
-
-        const snrForward =
-          tr.snrTowards && tr.snrTowards !== 'null' && tr.snrTowards !== '' ? JSON.parse(tr.snrTowards) : [];
-        const timestamp = tr.timestamp || tr.createdAt || Date.now();
-
-        // #1862 — snapshot positions via the shared util (fixes a
-        // lat/lng===0 truthy-check bug in the old per-consumer copy).
-        const snapshotPositions = parseSnapshotRoutePositions(tr.routePositions);
-        const resolvePosition = (nodeNum: number): [number, number] | null =>
-          resolveSegmentPosition(nodeNum, snapshotPositions, liveNodePositions);
-
-        // Build forward path: responder -> route -> requester (fromNodeNum -> toNodeNum)
-        const forwardSequence: number[] = [tr.fromNodeNum, ...routeForward, tr.toNodeNum];
-        const forwardPositions: Array<{ nodeNum: number; pos: [number, number] }> = [];
-
-        // Build forward sequence with positions (prefer snapshot positions)
-        forwardSequence.forEach(nodeNum => {
-          const pos = resolvePosition(nodeNum);
-          if (pos) {
-            forwardPositions.push({ nodeNum, pos });
-          }
+        segmentsList.push({
+          ...segment,
+          key: `tr-${idx}-${segment.key}`,
         });
-
-        // Create forward segments and count usage
-        for (let i = 0; i < forwardPositions.length - 1; i++) {
-          const from = forwardPositions[i];
-          const to = forwardPositions[i + 1];
-          const segmentKey = [from.nodeNum, to.nodeNum].sort().join('-');
-
-          segmentUsage.set(segmentKey, (segmentUsage.get(segmentKey) || 0) + 1);
-
-          // Collect SNR value with timestamp for this segment
-          if (snrForward[i] !== undefined) {
-            const snrValue = snrForward[i] / 4; // Scale SNR value
-            if (!segmentSNRs.has(segmentKey)) {
-              segmentSNRs.set(segmentKey, []);
-            }
-            segmentSNRs.get(segmentKey)!.push({ snr: snrValue, timestamp });
-            if (isUnknownSnr(snrValue)) {
-              segmentHasMqtt.set(segmentKey, true);
-            }
-          }
-
-          // Track most recent timestamp for temporal fade
-          const existingTsFwd = segmentLatestTimestamp.get(segmentKey) || 0;
-          if (timestamp > existingTsFwd) {
-            segmentLatestTimestamp.set(segmentKey, timestamp);
-          }
-
-          segmentsList.push({
-            key: `tr-${idx}-fwd-seg-${i}`,
-            positions: [from.pos, to.pos],
-            nodeNums: [from.nodeNum, to.nodeNum],
-          });
-        }
-
-        // Process return path
-        const snrBack = tr.snrBack && tr.snrBack !== 'null' && tr.snrBack !== '' ? JSON.parse(tr.snrBack) : [];
-        // Build return path: requester -> routeBack -> responder (toNodeNum -> fromNodeNum)
-        const backSequence: number[] = [tr.toNodeNum, ...routeBack, tr.fromNodeNum];
-        const backPositions: Array<{ nodeNum: number; pos: [number, number] }> = [];
-
-        // Build back sequence with positions (prefer snapshot positions)
-        backSequence.forEach(nodeNum => {
-          const pos = resolvePosition(nodeNum);
-          if (pos) {
-            backPositions.push({ nodeNum, pos });
-          }
-        });
-
-        // Create back segments and count usage
-        for (let i = 0; i < backPositions.length - 1; i++) {
-          const from = backPositions[i];
-          const to = backPositions[i + 1];
-          const segmentKey = [from.nodeNum, to.nodeNum].sort().join('-');
-
-          segmentUsage.set(segmentKey, (segmentUsage.get(segmentKey) || 0) + 1);
-
-          // Collect SNR value with timestamp for this segment
-          if (snrBack[i] !== undefined) {
-            const snrValue = snrBack[i] / 4; // Scale SNR value
-            if (!segmentSNRs.has(segmentKey)) {
-              segmentSNRs.set(segmentKey, []);
-            }
-            segmentSNRs.get(segmentKey)!.push({ snr: snrValue, timestamp });
-            if (isUnknownSnr(snrValue)) {
-              segmentHasMqtt.set(segmentKey, true);
-            }
-          }
-
-          // Track most recent timestamp for temporal fade
-          const existingTsBack = segmentLatestTimestamp.get(segmentKey) || 0;
-          if (timestamp > existingTsBack) {
-            segmentLatestTimestamp.set(segmentKey, timestamp);
-          }
-
-          segmentsList.push({
-            key: `tr-${idx}-back-seg-${i}`,
-            positions: [from.pos, to.pos],
-            nodeNums: [from.nodeNum, to.nodeNum],
-          });
-        }
-      } catch (error) {
-        logger.error('Error parsing traceroute:', error);
       }
     });
 
-    // Filter segments to only include those where both endpoints are visible
-    // This ensures route segments are hidden when their connected nodes are filtered out
+    // A real endpoint must pass the map filters. An anonymous placeholder has
+    // no ordinary node marker/filter row; its explicit estimated-hop marker is
+    // the endpoint, so it remains eligible.
     let filteredSegments = visibleNodeNums
       ? segmentsList.filter(segment => {
-          const [nodeNum1, nodeNum2] = segment.nodeNums;
-          return visibleNodeNums.has(nodeNum1) && visibleNodeNums.has(nodeNum2);
+          const fromVisible =
+            !isValidRouteNode(segment.fromNodeNum) || visibleNodeNums.has(segment.fromNodeNum);
+          const toVisible =
+            !isValidRouteNode(segment.toNodeNum) || visibleNodeNums.has(segment.toNodeNum);
+          return fromVisible && toVisible;
         })
       : segmentsList;
 
@@ -355,7 +290,7 @@ export function useTraceroutePaths({
     if (mapZoom !== undefined && mapZoom < 8) {
       // Regional view: only show segments with good or medium SNR (filter out poor/unknown)
       filteredSegments = filteredSegments.filter(segment => {
-        const segKey = segment.nodeNums.slice().sort().join('-');
+        const segKey = segmentPairKey(segment);
         const snrData = segmentSNRs.get(segKey);
         if (!snrData || snrData.length === 0) return false; // Hide unknown segments at low zoom
         const rfSnrs = snrData.filter(d => !isUnknownSnr(d.snr)).map(d => d.snr);
@@ -370,8 +305,8 @@ export function useTraceroutePaths({
     // popup/className below can read them straight off `seg` instead of a
     // side-table lookup.
     const renderSegments: TracerouteRenderSegment[] = filteredSegments.map(segment => {
-      const segmentKey = segment.nodeNums.slice().sort().join('-');
-      const usage = segmentUsage.get(segmentKey) || 1;
+      const segmentKey = segmentPairKey(segment);
+      const usage = segmentTraceIds.get(segmentKey)?.size ?? 1;
       // A segment is MQTT/IP only when the firmware reported the unknown-SNR
       // sentinel for that specific hop (issue #2931). Don't infer from
       // `node.viaMqtt` — that flag tracks how the node's own NodeInfo last
@@ -385,11 +320,7 @@ export function useTraceroutePaths({
       const latestTimestamp = segmentLatestTimestamp.get(segmentKey);
 
       return {
-        key: segment.key,
-        from: segment.positions[0],
-        to: segment.positions[1],
-        fromNodeNum: segment.nodeNums[0],
-        toNodeNum: segment.nodeNums[1],
+        ...segment,
         // Aggregated bidirectionally across (possibly many) traceroutes —
         // not a single forward/return leg, so 'neutral' (curvature 0 either
         // way for this layer, per the consumer table).
@@ -412,34 +343,26 @@ export function useTraceroutePaths({
     const renderBasePopup = (seg: TracerouteRenderSegment): React.ReactNode => {
       const nodeNum1 = seg.fromNodeNum;
       const nodeNum2 = seg.toNodeNum;
-      const segmentKey = [nodeNum1, nodeNum2].sort().join('-');
-      const usage = segmentUsage.get(segmentKey) || 1;
+      const segmentKey = segmentPairKey(seg);
+      const usage = segmentTraceIds.get(segmentKey)?.size ?? 1;
       const node1 = nodeByNum.get(nodeNum1);
       const node2 = nodeByNum.get(nodeNum2);
       const isMqttSegment = seg.isMqtt;
       const node1Name =
         nodeNum1 === BROADCAST_ADDR
-          ? '(unknown)'
+          ? 'Unknown hop'
           : node1?.user?.longName || node1?.user?.shortName || `!${nodeNum1.toString(16)}`;
       const node2Name =
         nodeNum2 === BROADCAST_ADDR
-          ? '(unknown)'
+          ? 'Unknown hop'
           : node2?.user?.longName || node2?.user?.shortName || `!${nodeNum2.toString(16)}`;
 
-      let segmentDistanceKm = 0;
-      if (
-        node1?.position?.latitude &&
-        node1?.position?.longitude &&
-        node2?.position?.latitude &&
-        node2?.position?.longitude
-      ) {
-        segmentDistanceKm = calculateDistance(
-          node1.position.latitude,
-          node1.position.longitude,
-          node2.position.latitude,
-          node2.position.longitude
-        );
-      }
+      const segmentDistanceKm = calculateDistance(
+        seg.from[0],
+        seg.from[1],
+        seg.to[0],
+        seg.to[1],
+      );
 
       return (
         <RouteSegmentPopup
@@ -484,7 +407,11 @@ export function useTraceroutePaths({
                 }
               : undefined
           }
-          onUsageClick={() => callbacks.onSelectRouteSegment(nodeNum1, nodeNum2)}
+          onUsageClick={
+            isValidRouteNode(nodeNum1) && isValidRouteNode(nodeNum2)
+              ? () => callbacks.onSelectRouteSegment(nodeNum1, nodeNum2)
+              : undefined
+          }
         />
       );
     };
@@ -506,6 +433,15 @@ export function useTraceroutePaths({
         temporalFade
         renderPopup={renderBasePopup}
         segmentClassName={baseSegmentClassName}
+        showEstimatedHopMarkers
+        estimatedHopName={(nodeNum) => {
+          const node = nodeByNum.get(nodeNum);
+          return node?.user?.longName || node?.user?.shortName || (
+            isValidRouteNode(nodeNum)
+              ? `!${nodeNum.toString(16).padStart(8, '0')}`
+              : 'Unknown hop'
+          );
+        }}
       />,
     ];
   }, [showPaths, traceroutesDigest, nodesPositionDigest, distanceUnit, maxNodeAgeHours, themeColors.snrColors, themeColors.mqttSegment, themeColors.overlay0, callbacks, visibleNodeNums, mapZoom, liveNodePositions]);
@@ -548,7 +484,13 @@ export function useTraceroutePaths({
           timestamp: selectedTrace.timestamp,
           createdAt: selectedTrace.createdAt,
         },
-        { resolvePosition }
+        {
+          resolvePosition,
+          estimateMissingHops: true,
+          canEstimateHop: (nodeNum) =>
+            !isValidRouteNode(nodeNum) || !visibleNodeNums || visibleNodeNums.has(nodeNum),
+          traceKey: `selected-${selectedTrace.timestamp ?? selectedTrace.createdAt ?? 'latest'}`,
+        }
       );
 
       if (segments.length === 0) return null;
@@ -559,9 +501,24 @@ export function useTraceroutePaths({
       const toName = toNode?.user?.longName || toNode?.user?.shortName || selectedTrace.toNodeId;
 
       const nameForNode = (num: number): string => {
+        if (!isValidRouteNode(num)) return 'Unknown hop';
         const n = nodesPositionDigest.find(nd => nd.nodeNum === num);
         return n?.user?.longName || n?.user?.shortName || `!${num.toString(16)}`;
       };
+
+      // Assign one deterministic color to each physical hop in this selected
+      // trace. The same A↔B link keeps its color on the return leg, while a
+      // different return route receives its own colors.
+      const hopColorByKey = new Map<string, string>();
+      for (const segment of segments) {
+        const key = segmentPairKey(segment);
+        if (!hopColorByKey.has(key)) {
+          hopColorByKey.set(
+            key,
+            SELECTED_HOP_COLORS[hopColorByKey.size % SELECTED_HOP_COLORS.length],
+          );
+        }
+      }
 
       // Leg-level popup metadata (distance, path listing) — computed once per
       // leg and reused across all of that leg's per-hop popups, matching the
@@ -607,6 +564,11 @@ export function useTraceroutePaths({
               <div className="route-usage">
                 Path:{' '}{isForward ? forwardPathLabel : backPathLabel}
               </div>
+              {typeof seg.hopIndex === 'number' && typeof seg.hopCount === 'number' && (
+                <div className="route-usage">
+                  Hop: <strong>{seg.hopIndex + 1} of {seg.hopCount}</strong>
+                </div>
+              )}
               {legDistance > 0 && (
                 <div className="route-usage">
                   Distance: <strong>{formatDistance(legDistance, distanceUnit)}</strong>
@@ -628,24 +590,25 @@ export function useTraceroutePaths({
           key="selected-traceroute-layer"
           segments={segments}
           snrColors={themeColors.snrColors ?? FALLBACK_SNR_COLORS}
-          colorMode="fixed-leg"
-          legColors={{
-            forward: themeColors.tracerouteForward ?? themeColors.blue,
-            return: themeColors.tracerouteReturn ?? themeColors.red,
-          }}
+          colorMode="custom"
+          segmentColor={(segment) =>
+            hopColorByKey.get(segmentPairKey(segment)) ?? themeColors.overlay0
+          }
           curvature={0.2}
           weight={tracerouteSegmentWeight}
           opacity={0.9}
           dashMode="mqtt-unknown"
           showArrows
           renderPopup={renderSelectedPopup}
+          showEstimatedHopMarkers
+          estimatedHopName={nameForNode}
         />,
       ];
     } catch (error) {
       logger.error('Error rendering selected node traceroute:', error);
       return null;
     }
-  }, [showRoute, selectedNodeId, traceroutesDigest, nodesPositionDigest, currentNodeId, distanceUnit, themeColors.red, themeColors.blue, themeColors.tracerouteForward, themeColors.tracerouteReturn, themeColors.snrColors, liveNodePositions]);
+  }, [showRoute, selectedNodeId, traceroutesDigest, nodesPositionDigest, currentNodeId, distanceUnit, themeColors.overlay0, themeColors.snrColors, liveNodePositions, visibleNodeNums]);
 
   // Compute the set of node numbers involved in the selected traceroute.
   // Used for filtering map markers to only show nodes in the active

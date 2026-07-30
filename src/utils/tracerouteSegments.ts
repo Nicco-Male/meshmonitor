@@ -10,9 +10,10 @@
  *     return line when the return path hasn't been recorded yet).
  *   - #2931 — the firmware unknown-SNR sentinel (MQTT-bridged / relay-role /
  *     decrypt-failure hops report a sentinel value, not a real SNR reading).
- *   - reserved/broadcast node-number filtering (route arrays can contain
- *     firmware placeholder values for a relay-role hop that never resolved
- *     its identity; segments touching them join across, not gap).
+ *   - reserved/broadcast node-number handling (route arrays can contain a
+ *     firmware placeholder for a relay-role hop that never exposed its
+ *     identity; that hop must remain in the path, never be collapsed into a
+ *     false direct link).
  *
  * `src/utils/mapHelpers.tsx` re-exports `UNKNOWN_SNR_SENTINEL`/`isUnknownSnr`
  * from here for backward compatibility with existing importers. This file
@@ -59,7 +60,7 @@ export function averageNonSentinelSnr(samples: Array<{ snr: number }> | undefine
 // Reserved/broadcast node-number filtering
 // ---------------------------------------------------------------------------
 
-const BROADCAST_ADDR = 4294967295;
+export const BROADCAST_ADDR = 4294967295;
 
 /**
  * True for a real, renderable node number — false for firmware reserved or
@@ -77,6 +78,15 @@ export function isValidRouteNode(nodeNum: number): boolean {
   if (nodeNum === 65535) return false;
   if (nodeNum === BROADCAST_ADDR) return false;
   return true;
+}
+
+/**
+ * True for the firmware's anonymous-hop placeholder. Unlike the other
+ * reserved values, `0xffffffff` is meaningful route topology: it says a real
+ * relay occurred but declined to expose its node number.
+ */
+export function isUnknownRouteNode(nodeNum: number): boolean {
+  return nodeNum === BROADCAST_ADDR;
 }
 
 // ---------------------------------------------------------------------------
@@ -219,6 +229,18 @@ export interface TracerouteRenderSegment {
   /** Hop node numbers this segment connects, in traversal order (from -> to). */
   fromNodeNum: number;
   toNodeNum: number;
+  /** Stable per-hop identities. Real nodes use `node:<nodeNum>`; anonymous
+   *  firmware placeholders are scoped to the traceroute + leg + hop index so
+   *  unrelated hidden relays are never aggregated together. */
+  fromHopKey?: string;
+  toHopKey?: string;
+  /** True when the endpoint did not have a reported/snapshot position and was
+   *  placed by signal-weighted interpolation between positioned route anchors. */
+  fromPositionEstimated?: boolean;
+  toPositionEstimated?: boolean;
+  /** Zero-based hop index within this directional leg, plus total hop count. */
+  hopIndex?: number;
+  hopCount?: number;
   leg: 'forward' | 'return' | 'neutral';
   direction?: 'inbound' | 'outbound' | 'neutral'; // MapAnalysis relative-to-selection
   avgSnr: number | null;               // /4-scaled dB; null = no data
@@ -251,6 +273,18 @@ export interface DecomposeTracerouteOptions {
    *  pre-existing renderers' "only push a segment when both endpoints
    *  resolve" behavior). Typically `(n) => resolveSegmentPosition(n, snapshot, liveNodes)`. */
   resolvePosition: (nodeNum: number) => [number, number] | null;
+  /**
+   * Estimate unresolved intermediate hops between the nearest positioned
+   * anchors. This never estimates a missing source/destination endpoint and
+   * never joins across an unresolved hop.
+   */
+  estimateMissingHops?: boolean;
+  /** Optional visibility/permission gate for position estimation. Anonymous
+   *  firmware placeholders should normally return true. */
+  canEstimateHop?: (nodeNum: number) => boolean;
+  /** Caller-owned identity used to keep anonymous placeholders from different
+   *  traceroute records distinct during cross-trace aggregation. */
+  traceKey?: string;
 }
 
 /** `JSON.parse` a route/hop/SNR array, tolerating null/'null'/'' (all -> []).
@@ -283,6 +317,95 @@ interface HopEntry {
   /** Already-scaled by caller? No — raw firmware int (dB x4); undefined for
    *  the leg's start (nothing "arrives" there) or a missing array entry. */
   snr: number | undefined;
+  position: [number, number] | null;
+  positionEstimated: boolean;
+  hopKey: string;
+}
+
+/**
+ * Relative edge-length proxy derived from SNR. Higher SNR means a shorter
+ * likely radio span. The unknown-SNR sentinel is deliberately neutral.
+ */
+function edgeLengthProxy(rawSnr: number | undefined): number {
+  if (rawSnr === undefined) return 1;
+  const snrDb = rawSnr / 4;
+  if (!Number.isFinite(snrDb) || isUnknownSnr(snrDb)) return 1;
+  // Free-space distance is proportional to 10^(-SNR/20). Clamp the input so a
+  // single noisy sample cannot pin an estimated hop exactly onto an anchor.
+  const clampedDb = Math.max(-20, Math.min(20, snrDb));
+  return Math.pow(10, -clampedDb / 20);
+}
+
+/** Interpolate longitude across the antimeridian via the shorter arc. */
+function interpolatePosition(
+  from: [number, number],
+  to: [number, number],
+  fraction: number,
+): [number, number] {
+  const lat = from[0] + (to[0] - from[0]) * fraction;
+  let lngDelta = to[1] - from[1];
+  if (lngDelta > 180) lngDelta -= 360;
+  if (lngDelta < -180) lngDelta += 360;
+  let lng = from[1] + lngDelta * fraction;
+  if (lng > 180) lng -= 360;
+  if (lng < -180) lng += 360;
+  return [lat, lng];
+}
+
+/**
+ * Fill each contiguous run of unresolved *intermediate* hops when it is
+ * bracketed by positioned route anchors. Edge SNRs determine the relative
+ * spacing: stronger links are shorter, weaker links are longer. This is a
+ * route-local fallback for immediate rendering; the server's persistent
+ * multi-observation estimator remains the authoritative triangulation.
+ */
+function estimateBracketedHopPositions(
+  hops: HopEntry[],
+  canEstimateHop: (nodeNum: number) => boolean,
+): void {
+  let index = 1;
+  while (index < hops.length - 1) {
+    if (hops[index].position) {
+      index += 1;
+      continue;
+    }
+
+    const runStart = index;
+    while (index < hops.length - 1 && !hops[index].position) index += 1;
+    const runEnd = index - 1;
+    const leftIndex = runStart - 1;
+    const rightIndex = index;
+    const left = hops[leftIndex];
+    const right = hops[rightIndex];
+
+    if (
+      !left.position ||
+      !right.position ||
+      !hops.slice(runStart, runEnd + 1).every((hop) => canEstimateHop(hop.nodeNum))
+    ) {
+      continue;
+    }
+
+    const edgeLengths: number[] = [];
+    let totalLength = 0;
+    for (let edge = leftIndex; edge < rightIndex; edge += 1) {
+      const length = edgeLengthProxy(hops[edge + 1].snr);
+      edgeLengths.push(length);
+      totalLength += length;
+    }
+    if (!(totalLength > 0) || !Number.isFinite(totalLength)) continue;
+
+    let travelled = 0;
+    for (let hopIndex = runStart; hopIndex <= runEnd; hopIndex += 1) {
+      travelled += edgeLengths[hopIndex - leftIndex - 1];
+      hops[hopIndex].position = interpolatePosition(
+        left.position,
+        right.position,
+        travelled / totalLength,
+      );
+      hops[hopIndex].positionEstimated = true;
+    }
+  }
 }
 
 function buildLegSegments(
@@ -292,51 +415,82 @@ function buildLegSegments(
   endNum: number,
   snrRaw: number[],
   timestamp: number | undefined,
-  resolvePosition: (nodeNum: number) => [number, number] | null,
+  opts: DecomposeTracerouteOptions,
 ): TracerouteRenderSegment[] {
   // Pair every raw hop (including the end endpoint) with its own arrival SNR
-  // by index BEFORE filtering, then drop invalid/reserved intermediate hops.
-  // Endpoints (index 0 and the last index) are never filtered — they're real
-  // device node numbers, not raw route placeholders. This preserves index
-  // alignment between a hop and its SNR sample even when hops in between are
-  // dropped: adjacent segments join across the removed hop, carrying the
-  // correct arrival SNR for the surviving side.
+  // by index. Crucially, never filter/compress the topology here: removing an
+  // anonymous or unpositioned relay would turn A→?→B into a false A→B link.
+  const traceKey = opts.traceKey ?? 'trace';
   const hops: HopEntry[] = [
-    { nodeNum: startNum, snr: undefined },
-    ...intermediateHops.map((nodeNum, idx): HopEntry => ({
-      nodeNum,
-      snr: idx < snrRaw.length ? snrRaw[idx] : undefined,
-    })),
+    {
+      nodeNum: startNum,
+      snr: undefined,
+      position: opts.resolvePosition(startNum),
+      positionEstimated: false,
+      hopKey: `node:${startNum}`,
+    },
+    ...intermediateHops.map((nodeNum, idx): HopEntry => {
+      const identityKnown = isValidRouteNode(nodeNum);
+      return {
+        nodeNum,
+        snr: idx < snrRaw.length ? snrRaw[idx] : undefined,
+        // Reserved placeholders must never accidentally resolve through a
+        // globally-stored row keyed by their shared sentinel value.
+        position: identityKnown ? opts.resolvePosition(nodeNum) : null,
+        positionEstimated: false,
+        hopKey: identityKnown
+          ? `node:${nodeNum}`
+          : `${traceKey}:${leg}:unknown:${idx}:${nodeNum}`,
+      };
+    }),
     {
       nodeNum: endNum,
       snr: intermediateHops.length < snrRaw.length ? snrRaw[intermediateHops.length] : undefined,
+      position: opts.resolvePosition(endNum),
+      positionEstimated: false,
+      hopKey: `node:${endNum}`,
     },
   ];
-  const filtered = hops.filter(
-    (h, idx) => idx === 0 || idx === hops.length - 1 || isValidRouteNode(h.nodeNum),
-  );
+
+  if (opts.estimateMissingHops) {
+    estimateBracketedHopPositions(
+      hops,
+      opts.canEstimateHop ?? ((nodeNum) => isValidRouteNode(nodeNum) || isUnknownRouteNode(nodeNum)),
+    );
+  }
 
   const segments: TracerouteRenderSegment[] = [];
-  for (let i = 0; i < filtered.length - 1; i++) {
-    const fromNum = filtered[i].nodeNum;
-    const toNum = filtered[i + 1].nodeNum;
-    const fromPos = resolvePosition(fromNum);
-    const toPos = resolvePosition(toNum);
+  for (let i = 0; i < hops.length - 1; i++) {
+    const fromHop = hops[i];
+    const toHop = hops[i + 1];
+    const fromNum = fromHop.nodeNum;
+    const toNum = toHop.nodeNum;
+    const fromPos = fromHop.position;
+    const toPos = toHop.position;
     if (!fromPos || !toPos) continue;
 
     // SNR arriving at the segment's `to` end is what firmware recorded for
     // this hop (see HopEntry above).
-    const rawSnr = filtered[i + 1].snr;
+    const rawSnr = toHop.snr;
     const scaledSnr = rawSnr === undefined ? undefined : rawSnr / 4;
     const isMqtt = scaledSnr !== undefined && isUnknownSnr(scaledSnr);
     const avgSnr = scaledSnr === undefined || isMqtt ? null : scaledSnr;
 
     segments.push({
-      key: `${leg}:${fromNum}-${toNum}`,
+      key:
+        isValidRouteNode(fromNum) && isValidRouteNode(toNum)
+          ? `${leg}:${fromNum}-${toNum}`
+          : `${leg}:${fromHop.hopKey}-${toHop.hopKey}`,
       from: fromPos,
       to: toPos,
       fromNodeNum: fromNum,
       toNodeNum: toNum,
+      fromHopKey: fromHop.hopKey,
+      toHopKey: toHop.hopKey,
+      fromPositionEstimated: fromHop.positionEstimated,
+      toPositionEstimated: toHop.positionEstimated,
+      hopIndex: i,
+      hopCount: hops.length - 1,
       leg,
       avgSnr,
       isMqtt,
@@ -385,7 +539,7 @@ export function decomposeTraceroute(
         traceroute.toNodeNum,
         snrTowards,
         timestamp,
-        opts.resolvePosition,
+        opts,
       ),
     );
   }
@@ -401,7 +555,7 @@ export function decomposeTraceroute(
         traceroute.fromNodeNum,
         snrBack,
         timestamp,
-        opts.resolvePosition,
+        opts,
       ),
     );
   }

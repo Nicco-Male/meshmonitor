@@ -6,6 +6,7 @@ import { describe, it, expect } from 'vitest';
 import {
   UNKNOWN_SNR_SENTINEL,
   isUnknownSnr,
+  isUnknownRouteNode,
   isValidRouteNode,
   parseSnapshotRoutePositions,
   resolveSegmentPosition,
@@ -359,7 +360,7 @@ describe('decomposeTraceroute', () => {
     expect(decomposeTraceroute(tr, { resolvePosition })).toEqual([]);
   });
 
-  it('filters reserved/placeholder node numbers out of the route, joining adjacent segments across the removed hop (review F2)', () => {
+  it('never joins across a reserved/placeholder hop with no position', () => {
     const resolveWithExtra = (nodeNum: number): [number, number] | null =>
       nodeNum === 175 ? [17, 17] : resolvePosition(nodeNum);
     const tr: TracerouteDecomposeInput = {
@@ -371,16 +372,89 @@ describe('decomposeTraceroute', () => {
       snrTowards: JSON.stringify([40, -128, 28, 20]),
     };
     const segments = decomposeTraceroute(tr, { resolvePosition: resolveWithExtra });
+    // 150→65535 and 65535→175 cannot be placed, so they remain a visible gap.
+    // Most importantly there is no fabricated 150→175 physical link.
     expect(segments.map((s) => s.key)).toEqual([
       'forward:100-150',
-      'forward:150-175',
       'forward:175-200',
     ]);
-    // The dropped hop's own arrival SNR (-128, index 1) is discarded with it —
-    // the surviving joined segment keeps 175's OWN arrival SNR (28, index 2),
-    // not the removed node's.
-    const joined = segments.find((s) => s.key === 'forward:150-175');
-    expect(joined).toMatchObject({ fromNodeNum: 150, toNodeNum: 175, avgSnr: 7, isMqtt: false });
+    expect(segments.some((s) => s.fromNodeNum === 150 && s.toNodeNum === 175)).toBe(false);
+  });
+
+  it('inserts an anonymous firmware hop at a signal-weighted estimated position', () => {
+    const resolveWithExtra = (nodeNum: number): [number, number] | null =>
+      nodeNum === 175 ? [17, 17] : resolvePosition(nodeNum);
+    const tr: TracerouteDecomposeInput = {
+      fromNodeNum: 100,
+      toNodeNum: 200,
+      route: JSON.stringify([150, 4294967295, 175]),
+      routeBack: '[]',
+      snrTowards: JSON.stringify([40, -128, 28, 20]),
+    };
+    const segments = decomposeTraceroute(tr, {
+      resolvePosition: resolveWithExtra,
+      estimateMissingHops: true,
+      traceKey: 'trace-7',
+    });
+
+    expect(segments).toHaveLength(4);
+    expect(segments.map((s) => [s.fromNodeNum, s.toNodeNum])).toEqual([
+      [100, 150],
+      [150, 4294967295],
+      [4294967295, 175],
+      [175, 200],
+    ]);
+    const intoUnknown = segments[1];
+    const outOfUnknown = segments[2];
+    expect(intoUnknown.toPositionEstimated).toBe(true);
+    expect(outOfUnknown.fromPositionEstimated).toBe(true);
+    expect(intoUnknown.to).toEqual(outOfUnknown.from);
+    expect(intoUnknown.to[0]).toBeGreaterThan(15);
+    expect(intoUnknown.to[0]).toBeLessThan(17);
+    expect(intoUnknown.toHopKey).toContain('trace-7:forward:unknown:1');
+    // Arrival SNRs remain attached to their original raw hops.
+    expect(intoUnknown).toMatchObject({ avgSnr: null, isMqtt: true });
+    expect(outOfUnknown).toMatchObject({ avgSnr: 7, isMqtt: false });
+  });
+
+  it('estimates a known but unpositioned hop closer to the stronger-SNR anchor', () => {
+    const tr: TracerouteDecomposeInput = {
+      fromNodeNum: 100,
+      toNodeNum: 200,
+      route: JSON.stringify([160]),
+      routeBack: '[]',
+      // Strong first link, weak second link.
+      snrTowards: JSON.stringify([40, -20]),
+    };
+    const segments = decomposeTraceroute(tr, {
+      resolvePosition,
+      estimateMissingHops: true,
+      traceKey: 'known-missing',
+    });
+
+    expect(segments).toHaveLength(2);
+    const estimated = segments[0].to;
+    expect(estimated[0]).toBeGreaterThan(10);
+    expect(estimated[0]).toBeLessThan(15);
+    expect(segments[0].toPositionEstimated).toBe(true);
+    expect(segments[1].fromPositionEstimated).toBe(true);
+  });
+
+  it('honors the estimation visibility gate and leaves a gap instead of a direct link', () => {
+    const tr: TracerouteDecomposeInput = {
+      fromNodeNum: 100,
+      toNodeNum: 200,
+      route: JSON.stringify([160]),
+      routeBack: '[]',
+      snrTowards: JSON.stringify([40, 20]),
+    };
+    const segments = decomposeTraceroute(tr, {
+      resolvePosition,
+      estimateMissingHops: true,
+      canEstimateHop: () => false,
+    });
+
+    expect(segments).toEqual([]);
   });
 
   it('carries fromNodeNum/toNodeNum hop identity on every segment (review F5)', () => {
@@ -409,6 +483,14 @@ describe('isValidRouteNode (single home, review F2)', () => {
 
   it.each([4, 100, 65534, 4294967294])('accepts real node numbers %i', (n) => {
     expect(isValidRouteNode(n)).toBe(true);
+  });
+});
+
+describe('isUnknownRouteNode', () => {
+  it('recognizes only the firmware anonymous-hop placeholder', () => {
+    expect(isUnknownRouteNode(4294967295)).toBe(true);
+    expect(isUnknownRouteNode(65535)).toBe(false);
+    expect(isUnknownRouteNode(100)).toBe(false);
   });
 });
 

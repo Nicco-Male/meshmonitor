@@ -315,11 +315,17 @@ export default function DashboardMap({
   // reference instead of drifting per-node inside the marker map loop below.
   const nowMs = Date.now();
   const cutoffTime = nowMs / 1000 - effectiveMaxAge * 60 * 60;
-  const nodesWithTruePos = nodes
+  const mapEligibleNodes = nodes
     .filter((n) => !n.isIgnored)
     .filter((n) => !n.hideFromMap) // #3549: per-node "Hide from Map" suppresses the marker only
     .filter((n) => n.isFavorite || (n.lastHeard != null && n.lastHeard >= cutoffTime))
-    .filter((n) => nodePassesTransportFilter(n, { showRfNodes, showUdpNodes, showMqttNodes }, cutoffTime))
+    .filter((n) => nodePassesTransportFilter(n, { showRfNodes, showUdpNodes, showMqttNodes }, cutoffTime));
+  const mapEligibleNodeNumsKey = mapEligibleNodes
+    .map((node) => Number(node?.nodeNum))
+    .filter((nodeNum) => Number.isFinite(nodeNum))
+    .sort((a, b) => a - b)
+    .join(',');
+  const nodesWithTruePos = mapEligibleNodes
     .map((n) => ({ node: n, truePos: getNodeLatLng(n) }))
     .filter((e): e is { node: any; truePos: { lat: number; lng: number } } => e.truePos !== null);
 
@@ -458,6 +464,11 @@ export default function DashboardMap({
   // same node pair and the util itself only decomposes one record at a time.
   const tracerouteRenderSegments = useMemo<DashboardTracerouteRenderSegment[]>(() => {
     if (!showPaths && !showRoute) return [];
+    const mapEligibleNodeNums = new Set<number>(
+      mapEligibleNodeNumsKey
+        ? mapEligibleNodeNumsKey.split(',').map(Number)
+        : [],
+    );
     // Map Features age slider (#3322): hide traceroutes/route segments older
     // than the chosen age. Default (slider at max) keeps the prior behavior.
     const trCutoffMs = Date.now() - effectiveMaxAge * 60 * 60 * 1000;
@@ -495,14 +506,22 @@ export default function DashboardMap({
           timestamp: tr?.timestamp,
           createdAt: tr?.createdAt,
         },
-        { resolvePosition },
+        {
+          resolvePosition,
+          estimateMissingHops: true,
+          canEstimateHop: (nodeNum) =>
+            nodeNum === 0xffffffff || mapEligibleNodeNums.has(nodeNum),
+          traceKey: keyPrefix,
+        },
       );
       for (const seg of decomposed) {
-        const lowNodeNum = Math.min(seg.fromNodeNum, seg.toNodeNum);
-        const highNodeNum = Math.max(seg.fromNodeNum, seg.toNodeNum);
+        const fromHopKey = seg.fromHopKey ?? `node:${seg.fromNodeNum}`;
+        const toHopKey = seg.toHopKey ?? `node:${seg.toNodeNum}`;
+        const lowHopKey = fromHopKey < toHopKey ? fromHopKey : toHopKey;
+        const highHopKey = fromHopKey < toHopKey ? toHopKey : fromHopKey;
         // Source is part of the aggregate key: Unified popups must never mix
         // observations from different radios for the same physical node pair.
-        const popupAggregateKey = `${traceSourceId ?? 'legacy'}:${lowNodeNum}:${highNodeNum}`;
+        const popupAggregateKey = `${traceSourceId ?? 'legacy'}:${lowHopKey}:${highHopKey}`;
         let aggregate = popupAggregates.get(popupAggregateKey);
         if (!aggregate) {
           aggregate = {
@@ -559,10 +578,11 @@ export default function DashboardMap({
     effectiveMaxAge,
     isUnified,
     sourceId,
+    mapEligibleNodeNumsKey,
   ]);
 
   const tracerouteNodeNameByNum = new Map<number, string>();
-  for (const { node } of nodesWithPosition) {
+  for (const node of nodes) {
     if (typeof node?.nodeNum !== 'number') continue;
     tracerouteNodeNameByNum.set(
       node.nodeNum,
@@ -580,12 +600,12 @@ export default function DashboardMap({
     const fromName =
       tracerouteNodeNameByNum.get(segment.fromNodeNum) ??
       (segment.fromNodeNum === 0xffffffff
-        ? '(unknown)'
+        ? 'Unknown hop'
         : `!${segment.fromNodeNum.toString(16)}`);
     const toName =
       tracerouteNodeNameByNum.get(segment.toNodeNum) ??
       (segment.toNodeNum === 0xffffffff
-        ? '(unknown)'
+        ? 'Unknown hop'
         : `!${segment.toNodeNum.toString(16)}`);
     const distanceKm = calculateDistance(
       segment.from[0],
@@ -822,6 +842,13 @@ export default function DashboardMap({
             opacity={0.85}
             dashMode="mqtt-unknown"
             renderPopup={renderDashboardTraceroutePopup}
+            showEstimatedHopMarkers={!showRoute}
+            estimatedHopName={(nodeNum) =>
+              tracerouteNodeNameByNum.get(nodeNum) ??
+              (nodeNum === 0xffffffff
+                ? 'Unknown hop'
+                : `!${nodeNum.toString(16).padStart(8, '0')}`)
+            }
           />
         )}
 
@@ -837,6 +864,13 @@ export default function DashboardMap({
             opacity={0.6}
             dashMode="never"
             renderPopup={renderDashboardTraceroutePopup}
+            showEstimatedHopMarkers
+            estimatedHopName={(nodeNum) =>
+              tracerouteNodeNameByNum.get(nodeNum) ??
+              (nodeNum === 0xffffffff
+                ? 'Unknown hop'
+                : `!${nodeNum.toString(16).padStart(8, '0')}`)
+            }
           />
         )}
 
