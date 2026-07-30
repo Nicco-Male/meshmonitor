@@ -18,7 +18,10 @@ export type {
   DbApiToken, CreateApiTokenInput,
   DbAuditLogEntry,
 } from './auth.js';
-export { TraceroutesRepository } from './traceroutes.js';
+export {
+  TraceroutesRepository,
+  normalizeTracerouteResponseEndpoints,
+} from './traceroutes.js';
 export { NeighborsRepository } from './neighbors.js';
 export type { DirectNeighborStats } from './neighbors.js';
 export { NotificationsRepository } from './notifications.js';
