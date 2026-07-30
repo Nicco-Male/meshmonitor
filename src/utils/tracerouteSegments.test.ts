@@ -11,6 +11,7 @@ import {
   parseSnapshotRoutePositions,
   resolveSegmentPosition,
   buildLiveNodePositionMap,
+  consolidateEstimatedNodePositions,
   hasReturnPath,
   decomposeTraceroute,
   type TracerouteDecomposeInput,
@@ -31,6 +32,98 @@ describe('isUnknownSnr / UNKNOWN_SNR_SENTINEL (#2931, re-homed from mapHelpers)'
 
   it('treats undefined as NOT unknown', () => {
     expect(isUnknownSnr(undefined)).toBe(false);
+  });
+});
+
+describe('consolidateEstimatedNodePositions', () => {
+  it('uses one centroid position for every occurrence of the same real node ID', () => {
+    const segments = [
+      {
+        key: 'trace-1-into',
+        from: [0, 0] as [number, number],
+        to: [10, 20] as [number, number],
+        fromNodeNum: 100,
+        toNodeNum: 0x1234fb3c,
+        toPositionEstimated: true,
+        leg: 'forward' as const,
+        avgSnr: 5,
+        isMqtt: false,
+        timestamp: 1,
+      },
+      {
+        key: 'trace-1-out',
+        from: [10, 20] as [number, number],
+        to: [30, 30] as [number, number],
+        fromNodeNum: 0x1234fb3c,
+        toNodeNum: 200,
+        fromPositionEstimated: true,
+        leg: 'forward' as const,
+        avgSnr: 4,
+        isMqtt: false,
+        timestamp: 1,
+      },
+      {
+        key: 'trace-2-into',
+        from: [40, 40] as [number, number],
+        to: [20, 30] as [number, number],
+        fromNodeNum: 300,
+        toNodeNum: 0x1234fb3c,
+        toPositionEstimated: true,
+        leg: 'return' as const,
+        avgSnr: 3,
+        isMqtt: false,
+        timestamp: 2,
+      },
+      {
+        key: 'trace-2-out',
+        from: [20, 30] as [number, number],
+        to: [50, 50] as [number, number],
+        fromNodeNum: 0x1234fb3c,
+        toNodeNum: 400,
+        fromPositionEstimated: true,
+        leg: 'return' as const,
+        avgSnr: 2,
+        isMqtt: false,
+        timestamp: 2,
+      },
+    ];
+
+    const consolidated = consolidateEstimatedNodePositions(segments);
+    expect(consolidated[0].to).toEqual([15, 25]);
+    expect(consolidated[1].from).toEqual([15, 25]);
+    expect(consolidated[2].to).toEqual([15, 25]);
+    expect(consolidated[3].from).toEqual([15, 25]);
+  });
+
+  it('does not merge anonymous 0xffffffff hops from unrelated traces', () => {
+    const segments = [
+      {
+        key: 'trace-1',
+        from: [0, 0] as [number, number],
+        to: [10, 10] as [number, number],
+        fromNodeNum: 100,
+        toNodeNum: 0xffffffff,
+        toPositionEstimated: true,
+        leg: 'forward' as const,
+        avgSnr: null,
+        isMqtt: true,
+      },
+      {
+        key: 'trace-2',
+        from: [20, 20] as [number, number],
+        to: [30, 30] as [number, number],
+        fromNodeNum: 0xffffffff,
+        toNodeNum: 200,
+        fromPositionEstimated: true,
+        leg: 'forward' as const,
+        avgSnr: null,
+        isMqtt: true,
+      },
+    ];
+
+    const consolidated = consolidateEstimatedNodePositions(segments);
+    expect(consolidated[0].to).toEqual([10, 10]);
+    expect(consolidated[1].from).toEqual([20, 20]);
   });
 });
 
