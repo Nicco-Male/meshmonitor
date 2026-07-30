@@ -231,7 +231,12 @@ describe('ChannelDecryptionService', () => {
       const testPayload = Buffer.from([0x08, 0x01, 0x12, 0x04, 0x74, 0x65, 0x73, 0x74]);
       const encrypted = encryptTestData(testPayload, testPsk, packetId, fromNode);
 
-      mockDataType.decode.mockReturnValue({ portnum: 1, payload: Buffer.from('test') });
+      mockDataType.decode.mockReturnValue({
+        portnum: 1,
+        payload: Buffer.from('test'),
+        requestId: 0xabcdef01,
+        wantResponse: false,
+      });
 
       const result = await channelDecryptionService.tryDecrypt(
         new Uint8Array(encrypted),
@@ -243,6 +248,8 @@ describe('ChannelDecryptionService', () => {
       expect(result.channelDatabaseId).toBe(1);
       expect(result.channelName).toBe('Test Channel');
       expect(result.portnum).toBe(1);
+      expect(result.requestId).toBe(0xabcdef01);
+      expect(result.wantResponse).toBe(false);
     });
 
     it('should successfully decrypt with correct AES-128 key', async () => {
