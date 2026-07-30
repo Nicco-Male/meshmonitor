@@ -55,6 +55,8 @@ function seg(overrides: Partial<TracerouteRenderSegment> = {}): TracerouteRender
     key: 'forward:1-2',
     from: [10, 10],
     to: [20, 20],
+    fromNodeNum: 1,
+    toNodeNum: 2,
     leg: 'forward',
     avgSnr: 5,
     isMqtt: false,
@@ -170,6 +172,60 @@ describe('TraceroutePathsLayer', () => {
         fixedColor: '#facc15',
       });
       expect(screen.getByTestId('polyline').getAttribute('data-color')).toBe('#facc15');
+    });
+  });
+
+  describe('colorMode: custom', () => {
+    it('uses the caller color for each individual hop', () => {
+      renderLayer({
+        segments: [seg({ key: 'hop-a', hopIndex: 2 })],
+        weight: 3,
+        colorMode: 'custom',
+        segmentColor: (segment) => `hop-${segment.hopIndex}`,
+      });
+      expect(screen.getByTestId('polyline').getAttribute('data-color')).toBe('hop-2');
+    });
+  });
+
+  describe('estimated hop markers', () => {
+    it('renders one explicit marker for an estimated interior hop shared by two segments', () => {
+      const estimatedPosition: [number, number] = [15, 15];
+      renderLayer({
+        segments: [
+          seg({
+            key: 'into-unknown',
+            to: estimatedPosition,
+            toNodeNum: 4294967295,
+            toHopKey: 'trace:forward:unknown:0:4294967295',
+            toPositionEstimated: true,
+          }),
+          seg({
+            key: 'out-of-unknown',
+            from: estimatedPosition,
+            fromNodeNum: 4294967295,
+            fromHopKey: 'trace:forward:unknown:0:4294967295',
+            fromPositionEstimated: true,
+          }),
+        ],
+        weight: 3,
+        colorMode: 'snr',
+        showEstimatedHopMarkers: true,
+        estimatedHopName: () => 'Hidden relay',
+      });
+
+      expect(screen.getAllByTestId('circle-marker')).toHaveLength(1);
+      expect(screen.getByText('Hidden relay (estimated)')).toBeInTheDocument();
+      expect(screen.getByText('Estimated Route Hop')).toBeInTheDocument();
+      expect(screen.getByText(/not a reported GPS fix/i)).toBeInTheDocument();
+    });
+
+    it('does not render estimated markers unless explicitly enabled', () => {
+      renderLayer({
+        segments: [seg({ toPositionEstimated: true })],
+        weight: 3,
+        colorMode: 'snr',
+      });
+      expect(screen.queryByTestId('circle-marker')).not.toBeInTheDocument();
     });
   });
 

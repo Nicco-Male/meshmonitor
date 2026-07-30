@@ -306,7 +306,11 @@ const TracerouteWidget: React.FC<TracerouteWidgetProps> = ({
         timestamp: traceroute.timestamp,
         createdAt: traceroute.createdAt,
       },
-      { resolvePosition: (n) => resolveSegmentPosition(n, snapshotPositions, liveNodePositions) },
+      {
+        resolvePosition: (n) => resolveSegmentPosition(n, snapshotPositions, liveNodePositions),
+        estimateMissingHops: true,
+        traceKey: `widget-${traceroute.timestamp ?? traceroute.createdAt ?? 'latest'}`,
+      },
     );
 
     return {
@@ -515,6 +519,8 @@ const TracerouteWidget: React.FC<TracerouteWidgetProps> = ({
                         group: highlightedPath === 'back' ? 'return' : highlightedPath,
                         dimmedOpacity: 0.2,
                       }}
+                      showEstimatedHopMarkers
+                      estimatedHopName={getNodeName}
                     />
 
                     {/* Node markers */}

@@ -1,5 +1,5 @@
 import { memo, type ReactElement, type ReactNode } from 'react';
-import { Polyline } from 'react-leaflet';
+import { CircleMarker, Polyline, Popup, Tooltip } from 'react-leaflet';
 import {
   generateCurvedPath,
   generateCurvedArrowMarkers,
@@ -8,14 +8,18 @@ import {
   MQTT_DASH,
   type SnrColorScale,
 } from '../../../utils/mapHelpers';
-import { UNKNOWN_SNR_SENTINEL, type TracerouteRenderSegment } from '../../../utils/tracerouteSegments';
+import {
+  UNKNOWN_SNR_SENTINEL,
+  isUnknownRouteNode,
+  type TracerouteRenderSegment,
+} from '../../../utils/tracerouteSegments';
 
 const CURVE_SEGMENTS = 20;
 
 export interface TraceroutePathsLayerProps {
   segments: TracerouteRenderSegment[];
   snrColors: SnrColorScale;                          // theme palette (prop, not useSettings)
-  colorMode: 'snr' | 'direction' | 'fixed-leg' | 'fixed';
+  colorMode: 'snr' | 'direction' | 'fixed-leg' | 'fixed' | 'custom';
   /** `colorMode: 'snr'` only — when set, an `isMqtt` segment uses this color
    *  instead of `snrToColor(seg.avgSnr, snrColors)` (which would resolve to
    *  `noData` gray, losing the MQTT/IP-bridged distinction). Omit to fall
@@ -24,6 +28,7 @@ export interface TraceroutePathsLayerProps {
   legColors?: { forward: string; return: string };   // 'fixed-leg'
   directionColors?: { outbound: string; inbound: string; neutral?: string }; // 'direction'
   fixedColor?: string;                                // 'fixed' (Dashboard yellow overlay)
+  segmentColor?: (seg: TracerouteRenderSegment) => string; // 'custom' (selected trace: one color per physical hop)
   curvature?: number | ((seg: TracerouteRenderSegment) => number); // 0 = straight; default 0. Function form is used as-is (no leg-sign negation).
   neutralCurvature?: number;                          // MapAnalysis neutral 0.12 (number `curvature` form only)
   weight: number | ((seg: TracerouteRenderSegment) => number);
@@ -35,6 +40,11 @@ export interface TraceroutePathsLayerProps {
   onSegmentClick?: (seg: TracerouteRenderSegment) => void;   // MapAnalysis click-select
   renderPopup?: (seg: TracerouteRenderSegment) => ReactNode; // NodesTab recharts / DraggablePopup
   segmentClassName?: (seg: TracerouteRenderSegment) => string;     // NodesTab 'route-segment node-X'
+  /** Draw a small explicit marker wherever an unresolved route hop received a
+   *  signal-weighted fallback position. */
+  showEstimatedHopMarkers?: boolean;
+  /** Optional display-name resolver for estimated hop marker popups. */
+  estimatedHopName?: (nodeNum: number) => string;
 }
 
 /** Resolve a segment's stroke color for the configured `colorMode`. */
@@ -56,6 +66,8 @@ function resolveColor(seg: TracerouteRenderSegment, props: TraceroutePathsLayerP
     }
     case 'fixed':
       return props.fixedColor ?? props.snrColors.noData;
+    case 'custom':
+      return props.segmentColor?.(seg) ?? props.snrColors.noData;
     default:
       return props.snrColors.noData;
   }
@@ -150,6 +162,52 @@ interface ResolvedSegment {
   className: string | undefined;
 }
 
+interface EstimatedHopMarker {
+  key: string;
+  position: [number, number];
+  nodeNum: number;
+}
+
+/** Collect estimated endpoints once, even though each interior hop occurs on
+ *  the two adjacent segments. Position is part of the key because the same
+ *  known-but-unpositioned node can have independent route-local estimates in
+ *  different traceroute records. */
+function collectEstimatedHopMarkers(segments: TracerouteRenderSegment[]): EstimatedHopMarker[] {
+  const markers = new Map<string, EstimatedHopMarker>();
+  for (const seg of segments) {
+    const endpoints = [
+      {
+        estimated: seg.fromPositionEstimated,
+        hopKey: seg.fromHopKey,
+        position: seg.from,
+        nodeNum: seg.fromNodeNum,
+      },
+      {
+        estimated: seg.toPositionEstimated,
+        hopKey: seg.toHopKey,
+        position: seg.to,
+        nodeNum: seg.toNodeNum,
+      },
+    ];
+    for (const endpoint of endpoints) {
+      if (!endpoint.estimated) continue;
+      const key = [
+        endpoint.hopKey ?? `node:${endpoint.nodeNum}`,
+        endpoint.position[0].toFixed(7),
+        endpoint.position[1].toFixed(7),
+      ].join(':');
+      if (!markers.has(key)) {
+        markers.set(key, {
+          key,
+          position: endpoint.position,
+          nodeNum: endpoint.nodeNum,
+        });
+      }
+    }
+  }
+  return [...markers.values()];
+}
+
 /**
  * Shared traceroute render layer (`src/components/map/layers/`, per the
  * Phase-1 `BaseMap` convention: named export, typed props, no `any`, returns
@@ -180,6 +238,9 @@ function TraceroutePathsLayerImpl(props: TraceroutePathsLayerProps): ReactElemen
       className: props.segmentClassName?.(seg),
     };
   });
+  const estimatedHopMarkers = props.showEstimatedHopMarkers
+    ? collectEstimatedHopMarkers(segments)
+    : [];
 
   return (
     <>
@@ -198,6 +259,37 @@ function TraceroutePathsLayerImpl(props: TraceroutePathsLayerProps): ReactElemen
           {props.renderPopup ? props.renderPopup(seg) : null}
         </Polyline>
       ))}
+      {estimatedHopMarkers.map((marker) => {
+        const defaultName = isUnknownRouteNode(marker.nodeNum)
+          ? 'Unknown hop'
+          : `!${marker.nodeNum.toString(16).padStart(8, '0')}`;
+        const name = props.estimatedHopName?.(marker.nodeNum) ?? defaultName;
+        return (
+          <CircleMarker
+            key={`estimated-hop-${marker.key}`}
+            center={marker.position}
+            radius={6}
+            pathOptions={{
+              color: '#111827',
+              fillColor: '#facc15',
+              fillOpacity: 0.95,
+              weight: 2,
+              dashArray: '3 2',
+            }}
+          >
+            <Tooltip direction="top">{name} (estimated)</Tooltip>
+            <Popup>
+              <div className="route-popup">
+                <h4>Estimated Route Hop</h4>
+                <div className="route-endpoints"><strong>{name}</strong></div>
+                <div className="route-usage">
+                  Position estimated from adjacent traceroute signals; not a reported GPS fix.
+                </div>
+              </div>
+            </Popup>
+          </CircleMarker>
+        );
+      })}
       {showArrows &&
         resolved
           .filter(({ seg }) => shouldDrawArrow(seg, props))
