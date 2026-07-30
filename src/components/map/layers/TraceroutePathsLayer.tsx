@@ -9,8 +9,10 @@ import {
   type SnrColorScale,
 } from '../../../utils/mapHelpers';
 import {
+  consolidateEstimatedNodePositions,
   UNKNOWN_SNR_SENTINEL,
   isUnknownRouteNode,
+  isValidRouteNode,
   type TracerouteRenderSegment,
 } from '../../../utils/tracerouteSegments';
 
@@ -169,9 +171,9 @@ interface EstimatedHopMarker {
 }
 
 /** Collect estimated endpoints once, even though each interior hop occurs on
- *  the two adjacent segments. Position is part of the key because the same
- *  known-but-unpositioned node can have independent route-local estimates in
- *  different traceroute records. */
+ *  the two adjacent segments. Real node IDs are globally unique within the
+ *  layer after `consolidateEstimatedNodePositions`; anonymous firmware
+ *  placeholders remain trace-scoped because 0xffffffff is not an identity. */
 function collectEstimatedHopMarkers(segments: TracerouteRenderSegment[]): EstimatedHopMarker[] {
   const markers = new Map<string, EstimatedHopMarker>();
   for (const seg of segments) {
@@ -191,11 +193,13 @@ function collectEstimatedHopMarkers(segments: TracerouteRenderSegment[]): Estima
     ];
     for (const endpoint of endpoints) {
       if (!endpoint.estimated) continue;
-      const key = [
-        endpoint.hopKey ?? `node:${endpoint.nodeNum}`,
-        endpoint.position[0].toFixed(7),
-        endpoint.position[1].toFixed(7),
-      ].join(':');
+      const key = isValidRouteNode(endpoint.nodeNum)
+        ? `node:${endpoint.nodeNum}`
+        : [
+            endpoint.hopKey ?? `anonymous:${endpoint.nodeNum}`,
+            endpoint.position[0].toFixed(7),
+            endpoint.position[1].toFixed(7),
+          ].join(':');
       if (!markers.has(key)) {
         markers.set(key, {
           key,
@@ -220,11 +224,15 @@ function collectEstimatedHopMarkers(segments: TracerouteRenderSegment[]): Estima
  */
 function TraceroutePathsLayerImpl(props: TraceroutePathsLayerProps): ReactElement {
   const { segments, showArrows = false } = props;
+  // One physical node must have one position. Pool all route-local fallback
+  // candidates before resolving geometry, popups, arrows, and markers so every
+  // link terminates at the same consensus point.
+  const consolidatedSegments = consolidateEstimatedNodePositions(segments);
 
   // Resolve each segment's color/weight/opacity/dash/curvature/positions
   // exactly once and reuse the result for both the Polyline pass and the
   // arrow pass below (arrows share the same color/curvature).
-  const resolved: ResolvedSegment[] = segments.map((seg) => {
+  const resolved: ResolvedSegment[] = consolidatedSegments.map((seg) => {
     const color = resolveColor(seg, props);
     const curvature = resolveCurvature(seg, props.curvature, props.neutralCurvature);
     return {
@@ -239,7 +247,7 @@ function TraceroutePathsLayerImpl(props: TraceroutePathsLayerProps): ReactElemen
     };
   });
   const estimatedHopMarkers = props.showEstimatedHopMarkers
-    ? collectEstimatedHopMarkers(segments)
+    ? collectEstimatedHopMarkers(consolidatedSegments)
     : [];
 
   return (

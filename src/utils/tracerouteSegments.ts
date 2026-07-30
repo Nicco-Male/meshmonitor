@@ -252,6 +252,118 @@ export interface TracerouteRenderSegment {
 }
 
 /**
+ * Collapse route-local fallback estimates into one render position per real
+ * physical node.
+ *
+ * `decomposeTraceroute` can derive a temporary position for an unpositioned
+ * intermediate hop from the two anchors surrounding it. When the same node
+ * occurs in several traceroutes those independent candidates can differ.
+ * Rendering them as-is creates several markers with the same node ID and makes
+ * adjacent links terminate at different coordinates.
+ *
+ * This function pools every candidate for a valid `nodeNum`, places the node at
+ * their geographic centroid, and rewrites every segment endpoint to that one
+ * coordinate. The server-side position estimator remains authoritative when a
+ * persisted estimate is available; this only makes the immediate client-side
+ * fallback obey the same one-node/one-position invariant.
+ *
+ * Anonymous firmware placeholders (`0xffffffff`) are deliberately excluded:
+ * that value is not a physical identity, so occurrences in unrelated traces
+ * may represent different hidden relays.
+ */
+export function consolidateEstimatedNodePositions(
+  segments: TracerouteRenderSegment[],
+): TracerouteRenderSegment[] {
+  const candidatesByNode = new Map<
+    number,
+    Map<string, [number, number]>
+  >();
+
+  const collect = (
+    nodeNum: number,
+    position: [number, number],
+    estimated: boolean | undefined,
+    timestamp: number | undefined,
+  ): void => {
+    if (!estimated || !isValidRouteNode(nodeNum)) return;
+    if (!Number.isFinite(position[0]) || !Number.isFinite(position[1])) return;
+
+    let candidates = candidatesByNode.get(nodeNum);
+    if (!candidates) {
+      candidates = new Map<string, [number, number]>();
+      candidatesByNode.set(nodeNum, candidates);
+    }
+
+    // An interior hop occurs on both adjacent segments. Timestamp + coordinate
+    // identifies that single route-local candidate without counting it twice,
+    // while repeated observations at different times retain their weight.
+    const candidateKey = [
+      timestamp ?? 'no-time',
+      position[0].toFixed(9),
+      position[1].toFixed(9),
+    ].join(':');
+    candidates.set(candidateKey, position);
+  };
+
+  for (const segment of segments) {
+    collect(
+      segment.fromNodeNum,
+      segment.from,
+      segment.fromPositionEstimated,
+      segment.timestamp,
+    );
+    collect(
+      segment.toNodeNum,
+      segment.to,
+      segment.toPositionEstimated,
+      segment.timestamp,
+    );
+  }
+
+  if (candidatesByNode.size === 0) return segments;
+
+  const consensusByNode = new Map<number, [number, number]>();
+  for (const [nodeNum, candidateMap] of candidatesByNode) {
+    const candidates = [...candidateMap.values()];
+    if (candidates.length === 0) continue;
+
+    let latitudeSum = 0;
+    const referenceLongitude = candidates[0][1];
+    let unwrappedLongitudeSum = 0;
+    for (const [latitude, longitude] of candidates) {
+      latitudeSum += latitude;
+      let unwrappedLongitude = longitude;
+      while (unwrappedLongitude - referenceLongitude > 180) unwrappedLongitude -= 360;
+      while (unwrappedLongitude - referenceLongitude < -180) unwrappedLongitude += 360;
+      unwrappedLongitudeSum += unwrappedLongitude;
+    }
+
+    let longitude = unwrappedLongitudeSum / candidates.length;
+    while (longitude > 180) longitude -= 360;
+    while (longitude < -180) longitude += 360;
+    consensusByNode.set(nodeNum, [
+      latitudeSum / candidates.length,
+      longitude,
+    ]);
+  }
+
+  return segments.map((segment) => {
+    const fromConsensus = segment.fromPositionEstimated
+      ? consensusByNode.get(segment.fromNodeNum)
+      : undefined;
+    const toConsensus = segment.toPositionEstimated
+      ? consensusByNode.get(segment.toNodeNum)
+      : undefined;
+    if (!fromConsensus && !toConsensus) return segment;
+    return {
+      ...segment,
+      from: fromConsensus ?? segment.from,
+      to: toConsensus ?? segment.to,
+    };
+  });
+}
+
+/**
  * Minimal traceroute row shape `decomposeTraceroute` needs. A structural
  * subset of `TracerouteDigest` (useTraceroutePaths.tsx) so callers can pass
  * their existing traceroute records without an adapter.
