@@ -2853,6 +2853,7 @@
   "telemetry.loading": "Loading telemetry data...",
   "telemetry.load_failed": "Failed to load telemetry data",
   "telemetry.no_data": "No telemetry data available for this node",
+  "telemetry.no_data_in_range": "No telemetry data in the selected time range. Select a wider range.",
   "telemetry.title_one": "Last {{count}} Hour Telemetry",
   "telemetry.title_other": "Last {{count}} Hours Telemetry",
   "telemetry.title_minutes_one": "Last {{count}} Minute Telemetry",
