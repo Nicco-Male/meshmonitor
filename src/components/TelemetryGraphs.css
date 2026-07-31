@@ -23,6 +23,14 @@
 }
 
 /* Time-range selector (Device Info page) */
+.telemetry-graphs-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
 .telemetry-range-selector {
   display: flex;
   flex-wrap: wrap;
@@ -51,6 +59,33 @@
   background-color: var(--ctp-blue);
   border-color: var(--ctp-blue);
   color: var(--ctp-crust);
+}
+
+.telemetry-range-btn:disabled {
+  cursor: wait;
+  opacity: 0.65;
+}
+
+.telemetry-refresh-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.telemetry-refresh-icon.spinning {
+  animation: telemetry-refresh-spin 0.8s linear infinite;
+}
+
+@keyframes telemetry-refresh-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .telemetry-refresh-icon.spinning {
+    animation: none;
+  }
 }
 
 .telemetry-loading,

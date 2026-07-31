@@ -527,6 +527,7 @@ const TelemetryGraphs: React.FC<TelemetryGraphsProps> = React.memo(
     const {
       data: telemetryData = [],
       isLoading: loading,
+      isFetching: refreshing,
       error: telemetryError,
       refetch: refetchTelemetry,
     } = useTelemetry({
@@ -957,22 +958,39 @@ const TelemetryGraphs: React.FC<TelemetryGraphsProps> = React.memo(
         <div className="telemetry-graphs-header">
           <h3 className="telemetry-title">{titleText}</h3>
           {showTimeRangeSelector && (
-            <div
-              className="telemetry-range-selector"
-              role="group"
-              aria-label={t('telemetry.time_range')}
-            >
-              {TELEMETRY_RANGE_PRESETS.map(preset => (
-                <button
-                  key={preset.label}
-                  type="button"
-                  className={`telemetry-range-btn ${effectiveHours === preset.hours ? 'active' : ''}`}
-                  onClick={() => handleSelectRange(preset.hours)}
-                  aria-pressed={effectiveHours === preset.hours}
-                >
-                  {preset.label}
-                </button>
-              ))}
+            <div className="telemetry-graphs-controls">
+              <div
+                className="telemetry-range-selector"
+                role="group"
+                aria-label={t('telemetry.time_range')}
+              >
+                {TELEMETRY_RANGE_PRESETS.map(preset => (
+                  <button
+                    key={preset.label}
+                    type="button"
+                    className={`telemetry-range-btn ${effectiveHours === preset.hours ? 'active' : ''}`}
+                    onClick={() => handleSelectRange(preset.hours)}
+                    aria-pressed={effectiveHours === preset.hours}
+                  >
+                    {preset.label}
+                  </button>
+                ))}
+              </div>
+              <button
+                type="button"
+                className="telemetry-range-btn telemetry-refresh-btn"
+                onClick={() => void refetchTelemetry()}
+                disabled={refreshing}
+                aria-busy={refreshing}
+                title={t('common.refresh')}
+              >
+                <UiIcon
+                  name="refresh"
+                  size={14}
+                  className={refreshing ? 'telemetry-refresh-icon spinning' : 'telemetry-refresh-icon'}
+                />
+                {t('common.refresh')}
+              </button>
             </div>
           )}
         </div>
