@@ -1020,6 +1020,7 @@ describe('TelemetryGraphs Component', () => {
       });
 
       expect(screen.queryByRole('button', { name: '24h' })).not.toBeInTheDocument();
+      expect(screen.queryByRole('button', { name: 'common.refresh' })).not.toBeInTheDocument();
     });
 
     it('renders preset buttons and marks the active window when enabled', async () => {
@@ -1037,6 +1038,7 @@ describe('TelemetryGraphs Component', () => {
       // Defaults to the configured telemetryHours window.
       const active = screen.getByRole('button', { name: '24h' });
       expect(active).toHaveAttribute('aria-pressed', 'true');
+      expect(screen.getByRole('button', { name: 'common.refresh' })).toBeInTheDocument();
     });
 
     it('refetches with the selected window and persists the choice', async () => {
@@ -1057,6 +1059,30 @@ describe('TelemetryGraphs Component', () => {
       });
 
       expect(window.localStorage.getItem('deviceInfoTelemetryHours')).toBe('1');
+    });
+
+    it('manually refreshes the current window without changing the selection', async () => {
+      renderWithProviders(
+        <TelemetryGraphs nodeId={mockNodeId} telemetryHours={24} showTimeRangeSelector />
+      );
+
+      const telemetryUrl = `/api/telemetry/${mockNodeId}?hours=24&sourceId=src-test`;
+
+      await waitFor(() => {
+        expect(
+          (global.fetch as Mock).mock.calls.filter(([url]) => url === telemetryUrl)
+        ).toHaveLength(1);
+      });
+
+      fireEvent.click(screen.getByRole('button', { name: 'common.refresh' }));
+
+      await waitFor(() => {
+        expect(
+          (global.fetch as Mock).mock.calls.filter(([url]) => url === telemetryUrl)
+        ).toHaveLength(2);
+      });
+
+      expect(screen.getByRole('button', { name: '24h' })).toHaveAttribute('aria-pressed', 'true');
     });
 
     it('requests a fractional window and shows a minutes title for 15m', async () => {
