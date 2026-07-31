@@ -502,6 +502,13 @@ const TelemetryGraphs: React.FC<TelemetryGraphsProps> = React.memo(
     });
 
     const effectiveHours = showTimeRangeSelector ? selectedHours : telemetryHours;
+    // Sub-hour windows (e.g. the 15-minute preset) read awkwardly as
+    // fractional hours, so render those with a minutes-based title instead.
+    // Compute this before handling loading/empty/error states so the header
+    // and range selector never disappear while a different window is loaded.
+    const titleText = effectiveHours < 1
+      ? t('telemetry.title_minutes', { count: Math.round(effectiveHours * 60) })
+      : t('telemetry.title', { count: effectiveHours });
     const getDisplayLabel = useCallback(
       (type: string) => labelOverrides?.[type]?.trim() || getTelemetryLabel(type),
       [labelOverrides],
@@ -885,22 +892,6 @@ const TelemetryGraphs: React.FC<TelemetryGraphsProps> = React.memo(
       return colors[type] || '#8884d8';
     };
 
-    if (loading) {
-      return <div className="telemetry-loading">{t('telemetry.loading')}</div>;
-    }
-
-    if (error) {
-      return (
-        <div className="telemetry-empty" style={{ color: '#f38ba8' }}>
-          {t('common.error')}: {error}
-        </div>
-      );
-    }
-
-    if (telemetryData.length === 0) {
-      return <div className="telemetry-empty">{t('telemetry.no_data')}</div>;
-    }
-
     const groupedData = groupByType(telemetryData);
 
     // Calculate global time range across all telemetry data (excluding solar)
@@ -961,12 +952,6 @@ const TelemetryGraphs: React.FC<TelemetryGraphsProps> = React.memo(
       // around.
       .sort(([typeA], [typeB]) => compareTelemetryGraphs(typeA, typeB, favorites, getDisplayLabel));
 
-    // Sub-hour windows (e.g. the 15-minute preset) read awkwardly as
-    // fractional hours, so render those with a minutes-based title instead.
-    const titleText = effectiveHours < 1
-      ? t('telemetry.title_minutes', { count: Math.round(effectiveHours * 60) })
-      : t('telemetry.title', { count: effectiveHours });
-
     return (
       <div className="telemetry-graphs">
         <div className="telemetry-graphs-header">
@@ -991,40 +976,52 @@ const TelemetryGraphs: React.FC<TelemetryGraphsProps> = React.memo(
             </div>
           )}
         </div>
-        <div className="graphs-grid">
-          {filteredData.map(([type, data]) => (
-            <TelemetryGraphWidget
-              key={type}
-              nodeId={nodeId}
-              type={type}
-              baseUrl={baseUrl}
-              data={data}
-              isPaxcounterCombined={type === 'paxcounterWifi'}
-              bleData={groupedData.get('paxcounterBle')}
-              temperatureUnit={temperatureUnit}
-              globalTimeRange={globalTimeRange}
-              globalMinTime={globalMinTime}
-              solarEstimates={solarEstimates}
-              solarMonitoringEnabled={solarMonitoringEnabled}
-              getSolarVisibility={getSolarVisibility}
-              handleToggleSolar={handleToggleSolar}
-              favorites={favorites}
-              createToggleFavorite={createToggleFavorite}
-              handleMenuClick={handleMenuClick}
-              openMenu={openMenu}
-              menuPosition={menuPosition}
-              handlePurgeData={handlePurgeData}
-              chartColors={chartColors}
-              getTelemetryLabel={getDisplayLabel}
-              getColor={getColor}
-              prepareChartData={prepareChartData}
-              timeFormat={timeFormat}
-              t={t as (key: string, opts?: Record<string, unknown>) => string}
-              canEditSettings={canEditSettings}
-              readOnly={readOnly}
-            />
-          ))}
-        </div>
+        {loading ? (
+          <div className="telemetry-loading" role="status">{t('telemetry.loading')}</div>
+        ) : error ? (
+          <div className="telemetry-empty" role="alert" style={{ color: '#f38ba8' }}>
+            {t('common.error')}: {error}
+          </div>
+        ) : telemetryData.length === 0 ? (
+          <div className="telemetry-empty" role="status">
+            {showTimeRangeSelector ? t('telemetry.no_data_in_range') : t('telemetry.no_data')}
+          </div>
+        ) : (
+          <div className="graphs-grid">
+            {filteredData.map(([type, data]) => (
+              <TelemetryGraphWidget
+                key={type}
+                nodeId={nodeId}
+                type={type}
+                baseUrl={baseUrl}
+                data={data}
+                isPaxcounterCombined={type === 'paxcounterWifi'}
+                bleData={groupedData.get('paxcounterBle')}
+                temperatureUnit={temperatureUnit}
+                globalTimeRange={globalTimeRange}
+                globalMinTime={globalMinTime}
+                solarEstimates={solarEstimates}
+                solarMonitoringEnabled={solarMonitoringEnabled}
+                getSolarVisibility={getSolarVisibility}
+                handleToggleSolar={handleToggleSolar}
+                favorites={favorites}
+                createToggleFavorite={createToggleFavorite}
+                handleMenuClick={handleMenuClick}
+                openMenu={openMenu}
+                menuPosition={menuPosition}
+                handlePurgeData={handlePurgeData}
+                chartColors={chartColors}
+                getTelemetryLabel={getDisplayLabel}
+                getColor={getColor}
+                prepareChartData={prepareChartData}
+                timeFormat={timeFormat}
+                t={t as (key: string, opts?: Record<string, unknown>) => string}
+                canEditSettings={canEditSettings}
+                readOnly={readOnly}
+              />
+            ))}
+          </div>
+        )}
       </div>
     );
   }

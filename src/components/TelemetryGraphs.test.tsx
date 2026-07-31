@@ -1077,6 +1077,41 @@ describe('TelemetryGraphs Component', () => {
       expect(screen.getByText('telemetry.title_minutes')).toBeInTheDocument();
     });
 
+    it('keeps the selector visible and explains when the selected window has no data', async () => {
+      (global.fetch as Mock).mockImplementation((url: string) => {
+        if (url.includes('/api/settings')) {
+          return Promise.resolve({ ok: true, json: async () => ({}) });
+        }
+        if (url.includes('/api/solar/estimates')) {
+          return Promise.resolve({
+            ok: true,
+            json: async () => ({ count: 0, estimates: [] }),
+          });
+        }
+        if (url.includes('/api/csrf-token')) {
+          return Promise.resolve({
+            ok: true,
+            json: async () => ({ token: 'test-csrf-token' }),
+          });
+        }
+        return Promise.resolve({
+          ok: true,
+          json: async () => url.includes('hours=0.25') ? [] : mockTelemetryData,
+        });
+      });
+
+      renderWithProviders(
+        <TelemetryGraphs nodeId={mockNodeId} telemetryHours={24} showTimeRangeSelector />
+      );
+
+      fireEvent.click(await screen.findByRole('button', { name: '15m' }));
+
+      expect(await screen.findByText('telemetry.no_data_in_range')).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: '15m' })).toHaveAttribute('aria-pressed', 'true');
+      expect(screen.getByRole('button', { name: '7d' })).toBeInTheDocument();
+      expect(screen.getByText('telemetry.title_minutes')).toBeInTheDocument();
+    });
+
     it('seeds the initial window from a persisted choice', async () => {
       window.localStorage.setItem('deviceInfoTelemetryHours', '48');
 
