@@ -25,6 +25,7 @@ import {
   type TracerouteForEstimation,
   type NeighborForEstimation,
 } from './positionEstimationService.js';
+import { DEFAULT_MAX_UNCERTAINTY_KM } from './positionEstimationScheduler.js';
 
 const NOW = 1_700_000_000_000;
 
@@ -155,6 +156,75 @@ describe('solveNodePosition', () => {
       expect(tight.latitude).toBeCloseTo(10, 4);
       expect(tight.uncertaintyKm).toBeLessThan(1); // confident, unchanged by the fix
     });
+  });
+});
+
+// #4432 follow-up: a bogus anchor drags the weighted centroid to (0,0) and the
+// resulting "estimate" gets substituted onto a node as though it were a fix.
+// Two lines of defence: drop bogus anchors, and reject a solve that lands there.
+describe('Null Island rejection (#4432 follow-up)', () => {
+  it('returns null when the weighted centroid lands on Null Island', () => {
+    // Legitimate anchors placed symmetrically about (0,0) average onto it —
+    // the case anchor filtering alone cannot catch.
+    const result = solveNodePosition(
+      [
+        obs({ anchorLat: 1, anchorLon: 1, snrDb: 0 }),
+        obs({ anchorLat: -1, anchorLon: -1, snrDb: 0 }),
+      ],
+      NOW,
+    );
+    expect(result).toBeNull();
+  });
+
+  it('still solves normally when the centroid is a real position', () => {
+    const result = solveNodePosition(
+      [
+        obs({ anchorLat: 35.0, anchorLon: -80.0, snrDb: 0 }),
+        obs({ anchorLat: 35.2, anchorLon: -80.2, snrDb: 0 }),
+      ],
+      NOW,
+    );
+    expect(result).not.toBeNull();
+    expect(result!.latitude).toBeCloseTo(35.1, 5);
+  });
+
+  it('solves for a genuine equator anchor pair (only BOTH axes near 0 is bogus)', () => {
+    const result = solveNodePosition(
+      [
+        obs({ anchorLat: 0, anchorLon: 37.4, snrDb: 0 }),
+        obs({ anchorLat: 0, anchorLon: 37.6, snrDb: 0 }),
+      ],
+      NOW,
+    );
+    expect(result).not.toBeNull();
+    expect(result!.latitude).toBeCloseTo(0, 5);
+    expect(result!.longitude).toBeCloseTo(37.5, 5);
+  });
+
+  it('drops a Null Island anchor before it can constrain a neighbour', () => {
+    const anchors = new Map<number, { lat: number; lon: number }>([
+      [10, { lat: 0, lon: 0 }],        // bogus — must not anchor anything
+      [20, { lat: 35.1, lon: -80.6 }], // real
+    ]);
+    const neighbors: NeighborForEstimation[] = [
+      { nodeNum: 1, neighborNodeNum: 10, snr: 5, timestamp: NOW },
+      { nodeNum: 2, neighborNodeNum: 20, snr: 5, timestamp: NOW },
+    ];
+
+    const out = buildObservations([], neighbors, anchors);
+
+    expect(out.get(1)).toBeUndefined();
+    expect(out.get(2)).toHaveLength(1);
+    expect(out.get(2)![0].anchorLat).toBeCloseTo(35.1, 5);
+  });
+
+  it('does not mutate the caller\'s anchors map', () => {
+    const anchors = new Map<number, { lat: number; lon: number }>([[10, { lat: 0, lon: 0 }]]);
+
+    buildObservations([], [], anchors);
+
+    expect(anchors.size).toBe(1);
+    expect(anchors.get(10)).toEqual({ lat: 0, lon: 0 });
   });
 });
 
@@ -336,6 +406,28 @@ describe('positionEstimationService.recomputeAll', () => {
       // Nothing stored for the over-threshold node...
       expect(mockDb.upsertEstimatedPositionsAsync.mock.calls[0][0]).toHaveLength(0);
       // ...and its existing estimate (if any) is cleared.
+      expect(mockDb.deleteEstimatedPositionsByNodeNumsAsync.mock.calls[0][0]).toContain(5);
+    });
+
+    it('rejects the single-anchor estimate at the SHIPPED default (#4450)', async () => {
+      // The regression that mattered: the threshold machinery above always
+      // worked, but DEFAULT_MAX_UNCERTAINTY_KM was 0 ("no limit"), so a stock
+      // install stored single-anchor solves. Those sit at the anchor's exact
+      // coordinates — and since the locally-connected node is itself an anchor,
+      // that is the phantom pin on top of your own node reported in #4450.
+      //
+      // Asserted against the real exported default rather than a literal, so
+      // this fails if it is ever raised back above the 5 km single-anchor radius.
+      singleAnchorSetup();
+      const result = await positionEstimationService.recomputeAll({
+        lookbackMs: 7 * 24 * 60 * 60 * 1000,
+        maxUncertaintyKm: DEFAULT_MAX_UNCERTAINTY_KM,
+      });
+      expect(result.estimatedNodeCount).toBe(0);
+      expect(result.rejectedNodeCount).toBe(1);
+      expect(mockDb.upsertEstimatedPositionsAsync.mock.calls[0][0]).toHaveLength(0);
+      // The stale row is cleared too, so existing installs self-heal on the
+      // next scheduled run rather than needing a manual purge.
       expect(mockDb.deleteEstimatedPositionsByNodeNumsAsync.mock.calls[0][0]).toContain(5);
     });
 

@@ -51,6 +51,9 @@ function makeFakeManager(overrides: Partial<{
   localNodeInfo: { nodeNum: number } | null;
   sessionPasskeys: Map<number, Uint8Array>;
   txEnabled: boolean;
+  /** #4394: `network.enabledProtocols & UDP_BROADCAST` — a LAN peer relays our sends. */
+  udpRelayEnabled: boolean;
+  hopLimit: number;
 }> = {}) {
   const state = {
     transportReady: overrides.transportReady ?? true,
@@ -63,6 +66,8 @@ function makeFakeManager(overrides: Partial<{
     pendingModuleConfigRequests: new Map<number, string>(),
     moduleConfigsEverFetched: false,
     txEnabled: overrides.txEnabled ?? true,
+    udpRelayEnabled: overrides.udpRelayEnabled ?? false,
+    hopLimit: overrides.hopLimit ?? 3,
   };
 
   return {
@@ -80,6 +85,9 @@ function makeFakeManager(overrides: Partial<{
     resetModuleConfigState: vi.fn(() => { state.moduleConfigsEverFetched = false; }),
     setModuleConfigsEverFetched: vi.fn((v: boolean) => { state.moduleConfigsEverFetched = v; }),
     isTxEnabled: vi.fn(() => state.txEnabled),
+    getConfiguredHopLimit: vi.fn(() => state.hopLimit),
+    isUdpBroadcastRelayEnabled: vi.fn(() => state.udpRelayEnabled),
+    canTransmit: vi.fn(() => state.txEnabled || state.udpRelayEnabled),
   };
 }
 
@@ -209,6 +217,33 @@ describe('RemoteAdminService', () => {
         await vi.advanceTimersByTimeAsync(250);
         const result = await promise;
         expect(result).toEqual({ longName: 'fresh' });
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('sends remote-admin requests at the node\'s configured hop limit, not a hardcoded 3', async () => {
+      // Regression: every remote admin packet used to leave at hop_limit 3 (the
+      // firmware default), so a node configured for a deeper mesh could never
+      // administer anything more than 3 hops out.
+      vi.useFakeTimers();
+      try {
+        const mgr = makeFakeManager({
+          sessionPasskeys: new Map([[222, new Uint8Array([1])]]),
+          hopLimit: 7,
+        });
+        const svc = new RemoteAdminService(mgr as any);
+
+        const promise = svc.requestRemoteOwner(222);
+        await vi.advanceTimersByTimeAsync(1);
+
+        expect(createAdminPacket).toHaveBeenCalledWith(
+          expect.anything(), 222, LOCAL_NODE_NUM, 7,
+        );
+
+        mgr.state.remoteNodeOwners.set(222, { longName: 'fresh' });
+        await vi.advanceTimersByTimeAsync(250);
+        await promise;
       } finally {
         vi.useRealTimers();
       }
@@ -370,6 +405,23 @@ describe('RemoteAdminService', () => {
       const svc = new RemoteAdminService(mgr as any);
       await expect(svc.requestModuleConfig(14)).resolves.toBeUndefined();
       expect(mgr.sendLocalAdminPacket).toHaveBeenCalledTimes(1);
+    });
+
+    // #4394: the radio is TX-disabled, but UDP Broadcast puts the admin packet on
+    // the LAN where a peer relays it — remote admin is genuinely usable.
+    it('remote sends are NOT blocked when TX is off but UDP Broadcast relays', async () => {
+      vi.useFakeTimers();
+      try {
+        const mgr = makeFakeManager({ txEnabled: false, udpRelayEnabled: true });
+        const svc = new RemoteAdminService(mgr as any);
+        const promise = svc.sendRebootCommand(222, 5);
+        await vi.advanceTimersByTimeAsync(1);
+        mgr.state.sessionPasskeys.set(222, new Uint8Array([7]));
+        await vi.advanceTimersByTimeAsync(500);
+        await expect(promise).resolves.toBeUndefined();
+      } finally {
+        vi.useRealTimers();
+      }
     });
 
     it('remote sends succeed normally when TX is enabled', async () => {

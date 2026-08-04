@@ -28,7 +28,23 @@ interface MeshCoreMessageStreamProps {
   conversationKey?: string;
   /** Maximum UTF-8 byte length for a message. Send is blocked when exceeded. */
   maxBytes?: number;
+  /** When provided together with `hasMoreOlder`, the stream requests older
+   *  history (#4460) once the user scrolls near the top, throttled to avoid
+   *  spamming the caller. The caller owns fetching/prepending and is expected
+   *  to be idempotent against overlapping calls (guard on `loadingOlder`). */
+  onLoadOlder?: () => void;
+  /** Whether an older page of history exists beyond what's currently loaded. */
+  hasMoreOlder?: boolean;
+  /** True while a load-older request is in flight. Used to gate re-triggering
+   *  and to know when it's safe to restore scroll position after older
+   *  messages are prepended. */
+  loadingOlder?: boolean;
 }
+
+/** Scroll-to-top distance (px) that triggers a load-older request. */
+const LOAD_OLDER_THRESHOLD_PX = 100;
+/** Minimum time between load-older triggers, to avoid spamming scroll events. */
+const LOAD_OLDER_THROTTLE_MS = 200;
 
 function formatTime(ts: number): string {
   return new Date(ts).toLocaleTimeString();
@@ -75,6 +91,9 @@ export const MeshCoreMessageStream: React.FC<MeshCoreMessageStreamProps> = ({
   onDeleteMessage,
   conversationKey,
   maxBytes = 130,
+  onLoadOlder,
+  hasMoreOlder,
+  loadingOlder,
 }) => {
   const { t } = useTranslation();
   const [draft, setDraft] = useState('');
@@ -145,6 +164,29 @@ export const MeshCoreMessageStream: React.FC<MeshCoreMessageStreamProps> = ({
     key: conversationKey,
     done: false,
   });
+
+  /**
+   * Perform the one-shot entry scroll, but only when the list is actually laid
+   * out. Returns whether it ran, so callers know not to mark the shot spent.
+   *
+   * The `scrollHeight` check is the load-bearing part. On mobile both the
+   * channels and DM views render a two-pane layout where the conversation is
+   * MOUNTED but hidden until the operator drills in from the list — measured
+   * there: `scrollHeight: 0`, `clientHeight: 0`, `offsetParent: null`. Assigning
+   * `scrollTop = scrollHeight` is then `0 = 0`, a silent no-op that still burnt
+   * the one shot, so drilling in left the viewport pinned at the very top of a
+   * 17,000px backlog with nothing left to re-trigger it.
+   *
+   * Deliberately keys off `scrollHeight` alone, not `clientHeight`: a hidden
+   * subtree zeroes both, while jsdom reports clientHeight 0 for everything, so a
+   * clientHeight guard would disable the entry scroll in every test.
+   */
+  const runEntryScroll = useCallback((container: HTMLDivElement): boolean => {
+    if (container.scrollHeight === 0) return false;
+    container.scrollTop = container.scrollHeight;
+    return true;
+  }, []);
+
   useEffect(() => {
     const container = listRef.current;
     if (!container) return;
@@ -157,11 +199,47 @@ export const MeshCoreMessageStream: React.FC<MeshCoreMessageStreamProps> = ({
     if (state.done) return;
     // Wait for the (possibly async) backlog before committing the entry scroll.
     if (messages.length === 0) return;
-    state.done = true;
     requestAnimationFrame(() => {
-      container.scrollTop = container.scrollHeight;
+      // Re-check inside the frame: the pane may still be hidden.
+      if (entryScrollRef.current.done) return;
+      if (runEntryScroll(container)) entryScrollRef.current.done = true;
     });
-  }, [conversationKey, messages.length]);
+  }, [conversationKey, messages.length, runEntryScroll]);
+
+  // Complete a deferred entry scroll the moment the list gains a real size —
+  // i.e. when the hidden conversation pane is revealed. Nothing else changes at
+  // that point (no new messages, no key change), so without this observer the
+  // effect above has no trigger left to fire on.
+  //
+  // Read through a ref so the observer is created once per mount: putting the
+  // message count in the dep array would tear down and rebuild it on every
+  // incoming message.
+  const messageCountRef = useRef(messages.length);
+  messageCountRef.current = messages.length;
+
+  useEffect(() => {
+    const container = listRef.current;
+    if (!container || typeof ResizeObserver === 'undefined') return;
+    const observer = new ResizeObserver(() => {
+      const state = entryScrollRef.current;
+      if (state.done) return;
+      // The empty state ("No messages on this channel yet") is itself laid out,
+      // so the container has a real, non-zero height BEFORE any message
+      // arrives. Without this guard the observer fires on that empty list,
+      // scrolls to the bottom of ~700px of placeholder, trivially succeeds, and
+      // spends the one shot — so when the backlog lands there is nothing left
+      // to trigger on and the view sits at the top of a 16,000px history.
+      //
+      // Observed on the anonymous read-only view, where the absent compose box
+      // changes render timing enough to expose it: the list went 1 child ->
+      // 203 children in a single step, while an authenticated session rendered
+      // progressively and scrolled correctly by luck of ordering.
+      if (messageCountRef.current === 0) return;
+      if (runEntryScroll(container)) state.done = true;
+    });
+    observer.observe(container);
+    return () => observer.disconnect();
+  }, [runEntryScroll]);
 
   // Auto-scroll on new messages only when the user is already near the bottom.
   useEffect(() => {
@@ -174,13 +252,63 @@ export const MeshCoreMessageStream: React.FC<MeshCoreMessageStreamProps> = ({
     }
   }, [messages.length]);
 
+  // Scroll metrics captured right before a load-older request fires, so the
+  // restore effect below can keep the same content under the viewport once
+  // older messages are prepended (rather than jumping the user to the top).
+  const pendingOlderRestoreRef = useRef<{ scrollHeight: number; scrollTop: number } | null>(null);
+  const lastLoadOlderAtRef = useRef(0);
+
+  // Drop any load-older snapshot when the conversation changes. Without this, a
+  // load-older triggered in one conversation and abandoned by switching away
+  // (the parent resets `loadingOlder`, so the request never settles here) leaves
+  // stale metrics in the ref. The restore effect below would then fire on the
+  // NEW conversation's first message change and scroll it to a position derived
+  // from the old conversation's height — beating the entry scroll, since both
+  // use requestAnimationFrame and the restore is registered later.
+  // Declared before that effect so it clears the ref first on a key change.
+  useEffect(() => {
+    pendingOlderRestoreRef.current = null;
+  }, [conversationKey]);
+
   const handleScroll = useCallback(() => {
     const container = listRef.current;
     if (!container) return;
     const isNearBottom =
       container.scrollHeight - container.scrollTop - container.clientHeight < 100;
     setShowJumpToBottom(!isNearBottom);
-  }, []);
+
+    if (
+      onLoadOlder &&
+      hasMoreOlder &&
+      !loadingOlder &&
+      container.scrollTop < LOAD_OLDER_THRESHOLD_PX
+    ) {
+      const now = Date.now();
+      if (now - lastLoadOlderAtRef.current > LOAD_OLDER_THROTTLE_MS) {
+        lastLoadOlderAtRef.current = now;
+        pendingOlderRestoreRef.current = {
+          scrollHeight: container.scrollHeight,
+          scrollTop: container.scrollTop,
+        };
+        onLoadOlder();
+      }
+    }
+  }, [onLoadOlder, hasMoreOlder, loadingOlder]);
+
+  // Once a load-older request settles (loadingOlder flips back to false),
+  // restore the viewport to the same content it was showing before older
+  // messages were prepended — otherwise the prepend would visually yank the
+  // conversation down by the height of the newly-inserted rows.
+  useEffect(() => {
+    if (loadingOlder) return;
+    const container = listRef.current;
+    const pending = pendingOlderRestoreRef.current;
+    if (!container || !pending) return;
+    pendingOlderRestoreRef.current = null;
+    requestAnimationFrame(() => {
+      container.scrollTop = container.scrollHeight - pending.scrollHeight + pending.scrollTop;
+    });
+  }, [messages, loadingOlder]);
 
   const scrollToBottom = useCallback(() => {
     const container = listRef.current;
@@ -396,7 +524,36 @@ export const MeshCoreMessageStream: React.FC<MeshCoreMessageStreamProps> = ({
               {!outgoing && typeof m.hopCount === 'number' && (
                 <div className="mc-message-route" title={t('meshcore.route_tooltip', 'How this message reached you')}>
                   {m.hopCount === 0 ? (
-                    <><UiIcon name="location" size={13} /> {t('meshcore.route_direct', 'direct')}</>
+                    <>
+                      <UiIcon name="location" size={13} /> {t('meshcore.route_direct', 'direct')}
+                      {/*
+                        Signal quality for a directly-received message (#4504).
+                        A direct message otherwise shows nothing but the word
+                        "direct" — SNR/RSSI is the only thing left that says
+                        anything about the link.
+
+                        Shown ONLY for hopCount === 0 on purpose. On a relayed
+                        message these values describe the hop from the LAST
+                        repeater, not from the sender, so presenting them next to
+                        the sender's name would misattribute the measurement.
+
+                        RSSI renders only when present: MeshCore's message push
+                        carries SNR but no RSSI (that lives on the separate
+                        LogRxData OTA feed), so today this is SNR in practice and
+                        RSSI lights up automatically if the field is ever filled.
+                      */}
+                      {typeof m.snr === 'number' && (
+                        <> · <span
+                          className="mc-message-signal"
+                          title={t('meshcore.signal_tooltip', 'Signal quality of the direct link from the sender')}
+                        >
+                          {t('meshcore.snr_label', 'SNR')} {m.snr.toFixed(1)} dB
+                          {typeof m.rssi === 'number' && (
+                            <> · {t('meshcore.rssi_label', 'RSSI')} {m.rssi} dBm</>
+                          )}
+                        </span></>
+                      )}
+                    </>
                   ) : (
                     <><UiIcon name="route" size={13} /> {m.hopCount} {m.hopCount === 1 ? t('meshcore.hop', 'hop') : t('meshcore.hops', 'hops')}</>
                   )}

@@ -3,6 +3,7 @@ import type { DeviceInfo } from '../meshtasticManager.js';
 import type { User } from '../../types/auth.js';
 import type { ResourceType, PermissionSet } from '../../types/permission.js';
 import databaseService from '../../services/database.js';
+import { isBogusPosition } from '../../utils/nullIsland.js';
 import { CHANNEL_DB_OFFSET } from '../constants/meshtastic.js';
 
 /**
@@ -78,12 +79,12 @@ export function getEffectiveDbNodePosition(
 export async function enhanceNodeForClient(
   node: DeviceInfo,
   user: User | null,
-  estimatedPositions?: Map<string, { latitude: number; longitude: number }>,
+  estimatedPositions?: Map<string, { latitude: number; longitude: number; uncertaintyKm?: number | null }>,
   canViewPrivateOverride?: boolean
 ): Promise<DeviceInfo & { isMobile: boolean }> {
-  if (!node.user?.id) return { ...node, isMobile: false, positionIsOverride: false };
+  if (!node.user?.id) return { ...node, isMobile: false, positionIsOverride: false, positionIsEstimated: false };
 
-  const enhancedNode = { ...node, isMobile: node.mobile === 1, positionIsOverride: false };
+  const enhancedNode = { ...node, isMobile: node.mobile === 1, positionIsOverride: false, positionIsEstimated: false };
 
   // Priority 1: Check for position override
   const hasOverride = node.positionOverrideEnabled === true && node.latitudeOverride != null && node.longitudeOverride != null;
@@ -114,19 +115,41 @@ export async function enhanceNodeForClient(
   }
 
   // Priority 2: Use regular GPS position if available (already set in node.position)
-  if (node.position?.latitude && node.position?.longitude) {
+  //
+  // Presence check, not truthiness: a latitude or longitude of exactly 0 is a
+  // real coordinate (the equator / the prime meridian), and the old truthy test
+  // treated such a node as unpositioned, overwriting its genuine fix with an
+  // estimate (#4432 follow-up).
+  //
+  // Null Island — where BOTH are ~0 — is explicitly rejected rather than left to
+  // upstream filtering. It is already filtered at ingest and by migration 107,
+  // but making the gate independently correct matters: a bare presence check
+  // would accept a stray (0, 0) and render it as a GPS fix, which is worse than
+  // the behaviour this change replaces. Falling through lets an estimate take
+  // over, correctly labelled.
+  const pos = node.position;
+  if (pos?.latitude != null && pos?.longitude != null && !isBogusPosition(pos.latitude, pos.longitude)) {
     return enhancedNode;
   }
 
-  // Priority 3: Use estimated position if available
+  // Priority 3: Use estimated position if available.
+  //
+  // This is a trilaterated guess, not a device GPS fix, so flag it — otherwise
+  // it is indistinguishable from a real position by the time any screen reads
+  // `node.position` (#4432). Priority 1 (override) returns above, so a
+  // user-placed node can never be labelled estimated.
   const estimatedPos = estimatedPositions?.get(node.user.id);
-    
+
   if (estimatedPos) {
     enhancedNode.position = {
       latitude: estimatedPos.latitude,
       longitude: estimatedPos.longitude,
       altitude: node.position?.altitude,
     };
+    enhancedNode.positionIsEstimated = true;
+    if (estimatedPos.uncertaintyKm != null) {
+      enhancedNode.positionEstimateUncertaintyKm = estimatedPos.uncertaintyKm;
+    }
     return enhancedNode;
   }
 

@@ -122,8 +122,16 @@ function runSettingsTests(getBackend: () => TestBackend) {
     await repo.setSetting('b', '2');
     await repo.setSetting('c', '3');
 
+    // Subset assertion, not exact-equality: the SQLite backend builds its
+    // fixture from the real migration registry (createTestDb()), and a
+    // migration is free to legitimately seed real settings rows (e.g.
+    // migration 131 seeding per-source Node Display defaults for whatever
+    // source(s) exist — #4412). This test's contract is "getAllSettings
+    // returns what was set", not "the table starts empty".
     const all = await repo.getAllSettings();
-    expect(all).toEqual({ a: '1', b: '2', c: '3' });
+    expect(all.a).toBe('1');
+    expect(all.b).toBe('2');
+    expect(all.c).toBe('3');
   });
 
   it('deleteSetting - removes a specific setting', async () => {
@@ -230,6 +238,290 @@ function runSettingsTests(getBackend: () => TestBackend) {
     await repo.setSetting('bad', 'not-json');
     expect(await repo.getSettingAsJson('bad')).toBeNull();
     expect(await repo.getSettingAsJson('bad', defaultVal)).toEqual(defaultVal);
+  });
+
+  it('deleteSourceSettings - removes only the target source prefix', async () => {
+    const backend = getBackend();
+    if (!backend.available) {
+      console.log(`⚠ Skipped: ${backend.skipReason}`);
+      return;
+    }
+
+    await repo.setSetting('maxNodeAgeHours', '24');
+    await repo.setSourceSetting('source-a', 'maxNodeAgeHours', '48');
+    await repo.setSourceSetting('source-a', 'hideIncompleteNodes', '1');
+    await repo.setSourceSetting('source-b', 'maxNodeAgeHours', '12');
+
+    await repo.deleteSourceSettings('source-a');
+
+    // Target source's namespace is gone.
+    expect(await repo.getSourceSettings('source-a')).toEqual({});
+
+    // A sibling source's namespace survives.
+    expect(await repo.getSourceSettings('source-b')).toEqual({ maxNodeAgeHours: '12' });
+
+    // The un-namespaced global row survives.
+    expect(await repo.getSetting('maxNodeAgeHours')).toBe('24');
+  });
+
+  it('deleteSourceSettings - no-op on an unknown sourceId', async () => {
+    const backend = getBackend();
+    if (!backend.available) {
+      console.log(`⚠ Skipped: ${backend.skipReason}`);
+      return;
+    }
+
+    await repo.setSourceSetting('source-a', 'maxNodeAgeHours', '48');
+
+    await expect(repo.deleteSourceSettings('does-not-exist')).resolves.toBeUndefined();
+
+    expect(await repo.getSourceSettings('source-a')).toEqual({ maxNodeAgeHours: '48' });
+  });
+
+  it('deleteSourceSettings - a sourceId containing a LIKE wildcard does not over-match a lookalike namespace', async () => {
+    const backend = getBackend();
+    if (!backend.available) {
+      console.log(`⚠ Skipped: ${backend.skipReason}`);
+      return;
+    }
+
+    // 'source_a' (underscore) is a single-char LIKE wildcard that would match
+    // 'sourceXa' unless escaped. Set up a lookalike sibling namespace that must survive.
+    await repo.setSourceSetting('source_a', 'maxNodeAgeHours', '48');
+    await repo.setSourceSetting('sourceXa', 'maxNodeAgeHours', '12');
+
+    await repo.deleteSourceSettings('source_a');
+
+    expect(await repo.getSourceSettings('source_a')).toEqual({});
+    expect(await repo.getSourceSettings('sourceXa')).toEqual({ maxNodeAgeHours: '12' });
+  });
+
+  it('getSourceSettings - returns this source\'s rows with the prefix stripped', async () => {
+    const backend = getBackend();
+    if (!backend.available) {
+      console.log(`⚠ Skipped: ${backend.skipReason}`);
+      return;
+    }
+
+    await repo.setSourceSetting('source-a', 'maxNodeAgeHours', '48');
+    await repo.setSourceSetting('source-a', 'hideIncompleteNodes', '1');
+    await repo.setSourceSetting('source-b', 'maxNodeAgeHours', '12');
+    await repo.setSetting('maxNodeAgeHours', '24');
+
+    const result = await repo.getSourceSettings('source-a');
+
+    expect(result).toEqual({ maxNodeAgeHours: '48', hideIncompleteNodes: '1' });
+  });
+
+  it('getSourceSettings - excludes the un-namespaced global rows', async () => {
+    const backend = getBackend();
+    if (!backend.available) {
+      console.log(`⚠ Skipped: ${backend.skipReason}`);
+      return;
+    }
+
+    await repo.setSetting('maxNodeAgeHours', '24');
+
+    const result = await repo.getSourceSettings('source-a');
+
+    expect(result).toEqual({});
+  });
+
+  it('getSourceSettings - a sourceId containing a LIKE wildcard does not over-match a lookalike namespace', async () => {
+    const backend = getBackend();
+    if (!backend.available) {
+      console.log(`⚠ Skipped: ${backend.skipReason}`);
+      return;
+    }
+
+    // 'source_a' (underscore) is a single-char LIKE wildcard that would match
+    // 'sourceXa' unless escaped. Mirrors the deleteSourceSettings test above —
+    // this is the test that would catch a wrong ESCAPE literal on MySQL.
+    await repo.setSourceSetting('source_a', 'maxNodeAgeHours', '48');
+    await repo.setSourceSetting('sourceXa', 'maxNodeAgeHours', '12');
+
+    expect(await repo.getSourceSettings('source_a')).toEqual({ maxNodeAgeHours: '48' });
+  });
+
+  it('getSourceSettings - issues exactly one SELECT and does not read the whole table', async () => {
+    const backend = getBackend();
+    if (!backend.available) {
+      console.log(`⚠ Skipped: ${backend.skipReason}`);
+      return;
+    }
+
+    // Three sibling sources so a correctly-scoped query returns only A's rows,
+    // not the whole table. Counting db.select() calls alone is insufficient:
+    // the old getAllSettings()-then-JS-filter body also issues exactly one
+    // select() (from inside getAllSettings), so that count is 1 either way.
+    // The real distinguishing signal is whether getAllSettings() itself gets
+    // called at all — the scoped implementation never calls it.
+    await repo.setSourceSetting('source-a', 'maxNodeAgeHours', '48');
+    await repo.setSourceSetting('source-b', 'maxNodeAgeHours', '168');
+    await repo.setSourceSetting('source-c', 'maxNodeAgeHours', '24');
+
+    // Monkey-patching the protected drizzle handle to count round trips (no-explicit-any is off in *.test.ts).
+    const dbHandle = (repo as any).db;
+    const realSelect = dbHandle.select.bind(dbHandle);
+    let selectCalls = 0;
+    dbHandle.select = (...args: unknown[]) => {
+      selectCalls += 1;
+      return realSelect(...args);
+    };
+
+    const realGetAllSettings = repo.getAllSettings.bind(repo);
+    let getAllSettingsCalls = 0;
+    (repo as any).getAllSettings = (...args: unknown[]) => {
+      getAllSettingsCalls += 1;
+      return realGetAllSettings(...(args as []));
+    };
+
+    try {
+      const result = await repo.getSourceSettings('source-a');
+      expect(selectCalls).toBe(1);
+      expect(getAllSettingsCalls).toBe(0);
+      expect(result).toEqual({ maxNodeAgeHours: '48' });
+    } finally {
+      dbHandle.select = realSelect;
+      (repo as any).getAllSettings = realGetAllSettings;
+    }
+  });
+
+  it('getSourceSettings - a stored __proto__ key does not pollute the prototype', async () => {
+    const backend = getBackend();
+    if (!backend.available) {
+      console.log(`⚠ Skipped: ${backend.skipReason}`);
+      return;
+    }
+
+    await repo.setSourceSetting('source-a', '__proto__', 'pwned');
+
+    const result = await repo.getSourceSettings('source-a');
+
+    expect((({}) as any).polluted).toBeUndefined();
+    expect(Object.getPrototypeOf({})).toBe(Object.prototype);
+    expect(Object.prototype.hasOwnProperty.call(result, '__proto__')).toBe(true);
+    expect(Object.getOwnPropertyDescriptor(result, '__proto__')?.value).toBe('pwned');
+  });
+
+  it('getSettingForSources - batched multi-source hit/miss for one key', async () => {
+    const backend = getBackend();
+    if (!backend.available) {
+      console.log(`⚠ Skipped: ${backend.skipReason}`);
+      return;
+    }
+
+    await repo.setSourceSetting('source-a', 'maxNodeAgeHours', '48');
+    await repo.setSourceSetting('source-b', 'maxNodeAgeHours', '168');
+    // source-c has no override; a sibling key on source-c must not bleed in.
+    await repo.setSourceSetting('source-c', 'hideIncompleteNodes', '1');
+    // The un-namespaced global row must not be picked up for any source.
+    await repo.setSetting('maxNodeAgeHours', '999');
+
+    const result = await repo.getSettingForSources(
+      ['source-a', 'source-b', 'source-c'],
+      'maxNodeAgeHours',
+    );
+
+    expect(result.get('source-a')).toBe('48');
+    expect(result.get('source-b')).toBe('168');
+    expect(result.has('source-c')).toBe(false);
+    expect(result.size).toBe(2);
+  });
+
+  it('getSettingForSources - empty input returns an empty Map without querying', async () => {
+    const backend = getBackend();
+    if (!backend.available) {
+      console.log(`⚠ Skipped: ${backend.skipReason}`);
+      return;
+    }
+
+    const result = await repo.getSettingForSources([], 'maxNodeAgeHours');
+    expect(result.size).toBe(0);
+  });
+
+  it('getSettingForSources - dedupes a sourceId requested more than once', async () => {
+    const backend = getBackend();
+    if (!backend.available) {
+      console.log(`⚠ Skipped: ${backend.skipReason}`);
+      return;
+    }
+
+    await repo.setSourceSetting('source-a', 'maxNodeAgeHours', '48');
+
+    const result = await repo.getSettingForSources(
+      ['source-a', 'source-a', 'source-a'],
+      'maxNodeAgeHours',
+    );
+
+    expect(result.size).toBe(1);
+    expect(result.get('source-a')).toBe('48');
+  });
+
+  it('getSettingForSources - no cross-namespace bleed between different keys', async () => {
+    const backend = getBackend();
+    if (!backend.available) {
+      console.log(`⚠ Skipped: ${backend.skipReason}`);
+      return;
+    }
+
+    await repo.setSourceSetting('source-a', 'maxNodeAgeHours', '48');
+    await repo.setSourceSetting('source-a', 'inactiveNodeThresholdHours', '72');
+
+    const result = await repo.getSettingForSources(['source-a'], 'maxNodeAgeHours');
+
+    expect(result.get('source-a')).toBe('48');
+    expect(result.size).toBe(1);
+  });
+
+  it('getSettingForSources - issues exactly one SELECT for the whole batch, not one per source', async () => {
+    const backend = getBackend();
+    if (!backend.available) {
+      console.log(`⚠ Skipped: ${backend.skipReason}`);
+      return;
+    }
+
+    await repo.setSourceSetting('source-a', 'maxNodeAgeHours', '48');
+    await repo.setSourceSetting('source-b', 'maxNodeAgeHours', '168');
+    await repo.setSourceSetting('source-c', 'maxNodeAgeHours', '24');
+
+    // Monkey-patching the protected drizzle handle to count round trips (no-explicit-any is off in *.test.ts).
+    const dbHandle = (repo as any).db;
+    const realSelect = dbHandle.select.bind(dbHandle);
+    let selectCalls = 0;
+    dbHandle.select = (...args: unknown[]) => {
+      selectCalls += 1;
+      return realSelect(...args);
+    };
+
+    try {
+      await repo.getSettingForSources(['source-a', 'source-b', 'source-c'], 'maxNodeAgeHours');
+      expect(selectCalls).toBe(1);
+    } finally {
+      dbHandle.select = realSelect;
+    }
+  });
+
+  it('getSettingForSources - a sourceId containing a colon is resolved by reverse map, not string-split', async () => {
+    const backend = getBackend();
+    if (!backend.available) {
+      console.log(`⚠ Skipped: ${backend.skipReason}`);
+      return;
+    }
+
+    // A colon inside the id would corrupt a naive `key.split(':')` resolution
+    // (`source:a:b:maxNodeAgeHours` is ambiguous by string-splitting alone).
+    // The reverse-map implementation resolves by exact prefixed-key match, so
+    // this must round-trip correctly regardless.
+    const weirdId = 'weird:id:with:colons';
+    await repo.setSourceSetting(weirdId, 'maxNodeAgeHours', '99');
+    await repo.setSourceSetting('plain-id', 'maxNodeAgeHours', '11');
+
+    const result = await repo.getSettingForSources([weirdId, 'plain-id'], 'maxNodeAgeHours');
+
+    expect(result.get(weirdId)).toBe('99');
+    expect(result.get('plain-id')).toBe('11');
+    expect(result.size).toBe(2);
   });
 
   it('deleteAllSettings - removes all settings', async () => {

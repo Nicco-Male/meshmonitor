@@ -9,6 +9,8 @@
  */
 
 import { describe, it, expect } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { computeNeighborLinkStyle, isTracerouteRunDisabled } from './NodesTab';
 import {
   getEffectivePosition,
@@ -138,6 +140,129 @@ describe('NodesTab', () => {
     });
   });
 
+  // Issue #4342 — "GeoJSON overlay tooltip blocks waypoint creation".
+  //
+  // Leaflet's bindPopup handler calls DomEvent.stop() on the layer's click
+  // (leaflet/src/layer/Popup.js `_openPopup`), which sets
+  // originalEvent._stopped, and Map._fireDOMEvent bails out of its target loop
+  // as soon as that flag is set — BEFORE it reaches the map itself. So any
+  // click landing on popup-bound overlay geometry (a GeoJSON feature, a node
+  // or waypoint marker, a traceroute line, a neighbor link, an accuracy
+  // region) opened that layer's popup and never reached the map 'click'
+  // handler in WaypointMapEventBridge, so no waypoint was created.
+  //
+  // The fix makes interactive geometry click-through for the duration of
+  // placement, which is a hit-testing property jsdom cannot exercise — so this
+  // pins the CSS contract instead: as long as `.waypoint-placing` is on the
+  // container (WaypointMapEventBridge's first effect), interactive overlay
+  // geometry must not be a pointer target. Deleting that rule silently
+  // reintroduces the bug.
+  describe('waypoint placement mode suppresses overlay hit-testing (#4342)', () => {
+    const css = readFileSync(resolve('src/components/WaypointEditorModal.css'), 'utf8');
+
+    // Strip comments so the prose above the rule can't satisfy the assertions.
+    const rules = css.replace(/\/\*[\s\S]*?\*\//g, '');
+
+    it('makes .leaflet-interactive click-through while .waypoint-placing is set', () => {
+      const rule = rules.match(
+        /\.leaflet-container\.waypoint-placing\s+\.leaflet-interactive\s*\{[^}]*\}/g,
+      )?.find(r => /pointer-events\s*:\s*none/.test(r));
+
+      expect(rule, 'pointer-events:none rule for .waypoint-placing .leaflet-interactive is missing').toBeDefined();
+      // Leaflet's own `.leaflet-pane > svg path.leaflet-interactive` /
+      // `.leaflet-marker-icon.leaflet-interactive { pointer-events: auto }`
+      // rules are more specific, so the override has to be !important.
+      expect(rule).toMatch(/pointer-events\s*:\s*none\s*!important/);
+    });
+
+    it('keeps the crosshair cursor rule that signals placement mode', () => {
+      expect(rules).toMatch(/\.leaflet-container\.waypoint-placing[^{]*\{[^}]*cursor\s*:\s*crosshair/);
+    });
+  });
+
+  // #4379 — NodesTab renders under leaflet + a stack of contexts, so the node
+  // row can't be mounted here. These assertions read the source instead, which
+  // is enough to pin the two structural promises the issue extracted: the
+  // interactive controls are separated from the inert status icons, and the
+  // route to Node Details exists on EVERY row rather than only unmessageable
+  // ones.
+  describe('node row separates status indicators from actions (#4379)', () => {
+    const src = readFileSync(resolve('src/components/NodesTab.tsx'), 'utf8');
+
+    const strip = src.slice(
+      src.indexOf('<div className="node-actions">'),
+      src.indexOf('<div className="node-short">'),
+    );
+    const actionsAt = strip.indexOf('nodeRowStyles.actions');
+    const indicatorGroup = strip.slice(strip.indexOf('nodeRowStyles.indicators'), actionsAt);
+    const actionGroup = strip.slice(actionsAt);
+
+    it('puts the unmessageable badge among the inert indicators, with no props', () => {
+      // Self-closing with no props is the assertion that matters: an
+      // `onOpenDetails` prop reappearing means the badge became a control
+      // again, which is exactly what #4379 asked to undo.
+      expect(indicatorGroup).toContain('<NodeUnmessageableBadge />');
+      expect(actionGroup).not.toContain('NodeUnmessageableBadge');
+    });
+
+    it('puts the details button in the action group, away from the icon strip', () => {
+      expect(actionGroup).toContain('<NodeDetailsButton');
+      expect(indicatorGroup).not.toContain('NodeDetailsButton');
+    });
+
+    it('offers Node Details on every node, not just unmessageable ones', () => {
+      const detailsAt = actionGroup.indexOf('<NodeDetailsButton');
+      const guard = actionGroup.slice(actionGroup.lastIndexOf('{', detailsAt), detailsAt);
+
+      // #4333's affordance only existed on unmessageable rows. The issue asks
+      // for it "consistently in the node list", so messageability must not
+      // appear in this guard at all.
+      expect(guard).not.toMatch(/isUnmessagable/);
+      // It stays permission-gated because Node Details still lives inside the
+      // Messages tab — an ungated button would strand users on a tab they
+      // cannot see.
+      expect(guard).toMatch(/hasPermission\('messages', 'read'\)/);
+    });
+
+    it('no longer ships a separate Send-DM button beside the details button', () => {
+      // The DM button sat immediately next to NodeDetailsButton and navigated to
+      // the same place. #4379 folded them into one control.
+      expect(actionGroup).not.toContain("t('nodes.send_dm')");
+      expect(src).not.toContain('handleDMClick');
+    });
+
+    it('keeps #4325 compose-focus alive through the merged handler', () => {
+      // openDmForCompose sets pendingComposeFocus, which MessagesTab consumes to
+      // focus the compose box. The removed DM button was its ONLY caller, so if
+      // this branch goes away the entire chain — MessagingContext's
+      // pendingComposeFocus/clearComposeFocus and MessagesTab's focus effect —
+      // becomes unreachable dead code.
+      const handler = src.slice(
+        src.indexOf('const handleNodeDetailsClick'),
+        src.indexOf('const handleCollapseNodeList'),
+      );
+      expect(handler).toContain('openDmForCompose(nodeId)');
+      // Unmessageable nodes have no composer to focus, so they must NOT take
+      // the compose path.
+      expect(handler).toMatch(/if \(node\.isUnmessagable\)\s*\{\s*setSelectedDMNode\(nodeId\)/);
+    });
+
+    it('routes row double-click to details as a second path, like MeshCore', () => {
+      // Single-click is already taken (select + center the map), so the row's
+      // double-click is the free slot — MeshCoreNodesView does the same.
+      expect(src).toMatch(/onDoubleClick=\{hasPermission\('messages', 'read'\) \? handleNodeDetailsClick\(node\)/);
+    });
+
+    it('draws a divider between the two groups, but only when both are present', () => {
+      const css = readFileSync(resolve('src/components/NodeRowActions.module.css'), 'utf8')
+        .replace(/\/\*[\s\S]*?\*\//g, '');
+
+      // `:not(:empty)` is load-bearing: a node with zero status indicators
+      // would otherwise render a stray leading rule.
+      expect(css).toMatch(/\.indicators:not\(:empty\)\s*\+\s*\.actions\s*\{[^}]*border-left/);
+    });
+  });
+
   describe('Helper Functions', () => {
     describe('isToday', () => {
       it('should return true for today\'s date', () => {
@@ -236,5 +361,54 @@ describe('NodesTab', () => {
 
       expect(areSameDay(date1, date2)).toBe(false);
     });
+  });
+});
+
+describe('map controls: attribution clearance + zoom-to-fit (#4495, #4496)', () => {
+  const nodesCss = readFileSync(resolve('src/styles/nodes.css'), 'utf8');
+
+  /** Body of a rule inside the LATER mobile override block, per this file's #3532 note. */
+  function mobileOverrideRule(selector: string): string {
+    // lastIndexOf, NOT indexOf: an earlier NOTE comment cross-references this
+    // same phrase, and anchoring on it sliced in the BASE rule instead.
+    const block = nodesCss.slice(nodesCss.lastIndexOf('Map Controls (mobile override)'));
+    const escaped = selector.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    return block.match(new RegExp(escaped + '\\s*\\{([^}]*)\\}'))?.[1] ?? '';
+  }
+
+  it('bounds the mobile controls panel so it cannot reach the attribution strip', () => {
+    // Raising z-index cannot fix this: the attribution is inside Leaflet's
+    // `.leaflet-bottom` (z-index 1000) while this panel must stay at 997 to
+    // yield to the Sources drawer (999). Geometry is the only lever.
+    const rule = mobileOverrideRule('.map-controls');
+    expect(rule).toMatch(/max-height:\s*calc\(/);
+    // The z-index that forces the geometric approach must still be there.
+    expect(rule).toMatch(/z-index:\s*997/);
+  });
+
+  it('lets a long feature list scroll inside the bounded panel', () => {
+    // Base .map-controls is `overflow: hidden`, so without this the excess is
+    // clipped rather than reachable.
+    expect(nodesCss).toMatch(/\.map-controls \.map-controls-body \{[^}]*overflow-y:\s*auto/);
+  });
+
+  it('styles the zoom-to-fit button and gives it a disabled state', () => {
+    expect(nodesCss).toMatch(/\.map-controls-fit-btn/);
+    expect(nodesCss).toMatch(/\.map-controls-fit-btn:disabled \{[^}]*cursor:\s*not-allowed/);
+  });
+
+  it('wires the fit button to a counter, not a boolean', () => {
+    // A boolean would fire once and never re-fit on a second tap.
+    const src = readFileSync(resolve('src/components/NodesTab.tsx'), 'utf8');
+    expect(src).toMatch(/setFitAllRequest\(n => n \+ 1\)/);
+    expect(src).toMatch(/<FitAllNodesController\s+request=\{fitAllRequest\}/);
+  });
+
+  it('fits to the OFFSET marker positions, matching the pins the user sees', () => {
+    // Fitting to raw centres could leave a visible pin just outside the
+    // viewport — the #4016/#4155 single-position rule.
+    const src = readFileSync(resolve('src/components/NodesTab.tsx'), 'utf8');
+    const memo = src.match(/const fitAllPositions[\s\S]{0,400}/)?.[0] ?? '';
+    expect(memo).toMatch(/nodePositions\.get\(node\.nodeNum\)/);
   });
 });

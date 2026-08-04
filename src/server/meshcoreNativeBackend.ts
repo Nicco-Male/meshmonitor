@@ -228,7 +228,7 @@ export class MeshCoreNativeBackend extends EventEmitter {
    * captured). {@link consumePendingPath} matches by hop count and takes the
    * oldest unconsumed entry, so concurrent packets no longer evict each other.
    */
-  private pendingTxtMsgPaths: Array<{ hops: string[]; rawPathLen: number; snr?: number; rawHex?: string; bufferedAt: number }> = [];
+  private pendingTxtMsgPaths: Array<{ hops: string[]; rawPathLen: number; snr?: number; rssi?: number; rawHex?: string; bufferedAt: number }> = [];
 
   /**
    * Maximum age (ms) of a buffered LogRxData path before we treat it as stale
@@ -392,10 +392,10 @@ export class MeshCoreNativeBackend extends EventEmitter {
    *     correlate, so {ROUTE} resolved to "—" for any routed message
    *     (issue #3710). We decode the packed byte to a hop count first.
    *
-   * Returns `{ hops, snr }` to attach, or `undefined` when the buffer is
+   * Returns `{ hops, snr, rssi }` to attach, or `undefined` when the buffer is
    * absent, stale, or for a different packet.
    */
-  private consumePendingPath(msgPathLen: unknown): { hops: string[]; snr?: number; rawHex?: string } | undefined {
+  private consumePendingPath(msgPathLen: unknown): { hops: string[]; snr?: number; rssi?: number; rawHex?: string } | undefined {
     const now = Date.now();
     // Drop stale entries first — a buffer whose matching recv never arrived
     // would mis-correlate route/SNR/scope if attached to a later message
@@ -428,7 +428,7 @@ export class MeshCoreNativeBackend extends EventEmitter {
     if (idx === -1) return undefined;
 
     const [buffered] = this.pendingTxtMsgPaths.splice(idx, 1); // consume-once
-    return { hops: buffered.hops, snr: buffered.snr, rawHex: buffered.rawHex };
+    return { hops: buffered.hops, snr: buffered.snr, rssi: buffered.rssi, rawHex: buffered.rawHex };
   }
 
   private wirePushEvents(): void {
@@ -483,7 +483,7 @@ export class MeshCoreNativeBackend extends EventEmitter {
             // each other's route/SNR/scope. Remaining limitation: if LogRxData
             // arrives AFTER its own recv (rare ordering), that packet's buffer is
             // still missed — inherent to the adjacency-buffer design.
-            this.pendingTxtMsgPaths.push({ hops, rawPathLen: pkt.pathLen, snr, rawHex: bytesToHex(raw), bufferedAt: Date.now() });
+            this.pendingTxtMsgPaths.push({ hops, rawPathLen: pkt.pathLen, snr, rssi, rawHex: bytesToHex(raw), bufferedAt: Date.now() });
             // Backstop against unbounded growth (recv-less LogRxData bursts).
             if (this.pendingTxtMsgPaths.length > MeshCoreNativeBackend.PENDING_PATH_MAX_ENTRIES) {
               this.pendingTxtMsgPaths.shift();
@@ -567,6 +567,9 @@ export class MeshCoreNativeBackend extends EventEmitter {
         // not available (e.g. backend started without raw logging).
         path_hops: consumedPath?.hops,
         snr: consumedPath?.snr,
+        // RSSI rides the same buffered LogRxData as SNR (#4504). It was already
+        // parsed from the OTA metadata; it just never reached the message.
+        rssi: consumedPath?.rssi,
         // Raw OTA bytes (from the same preceding LogRxData) so the manager can
         // resolve the scope/region the message was sent under (#3742 Phase 2).
         raw_hex: consumedPath?.rawHex,
@@ -585,6 +588,8 @@ export class MeshCoreNativeBackend extends EventEmitter {
         path_len: typeof msg.pathLen === 'number' ? msg.pathLen : undefined,
         path_hops: consumedPath?.hops,
         snr: consumedPath?.snr,
+        // Same buffered LogRxData that carries SNR (#4504).
+        rssi: consumedPath?.rssi,
         // Raw OTA bytes for scope/region resolution (#3742 Phase 2).
         raw_hex: consumedPath?.rawHex,
       });
@@ -704,6 +709,16 @@ export class MeshCoreNativeBackend extends EventEmitter {
         const publicKeyBytes = keyBytes.slice(0, 32);
         const publicKey = bytesToHex(publicKeyBytes);
 
+        // The reverse direction was parsed-adjacent but never read: the frame
+        // header SNR above is how WE heard the responder, while
+        // control_payload[1] (frame[5]) is the SNR the RESPONDER measured on
+        // our request — i.e. how well it hears us. Surfacing both gives the
+        // same "there and back" pair the zero-hop ping already reports (#4516).
+        // Read only after the length check above, so a truncated frame can't
+        // produce a garbage number.
+        const snrToNode = (frame[5] << 24 >> 24) / 4;
+        const rssi = frame[2] << 24 >> 24;
+
         // Auto-add a GENUINELY NEW node to the DEVICE contact store so it's
         // actually message-able and survives the next refreshContacts() (a
         // MeshMonitor-only mirror would be clobbered by the device's list). A
@@ -735,6 +750,8 @@ export class MeshCoreNativeBackend extends EventEmitter {
           public_key: publicKey,
           adv_type: nodeType,
           snr,
+          snr_to_node: snrToNode,
+          rssi,
         });
       } catch (err) {
         logger.warn(`[MeshCore:native] Failed to parse 0x8E discover frame: ${(err as Error).message}`);

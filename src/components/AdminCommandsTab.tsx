@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useQueryClient } from '@tanstack/react-query';
-import apiService from '../services/api';
+import apiService, { type AdminCommandAck } from '../services/api';
 import { useToast } from './ToastContainer';
 import { useResolvedSourceId } from '../hooks/useResolvedSourceId';
 import { useTxStatus } from '../hooks/useTxStatus';
@@ -66,6 +66,10 @@ const AdminCommandsTab: React.FC<AdminCommandsTabProps> = ({ nodes, currentNodeI
 
   // UI and non-config state (keep as useState for now)
   const [selectedNodeNum, setSelectedNodeNum] = useState<number | null>(null);
+  // Per-send retry override (#4487). null = defer to the `adminRetryAttempts`
+  // setting; a number overrides it for commands sent from this tab, for the one
+  // stubborn node rather than a global change.
+  const [retryAttemptsOverride, setRetryAttemptsOverride] = useState<number | null>(null);
   const [isExecuting, setIsExecuting] = useState(false);
   const [nodeOptions, setNodeOptions] = useState<NodeOption[]>([]);
   const [searchQuery, setSearchQuery] = useState('');
@@ -145,6 +149,8 @@ const AdminCommandsTab: React.FC<AdminCommandsTabProps> = ({ nodes, currentNodeI
     positionFlags: number;
     hwModel: number;
     hasRemoteHardware: boolean;
+    /** Firmware 2.8+ build capability: XEdDSA signature verification compiled in (#3923). */
+    hasXeddsa?: boolean;
   } | null>(null);
 
   // Reboot and Set Time command states
@@ -718,11 +724,11 @@ const AdminCommandsTab: React.FC<AdminCommandsTabProps> = ({ nodes, currentNodeI
           
           // First, ensure we have a session passkey
           try {
-            const passkeyResponse = await apiService.post<{
+            const passkeyResponse = await apiService.ensureSessionPasskey<{
               success: boolean;
               hasPasskey: boolean;
               remainingSeconds: number | null;
-            }>('/api/admin/ensure-session-passkey', {
+            }>({
               nodeNum: selectedNodeNum,
               ...(sourceId ? { sourceId } : {})
             });
@@ -971,11 +977,11 @@ const AdminCommandsTab: React.FC<AdminCommandsTabProps> = ({ nodes, currentNodeI
       // Note: This is done once before retries since the passkey persists
       if (isRemoteNode) {
         try {
-          const passkeyResponse = await apiService.post<{
+          const passkeyResponse = await apiService.ensureSessionPasskey<{
             success: boolean;
             hasPasskey: boolean;
             remainingSeconds: number | null;
-          }>('/api/admin/ensure-session-passkey', {
+          }>({
             nodeNum: selectedNodeNum,
             ...(sourceId ? { sourceId } : {})
           });
@@ -1258,11 +1264,11 @@ const AdminCommandsTab: React.FC<AdminCommandsTabProps> = ({ nodes, currentNodeI
         
         // First, ensure we have a session passkey (prevents conflicts from parallel requests)
         try {
-          const passkeyResponse = await apiService.post<{
+          const passkeyResponse = await apiService.ensureSessionPasskey<{
             success: boolean;
             hasPasskey: boolean;
             remainingSeconds: number | null;
-          }>('/api/admin/ensure-session-passkey', {
+          }>({
             nodeNum: selectedNodeNum,
             ...(sourceId ? { sourceId } : {})
           });
@@ -1439,10 +1445,16 @@ const AdminCommandsTab: React.FC<AdminCommandsTabProps> = ({ nodes, currentNodeI
 
     setIsExecuting(true);
     try {
-      const result = await apiService.post<{ success: boolean; message: string }>('/api/admin/commands', {
+      // Remote commands come back as a 202 + operation id that ApiService
+      // polls to completion (#4482), so this await can still take mesh time —
+      // it just no longer holds an HTTP request open for it.
+      const result = await apiService.sendAdminCommand<{ success: boolean; message: string; ack?: AdminCommandAck }>({
         command,
         nodeNum: selectedNodeNum,
         ...(sourceId ? { sourceId } : {}),
+        // Omitted unless explicitly set, so the server falls back to the
+        // adminRetryAttempts setting rather than this tab pinning a value.
+        ...(retryAttemptsOverride != null ? { retryAttempts: retryAttemptsOverride } : {}),
         ...params
       });
       showToast(result.message || t('admin_commands.command_executed', { command }), 'success');
@@ -1460,7 +1472,7 @@ const AdminCommandsTab: React.FC<AdminCommandsTabProps> = ({ nodes, currentNodeI
     } finally {
       setIsExecuting(false);
     }
-  }, [selectedNodeNum, sourceId, remoteAdminBlocked, showToast, t]);
+  }, [selectedNodeNum, sourceId, remoteAdminBlocked, retryAttemptsOverride, showToast, t]);
 
   const handleReboot = useCallback(async () => {
     if (!confirm(t('admin_commands.reboot_confirmation', { seconds: rebootSeconds }))) {
@@ -1596,8 +1608,22 @@ const AdminCommandsTab: React.FC<AdminCommandsTabProps> = ({ nodes, currentNodeI
       return;
     }
     try {
-      await executeCommand('setIgnoredNode', { targetNodeNum: nodeManagementNodeNum });
-      showToast(t('admin_commands.node_set_ignored', { nodeNum: nodeManagementNodeNum }), 'success');
+      const res = await executeCommand('setIgnoredNode', { targetNodeNum: nodeManagementNodeNum });
+      // Remote ignores now carry a routing ACK like favorites do (#4482 part B).
+      // A definitive routing rejection means it did NOT apply — don't
+      // optimistically mark it. 'confirmed' or 'timeout' keep the update.
+      const ack = res?.ack;
+      const rejected = ack && !ack.acked && !ack.timedOut;
+      if (ack?.acked) {
+        showToast(t('admin_commands.node_ignored_confirmed', { nodeNum: nodeManagementNodeNum }), 'success');
+      } else if (ack?.timedOut) {
+        showToast(t('admin_commands.node_ignored_no_ack', { nodeNum: nodeManagementNodeNum }), 'warning');
+      } else if (rejected) {
+        showToast(t('admin_commands.node_ignored_rejected', { nodeNum: nodeManagementNodeNum, status: ack.status }), 'error');
+      } else {
+        showToast(t('admin_commands.node_set_ignored', { nodeNum: nodeManagementNodeNum }), 'success');
+      }
+      if (rejected) return;
       // Optimistically update state - use remote status if managing remote node, otherwise local
       if (isManagingRemoteNode) {
         setRemoteNodeStatus(prev => {
@@ -1625,8 +1651,20 @@ const AdminCommandsTab: React.FC<AdminCommandsTabProps> = ({ nodes, currentNodeI
       return;
     }
     try {
-      await executeCommand('removeIgnoredNode', { targetNodeNum: nodeManagementNodeNum });
-      showToast(t('admin_commands.node_removed_ignored', { nodeNum: nodeManagementNodeNum }), 'success');
+      const res = await executeCommand('removeIgnoredNode', { targetNodeNum: nodeManagementNodeNum });
+      // Same ACK treatment as setIgnoredNode above (#4482 part B).
+      const ack = res?.ack;
+      const rejected = ack && !ack.acked && !ack.timedOut;
+      if (ack?.acked) {
+        showToast(t('admin_commands.node_unignored_confirmed', { nodeNum: nodeManagementNodeNum }), 'success');
+      } else if (ack?.timedOut) {
+        showToast(t('admin_commands.node_unignored_no_ack', { nodeNum: nodeManagementNodeNum }), 'warning');
+      } else if (rejected) {
+        showToast(t('admin_commands.node_unignored_rejected', { nodeNum: nodeManagementNodeNum, status: ack.status }), 'error');
+      } else {
+        showToast(t('admin_commands.node_removed_ignored', { nodeNum: nodeManagementNodeNum }), 'success');
+      }
+      if (rejected) return;
       // Optimistically update state - use remote status if managing remote node, otherwise local
       if (isManagingRemoteNode) {
         setRemoteNodeStatus(prev => {
@@ -2419,6 +2457,34 @@ const AdminCommandsTab: React.FC<AdminCommandsTabProps> = ({ nodes, currentNodeI
       {/* Node Selection Section */}
       <div id="admin-target-node" className="settings-section">
         <h3>{t('admin_commands.target_node')}</h3>
+        {/* Per-send retry override (#4487). Blank defers to the global
+            adminRetryAttempts setting, so this only ever narrows scope to the
+            node currently being worked on. */}
+        <div className="setting-item">
+          <label htmlFor="adminRetryAttemptsOverride">
+            {t('admin_commands.retry_attempts_label', 'Attempts for this command')}
+            <span className="setting-description">
+              {t('admin_commands.retry_attempts_description', 'Leave blank to use the Remote Administration setting. Only a command that gets no reply is retried — one the node refuses is never resent. Range 1–10.')}
+            </span>
+          </label>
+          <input
+            id="adminRetryAttemptsOverride"
+            type="number"
+            min="1"
+            max="10"
+            className="setting-input"
+            style={{ width: '120px' }}
+            placeholder={t('admin_commands.retry_attempts_placeholder', 'default')}
+            value={retryAttemptsOverride ?? ''}
+            disabled={isExecuting}
+            onChange={(e) => {
+              const raw = e.target.value.trim();
+              if (raw === '') { setRetryAttemptsOverride(null); return; }
+              const n = parseInt(raw, 10);
+              setRetryAttemptsOverride(Number.isNaN(n) ? null : Math.min(10, Math.max(1, n)));
+            }}
+          />
+        </div>
         <div className="setting-item">
           <label>
             {t('admin_commands.select_node_description')}
@@ -2608,7 +2674,8 @@ const AdminCommandsTab: React.FC<AdminCommandsTabProps> = ({ nodes, currentNodeI
                       deviceMetadata.hasBluetooth && 'Bluetooth',
                       deviceMetadata.hasEthernet && 'Ethernet',
                       deviceMetadata.canShutdown && 'Shutdown',
-                      deviceMetadata.hasRemoteHardware && 'Remote HW'
+                      deviceMetadata.hasRemoteHardware && 'Remote HW',
+                      deviceMetadata.hasXeddsa && 'XEdDSA'
                     ].filter(Boolean).join(', ') || t('common.none', 'None')}
                   </span>
 

@@ -59,6 +59,23 @@ vi.mock('./ToastContainer', async (importOriginal) => ({
 
 vi.mock('../hooks/useCsrfFetch', () => ({ useCsrfFetch: () => vi.fn() }));
 
+// This file renders MessagesTab without a QueryClientProvider. The
+// traceroute participation picker (epic phase 2, WP2) added an unconditional
+// useNodeTraceroutes -> useQuery call, which throws "No QueryClient set"
+// without one — stub the hook to a deterministic empty list, mirroring
+// MessagesTab.tracerouteStrip.test.tsx.
+vi.mock('../hooks/useNodeTraceroutes', () => ({
+  useNodeTraceroutes: () => ({ data: [], isLoading: false, error: null, refetch: vi.fn() }),
+}));
+
+// Statistical Route epic phase 2, WP4: the traceroute box now also calls
+// useTraceroutePairHistory unconditionally (with an `enabled` flag) — same
+// "no QueryClientProvider in this file" problem as useNodeTraceroutes above,
+// same fix.
+vi.mock('../hooks/useTraceroutePairHistory', () => ({
+  useTraceroutePairHistory: () => ({ rows: undefined, isLoading: false, error: null }),
+}));
+
 vi.mock('@tanstack/react-query', async (importOriginal) => ({
   ...(await importOriginal<Record<string, unknown>>()),
   useQueryClient: () => ({}),

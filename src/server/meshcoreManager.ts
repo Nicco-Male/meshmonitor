@@ -24,9 +24,29 @@ import { runScript, type RunScriptResult } from './utils/scriptRunner.js';
 import { MeshCoreNativeBackend, type BridgeShapedEvent } from './meshcoreNativeBackend.js';
 import { resolveMessageScope } from './meshcoreScopeResolve.js';
 import {
+  parseMeshCoreIgnoreList,
+  isMeshCoreIgnoreListEmpty,
+  isMeshCoreSenderIgnored,
+} from './meshcoreAutoAckIgnore.js';
+import {
   MeshCoreVirtualNodeServer,
   type MeshCoreVirtualNodeConfig,
+  type OtaPacketEvent,
 } from './meshcoreVirtualNodeServer.js';
+import {
+  MeshCoreObserverPublisher,
+  type MeshCoreObserverStatus,
+} from './services/meshcoreObserverPublisher.js';
+// Type-only import — meshcoreConfig.ts imports MeshCoreConfig (below) from this
+// file at runtime, so this side of the edge must stay `import type` to avoid a
+// circular runtime dependency. Same pattern already used for
+// MeshCoreVirtualNodeConfig above (that cycle runs the other direction).
+// reconfigureObserver() (#4457 Phase 2, WP6) needs the `observerConfigFromSource`
+// *function* from that same module for normalization parity with the boot path;
+// a static value import of it here would make the cycle real (meshcoreConfig.ts
+// already imports the MeshCoreManager class by value), so it is resolved with a
+// dynamic import() at call time instead — see reconfigureObserver() below.
+import type { MeshCoreObserverConfig, MeshCoreSourceConfig } from './meshcoreConfig.js';
 import meshcorePacketLogService from './services/meshcorePacketLogService.js';
 import { notificationService } from './services/notificationService.js';
 import { DistanceDeleteScheduler } from './services/distanceDeleteScheduler.js';
@@ -37,6 +57,7 @@ import { decodeMeshCorePacket } from '../utils/meshcorePacketDecode.js';
 import { MESHCORE_SECRET_BYTES } from '../utils/meshcoreHelpers.js';
 import { parsePathHops, pathHashBytesOf, resolveRouteNames } from '../utils/meshcorePath.js';
 import { tryDecodeGroupTextPayload } from './utils/meshcoreGroupEcho.js';
+import { meshcoreAgeCutoffMs, isWithinMeshcoreAge } from '../utils/meshcoreAge.js';
 
 // Dynamic imports for optional serialport dependency
 // These are loaded only when MeshCore is enabled to avoid requiring native build tools
@@ -169,11 +190,63 @@ export const MeshCoreDiscoverFilter = {
 
 export type MeshCoreDiscoverMode = 'nearby' | 'repeaters' | 'sensors';
 
+/**
+ * One node that answered a discovery sweep (#4516).
+ *
+ * The two SNRs are the "there and back" pair: `snr` is what our radio measured
+ * on the response, `snrToNode` is what the responder measured on our request.
+ * Both come from the same 0x8E frame — the reverse direction was simply never
+ * read before. Every field but the key is nullable because a discovery
+ * response carries only key + type + signal; the name is filled in afterwards
+ * from the contact store, and stays null for a node that has not advertised
+ * and does not answer an ANON_REQ OWNER.
+ */
+export interface MeshCoreDiscoveredNode {
+  publicKey: string;
+  name: string | null;
+  advType: number | null;
+  /** SNR our radio measured on the response — how well we hear them. */
+  snr: number | null;
+  /** SNR the responder measured on our request — how well they hear us. */
+  snrToNode: number | null;
+  rssi: number | null;
+  /** True when this key was not already in the contact store before the sweep. */
+  isNew: boolean;
+}
+
 /** Result of a share-contact request, carrying an actionable reason on failure. */
 export interface ShareContactResult {
   ok: boolean;
   error?: string;
 }
+
+/**
+ * Result of {@link MeshCoreManager.pingContactZeroHop} (issue #4393).
+ *
+ * A zero-hop ping is a TRACE (companion command `SendTracePath`, opcode 36)
+ * whose path is the single 1-byte hash of the target's public key. Only a node
+ * in DIRECT radio range that forwards packets can answer it, so a reply proves
+ * direct reachability and a timeout means "not directly reachable".
+ *
+ * `snrToTarget` is the SNR the *target* measured on our outbound frame;
+ * `snrFromTarget` is the SNR our own radio measured on the returning frame.
+ * `rttMs` is measured host-side around the companion command, so it includes
+ * the USB/TCP link latency as well as airtime — treat it as approximate.
+ */
+export type ZeroHopPingResult =
+  | {
+      ok: true;
+      /** Path hash byte used (first byte of the target public key), hex. */
+      hopHash: string;
+      rttMs: number;
+      snrToTarget: number | null;
+      snrFromTarget: number;
+    }
+  | {
+      ok: false;
+      reason: 'not-companion' | 'disconnected' | 'unknown-contact' | 'no-reply';
+      error: string;
+    };
 
 /**
  * Result of {@link MeshCoreManager.syncDeviceTime}. `reason` distinguishes the
@@ -308,6 +381,20 @@ export interface MeshCoreConfig {
   // MeshCore mobile app can connect through MeshMonitor over WiFi (issue #3535).
   // See docs/internal/dev-notes/MESHCORE_VIRTUAL_NODE_DESIGN.md.
   virtualNode?: MeshCoreVirtualNodeConfig;
+
+  /** Analyzer Observer MQTT output (#4457). Consumed by the Phase 2 publisher. */
+  observer?: MeshCoreObserverConfig;
+}
+
+/**
+ * MeshCoreManager.getStatus() return type. Extends the base SourceStatus with
+ * an optional `observer` sub-object (#4457 Phase 2 WP5) — present only when an
+ * Analyzer Observer publisher is constructed for this source. Conditionally
+ * spread in getStatus() so the JSON is byte-identical for every source
+ * without an observer (no new key appears for existing consumers).
+ */
+export interface MeshCoreSourceStatus extends SourceStatus {
+  observer?: MeshCoreObserverStatus;
 }
 
 export type MeshCoreConnectionState =
@@ -363,6 +450,23 @@ export interface MeshCoreNode {
   ver?: string;
 }
 
+/**
+ * Analyzer Observer (#4457 Phase 2) `radio` status field: `freq,bw,sf,cr` when
+ * every one of the four is a known number, else undefined. Module-local (not
+ * exported) — only startObserver() needs it.
+ */
+function formatRadioInfo(node: MeshCoreNode | null): string | undefined {
+  if (
+    typeof node?.radioFreq !== 'number' ||
+    typeof node?.radioBw !== 'number' ||
+    typeof node?.radioSf !== 'number' ||
+    typeof node?.radioCr !== 'number'
+  ) {
+    return undefined;
+  }
+  return `${node.radioFreq},${node.radioBw},${node.radioSf},${node.radioCr}`;
+}
+
 export interface MeshCoreContact {
   publicKey: string;
   advName?: string;
@@ -403,13 +507,8 @@ export const MC_PF_SNR_FLOOR = -100;
  * Exported at module scope (no manager instance needed) so it is unit
  * testable without device IO.
  *
- * Unit note (verified against this file's contact-write sites, NOT as
- * asserted by the original spec draft): `lastSeen` is epoch
- * **milliseconds** — every write site sets it via `Date.now()` or an
- * advert-derived `advertMs` (`refreshContacts()` ~L2584-2597). `lastAdvert`
- * is epoch **seconds**, taken verbatim from the firmware's `last_advert`
- * field. The two are normalized to a common millisecond cutoff below before
- * comparison.
+ * Unit normalization (lastSeen ms / lastAdvert s) is delegated to
+ * `../utils/meshcoreAge.js` — see that module for the authoritative note.
  */
 export function filterPathfindingContacts(
   contacts: MeshCoreContact[],
@@ -421,14 +520,8 @@ export function filterPathfindingContacts(
   // ---- AND pre-filters ----
   let pool = contacts;
   if (cfg.lastHeardEnabled) {
-    const cutoffMs = nowMs - cfg.lastHeardHours * 3600 * 1000;
-    pool = pool.filter(c => {
-      // Prefer lastSeen (already ms); fall back to lastAdvert (seconds -> ms).
-      const seenMs = c.lastSeen != null
-        ? c.lastSeen
-        : (c.lastAdvert != null ? c.lastAdvert * 1000 : null);
-      return seenMs != null && seenMs >= cutoffMs;
-    });
+    const cutoffMs = meshcoreAgeCutoffMs(cfg.lastHeardHours, nowMs);
+    pool = pool.filter(c => isWithinMeshcoreAge(c, cutoffMs));
   }
   if (cfg.hopsEnabled) {
     pool = pool.filter(c => {
@@ -489,6 +582,19 @@ export interface MeshCoreMessage {
   toPublicKey?: string; // null for broadcast
   text: string;
   timestamp: number;
+  /**
+   * MeshMonitor's own wall clock (ms) when this message was created or observed
+   * — NOT the sender's clock, and stamped identically for both directions.
+   *
+   * `timestamp` cannot order a stream: a received message takes its time from
+   * the wire's `sender_timestamp`, which MeshCore carries in whole SECONDS,
+   * while a locally-sent message gets `Date.now()` to the millisecond. A remote
+   * auto-responder replying inside the same second therefore sorted BEFORE its
+   * own trigger (observed: trigger …213050, reply …213000 despite arriving
+   * 1.4 s later). Ordering compares `timestamp` per-second and breaks ties on
+   * this field — see src/components/MeshCore/messageOrder.ts.
+   */
+  receivedAt?: number;
   rssi?: number;
   snr?: number;
   /**
@@ -689,6 +795,19 @@ class MeshCoreManager extends EventEmitter implements ISourceManager {
   private nativeBackend: MeshCoreNativeBackend | null = null;
   private virtualNodeServer: MeshCoreVirtualNodeServer | null = null;
 
+  // Analyzer Observer publisher (#4457 Phase 2). Companion-only — see
+  // startObserver()'s !nativeBackend guard.
+  private observerPublisher: MeshCoreObserverPublisher | null = null;
+  /**
+   * Bound arrow-property listener registered on 'ota_packet' in startObserver()
+   * and removed in stopObserver() — same shape as the Virtual Node bridge's
+   * onManagerOtaPacket (meshcoreVirtualNodeServer.ts). Kept as a stable
+   * reference so on()/off() target the exact same function.
+   */
+  private readonly onObserverOtaPacket = (data: OtaPacketEvent): void => {
+    this.observerPublisher?.handleOtaPacket(data);
+  };
+
   // Heartbeat / auto-reconnect state (native-backend only).
   private connectionState: MeshCoreConnectionState = 'disconnected';
   private heartbeatScheduler: HeartbeatScheduler | null = null;
@@ -761,7 +880,18 @@ class MeshCoreManager extends EventEmitter implements ISourceManager {
    * events feed this so the awaiting call can report how many unique nodes
    * responded and how many were not previously known. Null when idle.
    */
-  private activeDiscovery: { seen: Set<string>; returned: number; newCount: number } | null = null;
+  private activeDiscovery: {
+    seen: Set<string>;
+    returned: number;
+    newCount: number;
+    /**
+     * Per-node detail for the current burst, in arrival order (#4516). The
+     * counts alone told a user "7 nodes, 2 new" without saying *which*, so the
+     * signal readings the responder just handed us were thrown away.
+     * Keyed by public key to de-duplicate repeat responses from one node.
+     */
+    nodes: Map<string, MeshCoreDiscoveredNode>;
+  } | null = null;
   private messages: MeshCoreMessage[] = [];
   private pendingCommands: Map<string, { resolve: (value: any) => void; reject: (error: Error) => void; timeout: NodeJS.Timeout }> = new Map();
   private commandId: number = 0;
@@ -889,6 +1019,10 @@ class MeshCoreManager extends EventEmitter implements ISourceManager {
   private autoPathfindingTimer: NodeJS.Timeout | null = null;
   private autoPathfindingJitterTimeout: NodeJS.Timeout | null = null;
   private autoPathfindingLastRunAt: number = 0;
+  // Bumped by every stopAutoPathfinding() call (including the one at the top
+  // of startAutoPathfinding()). Lets a concurrent/overlapping start() call
+  // detect it has been superseded before it installs a timer — see #4434.
+  private autoPathfindingGeneration: number = 0;
 
   // Auto-announce scheduler state. announceScheduler holds the recurring
   // trigger (cron or interval) via the shared CronOrIntervalScheduler
@@ -1023,6 +1157,9 @@ class MeshCoreManager extends EventEmitter implements ISourceManager {
         rssi: dbMsg.rssi ?? undefined,
         snr: dbMsg.snr ?? undefined,
         sourceId: dbMsg.sourceId ?? undefined,
+        // The DB's createdAt IS our own observation clock — same semantic as
+        // receivedAt — so historical rows order correctly too, with no migration.
+        receivedAt: dbMsg.createdAt ?? undefined,
         hopCount: dbMsg.hopCount ?? null,
         routePath: dbMsg.routePath ?? null,
         scopeCode: dbMsg.scopeCode ?? null,
@@ -1137,6 +1274,11 @@ class MeshCoreManager extends EventEmitter implements ISourceManager {
       // is known — the server synthesizes SelfInfo from it. Non-fatal on error.
       await this.startVirtualNodeServer();
 
+      // Start the Analyzer Observer publisher (opt-in, Companion only, #4457
+      // Phase 2). Non-fatal on error — a broker that's down must never block
+      // the device link.
+      await this.startObserver();
+
       // Start auto-pathfinding scheduler if configured for this source.
       this.startAutoPathfinding().catch(err =>
         logger.warn(`[MeshCore:${this.sourceId}] Failed to start auto-pathfinding: ${(err as Error).message}`),
@@ -1207,6 +1349,7 @@ class MeshCoreManager extends EventEmitter implements ISourceManager {
         port: vn.port,
         manager: this,
         allowAdminCommands: vn.allowAdminCommands,
+        allowPkiExport: vn.allowPkiExport,
       });
       await this.virtualNodeServer.start();
     } catch (err) {
@@ -1231,6 +1374,88 @@ class MeshCoreManager extends EventEmitter implements ISourceManager {
   /** Whether the Virtual Node server is currently listening. */
   isVirtualNodeServerRunning(): boolean {
     return this.virtualNodeServer?.isRunning() ?? false;
+  }
+
+  /**
+   * Start the Analyzer Observer publisher (#4457 Phase 2) if this source has
+   * it enabled. Companion-only — the repeater/serial backend never emits
+   * 'ota_packet', so a publisher on that backend would sit idle forever.
+   * Idempotent and non-fatal: a broker that is down (or misconfigured) must
+   * never block the device link. Mirrors startVirtualNodeServer()'s shape.
+   */
+  private async startObserver(): Promise<void> {
+    const obs = this.config?.observer;
+    if (!obs?.enabled || this.observerPublisher) return;
+    if (!this.nativeBackend) return; // repeater/serial never emits ota_packet
+
+    try {
+      this.observerPublisher = new MeshCoreObserverPublisher({
+        sourceId: this.sourceId,
+        config: obs,
+        device: () => ({
+          origin: this.localNode?.name || this.sourceName || 'MeshMonitor',
+          model: this.localNode?.model,
+          // Some firmwares report `ver` with a leading 'v' already (live
+          // device: 'v1.15.0-dee3e26') — don't double it up.
+          firmwareVersion: this.localNode?.ver
+            ? `${this.localNode.ver.startsWith('v') ? '' : 'v'}${this.localNode.ver}${this.localNode.firmwareBuild ? ` (Build: ${this.localNode.firmwareBuild})` : ''}`
+            : undefined,
+          radio: formatRadioInfo(this.localNode),
+        }),
+      });
+      this.on('ota_packet', this.onObserverOtaPacket);
+      await this.observerPublisher.start();
+    } catch (err) {
+      logger.error(`[MeshCore:${this.sourceId}] Failed to start Analyzer Observer: ${(err as Error).message}`);
+      this.off('ota_packet', this.onObserverOtaPacket);
+      this.observerPublisher = null;
+    }
+  }
+
+  /** Stop the Analyzer Observer publisher if running. Safe to call when not started. */
+  private async stopObserver(): Promise<void> {
+    if (!this.observerPublisher) return;
+    this.off('ota_packet', this.onObserverOtaPacket);
+    try {
+      await this.observerPublisher.stop();
+    } catch (err) {
+      logger.debug(`[MeshCore:${this.sourceId}] Observer stop threw: ${(err as Error).message}`);
+    }
+    this.observerPublisher = null;
+  }
+
+  /** Analyzer Observer status, or undefined when the observer isn't running for this source. */
+  getObserverStatus(): MeshCoreObserverStatus | undefined {
+    return this.observerPublisher?.getStatus();
+  }
+
+  /**
+   * Hot-swap the Analyzer Observer sub-config without bouncing the companion
+   * device connection (#4457 Phase 2, WP6). Mirrors reconfigureVirtualNode on
+   * MeshtasticManager: stop the current publisher, re-derive the normalized
+   * runtime config, and restart only if the source is currently connected.
+   *
+   * Re-runs `observerConfigFromSource` (rather than trusting the caller's raw
+   * block) so the hot-swap path normalizes identically to the boot path — URL
+   * normalization, IATA uppercase, audience trim, and the incomplete-block →
+   * undefined rule all apply here exactly as they do in
+   * `meshcoreConfigFromSource`. Passing the raw block through unnormalized
+   * would let an incomplete config start a publisher the boot path would have
+   * refused.
+   */
+  async reconfigureObserver(observer: MeshCoreObserverConfig | undefined): Promise<void> {
+    await this.stopObserver();
+    if (this.config) {
+      const { observerConfigFromSource } = await import('./meshcoreConfig.js');
+      this.config.observer = observerConfigFromSource({ observer } as MeshCoreSourceConfig);
+    }
+    if (this.connected) {
+      // startObserver() is a no-op when the normalized config came back
+      // disabled/incomplete (its !obs?.enabled guard), so calling it
+      // unconditionally here is safe — a disable hot-swap ends with the
+      // publisher stopped and nothing restarted.
+      await this.startObserver();
+    }
   }
 
   /**
@@ -1272,6 +1497,11 @@ class MeshCoreManager extends EventEmitter implements ISourceManager {
     // Stop auto-announce + timer-trigger schedulers.
     this.stopAutoAnnounce();
     this.stopTimerTriggers();
+
+    // Stop the Analyzer Observer publisher before the Virtual Node server /
+    // native backend go away (#4457 Phase 2) — mirrors the VN server's own
+    // teardown-ordering rationale below.
+    await this.stopObserver();
 
     // Stop the Virtual Node server (if running) before tearing down the link
     // and clearing localNode — it reads localNode to answer AppStart.
@@ -1422,7 +1652,15 @@ class MeshCoreManager extends EventEmitter implements ISourceManager {
         toPublicKey: this.localNode?.publicKey || 'local',
         text: data.text,
         timestamp: data.sender_timestamp ? data.sender_timestamp * 1000 : Date.now(),
+        // Our own clock, for ordering. `timestamp` above is the REMOTE's and
+        // only whole-seconds, so it cannot order against our ms-precision
+        // sends (see components/MeshCore/messageOrder.ts).
+        receivedAt: Date.now(),
         snr: data.snr,
+        // Correlated from the same buffered LogRxData as snr (#4504). Present
+        // only when that correlation succeeded — the UI renders it
+        // conditionally rather than showing a placeholder.
+        rssi: data.rssi,
         sourceId: this.sourceId,
         hopCount,
         // Raw packed path_len byte (0xff = direct) so the Virtual Node bridge
@@ -1458,7 +1696,15 @@ class MeshCoreManager extends EventEmitter implements ISourceManager {
         fromName,
         text: body,
         timestamp: data.sender_timestamp ? data.sender_timestamp * 1000 : Date.now(),
+        // Our own clock, for ordering. `timestamp` above is the REMOTE's and
+        // only whole-seconds, so it cannot order against our ms-precision
+        // sends (see components/MeshCore/messageOrder.ts).
+        receivedAt: Date.now(),
         snr: data.snr,
+        // Correlated from the same buffered LogRxData as snr (#4504). Present
+        // only when that correlation succeeded — the UI renders it
+        // conditionally rather than showing a placeholder.
+        rssi: data.rssi,
         sourceId: this.sourceId,
         hopCount,
         // Raw packed path_len byte (0xff = direct) so the Virtual Node bridge
@@ -1493,6 +1739,10 @@ class MeshCoreManager extends EventEmitter implements ISourceManager {
         toPublicKey: roomFullKey,
         text: data.text,
         timestamp: data.sender_timestamp ? data.sender_timestamp * 1000 : Date.now(),
+        // Our own clock, for ordering. `timestamp` above is the REMOTE's and
+        // only whole-seconds, so it cannot order against our ms-precision
+        // sends (see components/MeshCore/messageOrder.ts).
+        receivedAt: Date.now(),
         snr: data.snr,
         sourceId: this.sourceId,
         messageType: 'room_post',
@@ -1737,6 +1987,18 @@ class MeshCoreManager extends EventEmitter implements ISourceManager {
           this.activeDiscovery.seen.add(publicKey);
           this.activeDiscovery.returned++;
           if (isNew) this.activeDiscovery.newCount++;
+          // Name is resolved when the burst is reported, not here: a discovery
+          // response carries no name, and the ANON_REQ OWNER pass that fetches
+          // one runs after the collection window closes.
+          this.activeDiscovery.nodes.set(publicKey, {
+            publicKey,
+            name: null,
+            advType: data.adv_type ?? null,
+            snr: typeof data.snr === 'number' ? data.snr : null,
+            snrToNode: typeof data.snr_to_node === 'number' ? data.snr_to_node : null,
+            rssi: typeof data.rssi === 'number' ? data.rssi : null,
+            isNew,
+          });
         }
         logger.debug(
           `[MeshCore:${this.sourceId}] Discovered node ${publicKey.substring(0, 16)}… ` +
@@ -2226,9 +2488,21 @@ class MeshCoreManager extends EventEmitter implements ISourceManager {
    * typically 40 on Companion builds) leaks into the UI.
    *
    * After syncing the configured slots we also delete any stale DB rows for
-   * this source whose idx is no longer reported as configured by the
-   * device — so an out-of-band delete via meshcore-cli is reflected on the
-   * next sync, and a previous "leaked empty slots" install gets cleaned up.
+   * this source whose idx the device POSITIVELY REPORTED as unconfigured — so
+   * an out-of-band delete via meshcore-cli is reflected on the next sync, and a
+   * previous "leaked empty slots" install gets cleaned up.
+   *
+   * A slot the device did not report at all is deliberately left alone. That
+   * distinction matters because `getChannels()` enumerates until the firmware
+   * errors: a timeout or hiccup part-way through the scan truncates the list
+   * rather than failing it, so slot 0 can come back alone while slots 1..n are
+   * simply missing. Treating "absent" as "deleted" turned a transient read into
+   * permanent loss of the channel definition — observed in the field, where a
+   * second configured channel vanished from the UI while its messages (a
+   * different table) survived. Absent is unknown, not empty.
+   *
+   * Mirrors the same decision `refreshContacts` already makes ("deliberately
+   * won't wipe on empty") for the contact list.
    *
    * MeshCore has no push event for channel changes, so callers should invoke
    * this on connect and after every local write.
@@ -2255,18 +2529,37 @@ class MeshCoreManager extends EventEmitter implements ISourceManager {
       );
     }
 
-    // Reconcile: remove DB rows for slots the device no longer treats as
-    // configured. This covers (a) out-of-band deletes via meshcore-cli and
+    // Reconcile: remove DB rows for slots the device positively reported as
+    // unconfigured. This covers (a) out-of-band deletes via meshcore-cli and
     // (b) cleanup of legacy installs that had unconfigured-slot rows from
     // before the filter landed.
+    //
+    // `reportedIdxSet` is every slot the firmware actually answered for. A row
+    // whose idx is NOT in it carries no evidence either way — the enumeration
+    // may simply have stopped short — so it is preserved. Only "reported AND
+    // not configured" is treated as a delete.
+    const reportedIdxSet = new Set(channels.map(ch => ch.channelIdx));
     const configuredIdxSet = new Set(configured.map(ch => ch.channelIdx));
     const existing = await databaseService.channels.getAllChannels(this.sourceId);
     let removed = 0;
+    let preserved = 0;
     for (const row of existing) {
-      if (!configuredIdxSet.has(row.id)) {
-        await databaseService.channels.deleteChannel(row.id, this.sourceId);
-        removed++;
+      if (configuredIdxSet.has(row.id)) continue;
+      if (!reportedIdxSet.has(row.id)) {
+        // Unreported: the scan never reached this slot. Leave it be.
+        preserved++;
+        continue;
       }
+      await databaseService.channels.deleteChannel(row.id, this.sourceId);
+      removed++;
+    }
+
+    if (preserved > 0) {
+      logger.warn(
+        `[MeshCore:${this.sourceId}] Channel scan returned ${channels.length} slot(s); ` +
+        `kept ${preserved} DB row(s) the device did not report (possible truncated read). ` +
+        'Re-run a sync once the device is responsive to reconcile properly.',
+      );
     }
 
     logger.debug(
@@ -2364,6 +2657,7 @@ class MeshCoreManager extends EventEmitter implements ISourceManager {
         fromPublicKey: match[1],
         text: match[2],
         timestamp: Date.now(),
+        receivedAt: Date.now(),
         sourceId: this.sourceId,
       };
       this.addMessage(message);
@@ -3015,6 +3309,7 @@ class MeshCoreManager extends EventEmitter implements ISourceManager {
           toPublicKey: sentToPublicKey,
           text: text,
           timestamp: Date.now(),
+          receivedAt: Date.now(),
           sourceId: this.sourceId,
           expectedAckCrc: ackCrc ?? undefined,
           estTimeout: estTimeout ?? undefined,
@@ -3495,8 +3790,13 @@ class MeshCoreManager extends EventEmitter implements ISourceManager {
     filter: number,
     windowMs: number = 8000,
     fetchNames: boolean = false,
-  ): Promise<{ returned: number; newCount: number; seen: string[] }> {
-    const empty = { returned: 0, newCount: 0, seen: [] as string[] };
+  ): Promise<{
+    returned: number;
+    newCount: number;
+    seen: string[];
+    nodes: MeshCoreDiscoveredNode[];
+  }> {
+    const empty = { returned: 0, newCount: 0, seen: [] as string[], nodes: [] as MeshCoreDiscoveredNode[] };
     if (this.deviceType !== MeshCoreDeviceType.COMPANION) {
       logger.warn('[MeshCore] Node discovery requires Companion firmware');
       return empty;
@@ -3506,7 +3806,7 @@ class MeshCoreManager extends EventEmitter implements ISourceManager {
     }
     // 32-bit correlation tag so responses can be matched to this request.
     const tag = Math.floor(Math.random() * 0xffffffff) >>> 0;
-    this.activeDiscovery = { seen: new Set(), returned: 0, newCount: 0 };
+    this.activeDiscovery = { seen: new Set(), returned: 0, newCount: 0, nodes: new Map() };
     try {
       const response = await this.sendBridgeCommand('discover_nodes', { filter, tag }, 15000);
       if (!response.success) {
@@ -3518,9 +3818,15 @@ class MeshCoreManager extends EventEmitter implements ISourceManager {
         `collecting for ${windowMs}ms`,
       );
       await new Promise<void>(resolve => setTimeout(resolve, windowMs));
-      const result = {
+      const result: {
+        returned: number;
+        newCount: number;
+        seen: string[];
+        nodes: MeshCoreDiscoveredNode[];
+      } = {
         returned: this.activeDiscovery.returned,
         newCount: this.activeDiscovery.newCount,
+        nodes: [],
         // Snapshot the public keys that responded to this sweep (insertion
         // order = arrival order) so callers like discoverRegions() can target
         // only the current 0-hop set (#3743).
@@ -3546,6 +3852,19 @@ class MeshCoreManager extends EventEmitter implements ISourceManager {
           }
         }
       }
+
+      // Resolve names last: the burst itself carries none, and the ANON_REQ
+      // OWNER pass above is what fills them in (#4516). `nodes` may be empty
+      // while `returned` is non-zero only if a response arrived without a key,
+      // which the handler already rejects.
+      result.nodes = [...(this.activeDiscovery?.nodes.values() ?? [])].map(n => {
+        const contact = this.contacts.get(n.publicKey);
+        return {
+          ...n,
+          name: contact?.advName || contact?.name || null,
+          advType: n.advType ?? contact?.advType ?? null,
+        };
+      });
 
       return result;
     } catch (error) {
@@ -3823,9 +4142,14 @@ class MeshCoreManager extends EventEmitter implements ISourceManager {
       }
       const d = response.data ?? {};
       const snrs: number[] = d.pathSnrs ?? [];
+      // Per-hop SNRs travel the wire as int8 of (SNR*4) but reach us as
+      // UNSIGNED bytes: meshcore.js decodes lastSnr with readInt8()/4 yet
+      // pathSnrs with a plain readBytes(), and the native backend passes those
+      // straight through. Sign-extend before scaling, or a -6 dB hop reads
+      // back as +62.5 dB. (lastSnr below is already signed and scaled.)
       const hops = snrs.map((raw: number, i: number) => ({
         index: i,
-        snr: raw / 4,
+        snr: ((raw << 24) >> 24) / 4,
       }));
       const lastSnr: number = d.lastSnr ?? 0;
       logger.debug(`[MeshCore] Trace path to ${publicKey.substring(0, 16)}…: ${hops.length} hops, lastSnr=${lastSnr}`);
@@ -3871,6 +4195,102 @@ class MeshCoreManager extends EventEmitter implements ISourceManager {
     } catch (error) {
       logger.error('[MeshCore] tracePathRaw threw:', error);
       return null;
+    }
+  }
+
+  /**
+   * Zero-hop ping ("Ping [zero hops]" in the MeshCore phone app) — issue #4393.
+   *
+   * Sends a TRACE packet (companion command `SendTracePath`, opcode 36, via the
+   * `trace_path` bridge command) whose path is a single 1-byte hop hash: the
+   * first byte of the target's public key. The firmware's TRACE handler
+   * (`Mesh::onRecvPacket`, MeshCore `src/Mesh.cpp`) only forwards the frame when
+   *   - it arrives route-direct (zero hops so far), AND
+   *   - the node's own identity hash matches the next path byte, AND
+   *   - `allowPacketForward()` is true.
+   * So a reply proves the target heard us with NO intermediate repeater: exactly
+   * the "is this node in direct RF range?" test the requester asked for.
+   *
+   * Caveat (documented, not worked around): `allowPacketForward()` is false on
+   * plain Companion firmware, so only repeaters / room servers (and any node
+   * with transport enabled) can answer a trace. Pinging a companion contact
+   * times out even when it is in range.
+   *
+   * Unlike {@link traceContactPath} this deliberately ignores the contact's
+   * cached `out_path` — the whole point is to bypass the learned multi-hop route
+   * and test the direct link.
+   */
+  async pingContactZeroHop(publicKey: string): Promise<ZeroHopPingResult> {
+    if (this.deviceType !== MeshCoreDeviceType.COMPANION) {
+      return {
+        ok: false,
+        reason: 'not-companion',
+        error: 'Zero-hop ping requires MeshCore Companion firmware.',
+      };
+    }
+    if (!this.connected) {
+      return { ok: false, reason: 'disconnected', error: 'Source is disconnected.' };
+    }
+    if (!/^[0-9a-fA-F]{64}$/.test(publicKey)) {
+      return { ok: false, reason: 'unknown-contact', error: 'Invalid public key.' };
+    }
+    const contact = this.contacts.get(publicKey);
+    if (!contact) {
+      return {
+        ok: false,
+        reason: 'unknown-contact',
+        error: 'Contact is not known to this source.',
+      };
+    }
+
+    // MeshCore path hashes are the leading byte(s) of the node's public key
+    // (`Identity::isHashMatch`). meshcore.js sends SendTracePath with flags=0,
+    // i.e. path hash size 1 (firmware reads the hash width from flags & 0x03),
+    // so a zero-hop path is exactly one byte.
+    const hopByte = parseInt(publicKey.slice(0, 2), 16);
+    const path = Uint8Array.from([hopByte]);
+    const hopHash = publicKey.slice(0, 2).toLowerCase();
+
+    const startedAt = Date.now();
+    try {
+      // extra_timeout gives the firmware's estimated direct-path timeout a
+      // little margin; the bridge ceiling is only a backstop for a device that
+      // never answers the command at all.
+      const response = await this.sendBridgeCommand(
+        'trace_path',
+        { path, extra_timeout: 3000 },
+        30_000,
+      );
+      if (!response.success) {
+        logger.debug(
+          `[MeshCore:${this.sourceId}] zero-hop ping to ${hopHash} got no reply: ${response.error}`,
+        );
+        return {
+          ok: false,
+          reason: 'no-reply',
+          error: 'No reply — the node is not in direct radio range (or does not repeat traces).',
+        };
+      }
+      this.recordMeshTx();
+      const rttMs = Date.now() - startedAt;
+      const d = response.data ?? {};
+      const rawSnrs: number[] = Array.isArray(d.pathSnrs) ? (d.pathSnrs as number[]) : [];
+      // Trace SNRs travel the wire as int8 of (SNR*4) but reach us as unsigned
+      // bytes, so sign-extend before scaling or -6 dB reads back as +62.5 dB.
+      const snrToTarget = rawSnrs.length > 0 ? ((rawSnrs[0] << 24) >> 24) / 4 : null;
+      const snrFromTarget = typeof d.lastSnr === 'number' ? d.lastSnr : 0;
+      logger.debug(
+        `[MeshCore:${this.sourceId}] zero-hop ping ${hopHash} ok: rtt=${rttMs}ms ` +
+          `snrToTarget=${snrToTarget ?? 'n/a'} snrFromTarget=${snrFromTarget}`,
+      );
+      return { ok: true, hopHash, rttMs, snrToTarget, snrFromTarget };
+    } catch (error) {
+      logger.error('[MeshCore] pingContactZeroHop threw:', error);
+      return {
+        ok: false,
+        reason: 'no-reply',
+        error: 'No reply — the node is not in direct radio range (or does not repeat traces).',
+      };
     }
   }
 
@@ -4591,6 +5011,7 @@ class MeshCoreManager extends EventEmitter implements ISourceManager {
           toPublicKey: roomPublicKey,
           text,
           timestamp: Date.now(),
+          receivedAt: Date.now(),
           sourceId: this.sourceId,
           messageType: 'room_post',
         };
@@ -5464,12 +5885,14 @@ class MeshCoreManager extends EventEmitter implements ISourceManager {
    * (e.g. the /status route). When omitted, the stored this.sourceName is used so
    * aggregate getAllStatuses() calls return a meaningful name.
    */
-  getStatus(sourceName?: string): SourceStatus {
+  getStatus(sourceName?: string): MeshCoreSourceStatus {
+    const observer = this.observerPublisher?.getStatus();
     return {
       sourceId: this.sourceId,
       sourceName: sourceName ?? this.sourceName,
       sourceType: 'meshcore',
       connected: this.connected,
+      ...(observer ? { observer } : {}),
     };
   }
 
@@ -5615,12 +6038,15 @@ class MeshCoreManager extends EventEmitter implements ISourceManager {
    * gets its own history independent of the shared in-memory pool and the
    * global recent-tail that {@link getRecentMessages} serves. Returns
    * oldest-first to match the ordering the message stream expects.
+   *
+   * `offset` pages further back into history (for infinite-scroll load-older).
    */
-  async getChannelMessages(channelIdx: number, limit: number = 100): Promise<MeshCoreMessage[]> {
+  async getChannelMessages(channelIdx: number, limit: number = 100, offset: number = 0): Promise<MeshCoreMessage[]> {
     const stored = await databaseService.meshcore.getChannelMessages(
       channelIdx,
       limit,
       this.sourceId,
+      offset,
     );
     // Enrich outgoing channel messages with their heard-by repeater set (#3700)
     // in one batched query.
@@ -5641,6 +6067,13 @@ class MeshCoreManager extends EventEmitter implements ISourceManager {
         rssi: dbMsg.rssi ?? undefined,
         snr: dbMsg.snr ?? undefined,
         sourceId: dbMsg.sourceId ?? undefined,
+        // The DB's createdAt IS our own observation clock — same semantic as
+        // receivedAt — so historical rows order correctly too, with no migration.
+        receivedAt: dbMsg.createdAt ?? undefined,
+        hopCount: dbMsg.hopCount ?? null,
+        routePath: dbMsg.routePath ?? null,
+        scopeCode: dbMsg.scopeCode ?? null,
+        scopeName: dbMsg.scopeName ?? null,
         heardBy: heard && heard.length > 0
           ? heard.map(r => ({ hash: r.repeaterHash, name: r.repeaterName, snr: r.snr }))
           : undefined,
@@ -5894,6 +6327,7 @@ class MeshCoreManager extends EventEmitter implements ISourceManager {
     this.connected = false;
     this.connectionState = 'disconnected';
     this.stopHeartbeat();
+    await this.stopObserver();
     await this.stopVirtualNodeServer();
     // Release the dead backend. Without this `nativeBackend` keeps pointing at a
     // closed connection, so sendBridgeCommand()'s `!nativeBackend` guard never
@@ -5921,6 +6355,11 @@ class MeshCoreManager extends EventEmitter implements ISourceManager {
     // native backend's own 'disconnected' event so it doesn't re-enter the
     // unexpected-drop path. connect() clears the flag when the reconnect lands.
     this.intentionalTeardown = true;
+
+    // Stop the Analyzer Observer publisher first (#4457 Phase 2) — same
+    // rationale as the VN server below: it shouldn't keep publishing (or hold
+    // a socket open) once the underlying transport is going away.
+    await this.stopObserver();
 
     // Stop the Virtual Node server first, same as disconnect() does. Without
     // this, the VN server keeps accepting app connections while isConnected()
@@ -5989,6 +6428,7 @@ class MeshCoreManager extends EventEmitter implements ISourceManager {
 
   async startAutoPathfinding(): Promise<void> {
     this.stopAutoPathfinding();
+    const myGeneration = this.autoPathfindingGeneration;
 
     const enabledRaw = await databaseService.settings.getSettingForSource(this.sourceId, 'meshcoreAutoPathfindingEnabled');
     if (enabledRaw !== 'true') {
@@ -6093,7 +6533,17 @@ class MeshCoreManager extends EventEmitter implements ISourceManager {
       logger.debug(`[MeshCore:${this.sourceId}] Auto-pathfinding: run complete`);
     };
 
+    if (myGeneration !== this.autoPathfindingGeneration) {
+      // A newer startAutoPathfinding() call (or a stopAutoPathfinding()) ran
+      // while we were awaiting settings above — don't install a timer this
+      // stale call no longer owns (#4434: overlapping starts previously
+      // stacked orphaned setInterval handles no future stop() could reach).
+      logger.debug(`[MeshCore:${this.sourceId}] Auto-pathfinding: start superseded, aborting`);
+      return;
+    }
+
     this.autoPathfindingJitterTimeout = setTimeout(() => {
+      if (myGeneration !== this.autoPathfindingGeneration) return;
       this.autoPathfindingJitterTimeout = null;
       executeRun().catch(err => logger.error('[MeshCore] Auto-pathfinding scheduler error:', err));
       this.autoPathfindingTimer = setInterval(executeRun, repeatMs);
@@ -6101,6 +6551,7 @@ class MeshCoreManager extends EventEmitter implements ISourceManager {
   }
 
   stopAutoPathfinding(): void {
+    this.autoPathfindingGeneration++;
     if (this.autoPathfindingJitterTimeout) {
       clearTimeout(this.autoPathfindingJitterTimeout);
       this.autoPathfindingJitterTimeout = null;
@@ -6897,6 +7348,24 @@ class MeshCoreManager extends EventEmitter implements ISourceManager {
         );
         if (channelIdx === undefined || !enabledChannels.has(channelIdx)) {
           logger.debug(`[MeshCore:${sourceId}] Auto-ack: channel ${channelIdx} not in allowlist`);
+          return;
+        }
+      }
+
+      // Per-sender ignore list (#4391): keeps a chatty bot from echo-looping
+      // with the auto-responder. Checked BEFORE the cooldown so an ignored
+      // sender never consumes a cooldown slot. Entries match a public key
+      // (or key prefix) and/or a contact/sender name — see meshcoreAutoAckIgnore.ts.
+      const ignoreList = parseMeshCoreIgnoreList(
+        await settings.getSettingForSource(sourceId, 'meshcoreAutoAckIgnoredNodes'),
+      );
+      if (!isMeshCoreIgnoreListEmpty(ignoreList)) {
+        const senderContact = this.resolveContactByPrefix(message.fromPublicKey);
+        if (isMeshCoreSenderIgnored(ignoreList, {
+          publicKey: message.fromPublicKey,
+          names: [message.fromName, senderContact?.advName, senderContact?.name],
+        })) {
+          logger.debug(`[MeshCore:${sourceId}] Auto-ack: sender ${message.fromName ?? message.fromPublicKey} is on the ignore list`);
           return;
         }
       }

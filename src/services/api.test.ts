@@ -802,12 +802,94 @@ describe('ApiService BASE_URL Support', () => {
       expect(mockFetch).toHaveBeenCalledWith('/api/route-segments/longest-active');
     });
 
-    it('getTracerouteHistory should call history endpoint with params', async () => {
-      mockFetch.mockResolvedValue(createMockResponse({ traceroutes: [] }));
+    it('getTracerouteHistory should call history endpoint with params and return the bare array unwrapped', async () => {
+      const traceroutes = [{ id: 1 }];
+      mockFetch.mockResolvedValue(createMockResponse(traceroutes));
 
-      await apiService.getTracerouteHistory(111, 222, 20);
+      const result = await apiService.getTracerouteHistory(111, 222, 20);
 
-      expect(mockFetch).toHaveBeenCalledWith('/api/traceroutes/history/111/222?limit=20');
+      expect(mockFetch).toHaveBeenCalledWith(
+        '/api/traceroutes/history/111/222?limit=20',
+        expect.objectContaining({ credentials: 'include' })
+      );
+      expect(result).toEqual(traceroutes);
+    });
+
+    it('getTracerouteHistory should include sourceId in the query string when provided (SR_PHASE2_SPEC.md D17)', async () => {
+      mockFetch.mockResolvedValue(createMockResponse([]));
+
+      await apiService.getTracerouteHistory(111, 222, 200, 'src-a');
+
+      expect(mockFetch).toHaveBeenCalledWith(
+        '/api/traceroutes/history/111/222?limit=200&sourceId=src-a',
+        expect.objectContaining({ credentials: 'include' })
+      );
+    });
+
+    it('getTracerouteHistory should omit sourceId from the query string when not provided (pinned existing behavior)', async () => {
+      mockFetch.mockResolvedValue(createMockResponse([]));
+
+      await apiService.getTracerouteHistory(111, 222, 200);
+
+      expect(mockFetch).toHaveBeenCalledWith(
+        '/api/traceroutes/history/111/222?limit=200',
+        expect.objectContaining({ credentials: 'include' })
+      );
+    });
+
+    it('getTracerouteParticipation should hit the participation endpoint with the encoded query string and unwrap data.entries', async () => {
+      const entries = [
+        {
+          id: 1,
+          timestamp: 1000,
+          fromNodeNum: 111,
+          toNodeNum: 222,
+          fromNodeId: '!0000006f',
+          toNodeId: '!000000de',
+          route: null,
+          routeBack: null,
+          snrTowards: null,
+          snrBack: null,
+          channel: null,
+          participation: 'endpoint' as const,
+          hopCount: null,
+        },
+      ];
+      mockFetch.mockResolvedValue(createMockResponse({ success: true, data: { entries } }));
+
+      const result = await apiService.getTracerouteParticipation(111, 'source-a', { hours: 48, limit: 10 });
+
+      expect(mockFetch).toHaveBeenCalledWith(
+        '/api/traceroutes/participation/111?sourceId=source-a&hours=48&limit=10',
+        expect.objectContaining({ credentials: 'include' })
+      );
+      expect(result).toEqual(entries);
+    });
+
+    it('getTracerouteParticipation should omit hours and send limit=50 for the picker call shape (History-dialog parity amendment)', async () => {
+      mockFetch.mockResolvedValue(createMockResponse({ success: true, data: { entries: [] } }));
+
+      // Mirrors useNodeTraceroutes's PARTICIPATION_LIMIT call: no `hours`, so
+      // the server applies no time window; limit=50 matches the Traceroute
+      // History dialog.
+      await apiService.getTracerouteParticipation(111, 'source-a', { limit: 50 });
+
+      expect(mockFetch).toHaveBeenCalledWith(
+        '/api/traceroutes/participation/111?sourceId=source-a&limit=50',
+        expect.objectContaining({ credentials: 'include' })
+      );
+    });
+
+    it('getTracerouteParticipation should return [] when the body has no data', async () => {
+      mockFetch.mockResolvedValue(createMockResponse({ success: true }));
+
+      const result = await apiService.getTracerouteParticipation(111, 'source-a');
+
+      expect(mockFetch).toHaveBeenCalledWith(
+        '/api/traceroutes/participation/111?sourceId=source-a',
+        expect.objectContaining({ credentials: 'include' })
+      );
+      expect(result).toEqual([]);
     });
 
     it('updateTracerouteInterval should POST interval setting', async () => {
@@ -1142,5 +1224,93 @@ describe('ApiService BASE_URL Support', () => {
       expect((err as Error).message).toBe('missing');
       expect(textSpy).not.toHaveBeenCalled();
     });
+  });
+});
+describe('ApiService.sendAdminCommand — async operation following (#4482)', () => {
+  beforeEach(() => {
+    (apiService as any).baseUrl = '';
+    (apiService as any).configFetched = true;
+    (apiService as any).configPromise = null;
+    mockFetch.mockReset();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  /** Queue responses in order: the POST, then each poll of the status endpoint. */
+  const queue = (...responses: any[]) => {
+    responses.forEach((r) => mockFetch.mockResolvedValueOnce(r));
+  };
+
+  it('returns the first response directly when the server answered synchronously (local node)', async () => {
+    queue(createMockResponse({ success: true, message: 'sent to local' }));
+
+    const result = await apiService.sendAdminCommand<any>({ command: 'reboot' });
+
+    expect(result).toMatchObject({ success: true, message: 'sent to local' });
+    // No polling: exactly one request was made.
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('polls the operation until it succeeds, then resolves with the result payload', async () => {
+    queue(
+      createMockResponse({ success: true, operationId: 'op-1', status: 'pending' }),
+      createMockResponse({ success: true, data: { status: 'awaiting_passkey' } }),
+      createMockResponse({ success: true, data: { status: 'awaiting_ack' } }),
+      createMockResponse({
+        success: true,
+        data: {
+          status: 'succeeded',
+          result: { message: 'sent', ack: { acked: true, timedOut: false, status: 'confirmed' } },
+        },
+      }),
+    );
+
+    const result = await apiService.sendAdminCommand<any>({ command: 'setIgnoredNode' });
+
+    expect(result).toMatchObject({
+      success: true,
+      message: 'sent',
+      ack: { acked: true, status: 'confirmed' },
+    });
+    const polled = mockFetch.mock.calls.slice(1).map(([url]) => url);
+    expect(polled.every((u: string) => u.includes('/api/admin/operations/op-1'))).toBe(true);
+  });
+
+  it('throws an ApiError carrying the failure code so TX_DISABLED still round-trips', async () => {
+    queue(
+      createMockResponse({ success: true, operationId: 'op-2', status: 'pending' }),
+      createMockResponse({
+        success: true,
+        data: { status: 'failed', error: { code: 'TX_DISABLED', message: 'Transmit is disabled on this source' } },
+      }),
+    );
+
+    await expect(apiService.sendAdminCommand<any>({ command: 'reboot' }))
+      .rejects.toMatchObject({ code: 'TX_DISABLED', message: 'Transmit is disabled on this source' });
+  });
+
+  it('surfaces a passkey timeout as its own code rather than a generic failure', async () => {
+    queue(
+      createMockResponse({ success: true, operationId: 'op-3', status: 'pending' }),
+      createMockResponse({
+        success: true,
+        data: { status: 'failed', error: { code: 'PASSKEY_TIMEOUT', message: 'no passkey' } },
+      }),
+    );
+
+    await expect(apiService.sendAdminCommand<any>({ command: 'reboot' }))
+      .rejects.toMatchObject({ code: 'PASSKEY_TIMEOUT' });
+  });
+
+  it('reports a dropped operation plainly when the server no longer knows it', async () => {
+    queue(
+      createMockResponse({ success: true, operationId: 'op-4', status: 'pending' }),
+      createMockResponse({ error: 'Unknown or expired admin operation', code: 'OPERATION_NOT_FOUND' }, false),
+    );
+
+    await expect(apiService.sendAdminCommand<any>({ command: 'reboot' }))
+      .rejects.toMatchObject({ code: 'OPERATION_NOT_FOUND' });
   });
 });

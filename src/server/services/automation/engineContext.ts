@@ -10,9 +10,11 @@
  * `node.*` (hydrated subject node incl. calculated `ageMinutes`/`roleName`), and
  * `telemetry.*` (latest reading per metric for the subject node).
  */
-import { type TriggerContext, resolveTriggerPath } from './triggerContext.js';
+import { type TriggerContext, resolveTriggerPath, subjectKeyOf } from './triggerContext.js';
 import type { VariableResolver, VarContext } from './variableResolver.js';
 import { interpolate, extractPaths, type InterpolationValue } from './interpolate.js';
+import type { CooldownScope } from '../../../types/automation.js';
+import { isNodeComplete } from '../../../utils/nodeHelpers.js';
 
 /** Subset of a node record used for condition fields. */
 export interface NodeFacts {
@@ -84,8 +86,70 @@ export const ROLE_NAMES = [
   'SENSOR', 'TAK', 'CLIENT_HIDDEN', 'LOST_AND_FOUND', 'TAK_TRACKER', 'ROUTER_LATE',
 ];
 
+/**
+ * The three states of `node.completeness` (#4340 Phase 3).
+ *
+ *  - 'complete'    the subject node's row exists and isNodeComplete() passes
+ *                  (real longName, a shortName, and an hwModel from NODEINFO).
+ *  - 'incomplete'  the row exists but NODEINFO has not arrived.
+ *  - 'unknown'     there is NO row for the subject, or the event has no subject
+ *                  node at all (Schedule / System / MeshCore).
+ *
+ * The third state is the point. Auto-Acknowledge skips a sender only when the
+ * row EXISTS and is incomplete (`if (fromNode && !isNodeComplete(fromNode))`,
+ * meshtasticManager.ts:10084) — an unknown sender is NOT skipped. A boolean
+ * field cannot express that: a missing row and an incomplete row both resolve
+ * to a falsy/undefined value. So the AutoAck rule is
+ * `node.completeness in (complete, unknown)`.
+ */
+export const NODE_COMPLETENESS = ['complete', 'incomplete', 'unknown'] as const;
+export type NodeCompleteness = (typeof NODE_COMPLETENESS)[number];
+
 export function varContextFromTrigger(trigger: TriggerContext): VarContext {
   return { sourceId: trigger.sourceId, nodeNum: trigger.subjectNodeNum };
+}
+
+/** Truncate a long subject id (a 64-char MeshCore pubkey) for trace/log copy. */
+function shortSubject(id: string): string {
+  return id.length > 16 ? `${id.slice(0, 12)}…` : id;
+}
+
+export interface CooldownKeyResolution {
+  /** Map key. '' is the automation-wide key (also the degraded fallback). */
+  key: string;
+  /** Human phrase naming the key, for the cooldown trace reason. */
+  label: string;
+  /** True when the requested scope could not be honoured and we fell back. */
+  degraded: boolean;
+}
+
+/**
+ * Resolve a trigger context to its cooldown key under `scope` (#4340 Phase 2).
+ *
+ * Key shapes intentionally match AutomationVariablesRepository.buildScopeKey's
+ * global/node/sourceNode shapes ('' / '<node>' / '<source>:<node>') — pinned by
+ * a cross-check test — so cooldown keys and variable scope keys read alike.
+ * It is NOT called directly: buildScopeKey's ctx.nodeNum is typed `number` and
+ * widening it to accept a MeshCore pubkey string would silently let VARIABLE
+ * scoping key off pubkeys too, a behaviour change we explicitly do not want.
+ *
+ * When the requested scope cannot be honoured (no subject node on a schedule /
+ * system / MeshCore-channel event, or no sourceId under 'sourceNode'), this
+ * degrades to the automation-wide key — today's exact behaviour — rather than
+ * never firing or never cooling down. See COOLDOWN_SCOPES for why.
+ */
+export function cooldownKeyFor(scope: CooldownScope, trigger: TriggerContext): CooldownKeyResolution {
+  if (scope === 'automation') return { key: '', label: 'automation-wide', degraded: false };
+  const node = subjectKeyOf(trigger);
+  if (node == null) {
+    return { key: '', label: 'automation-wide (this event has no subject node)', degraded: true };
+  }
+  if (scope === 'node') return { key: node, label: `node ${shortSubject(node)}`, degraded: false };
+  const src = trigger.sourceId;
+  if (!src) {
+    return { key: '', label: 'automation-wide (this event has no source)', degraded: true };
+  }
+  return { key: `${src}:${node}`, label: `source ${src} · node ${shortSubject(node)}`, degraded: false };
 }
 
 /** Hydrate (once) the trigger's subject node. Null when there is no subject node. */
@@ -166,8 +230,13 @@ export async function resolveFieldValue(ctx: EngineEvalContext, field: string): 
 
   if (field.startsWith('node.')) {
     const node = await getSubjectNode(ctx);
-    if (!node) return undefined;
     const prop = field.slice('node.'.length);
+    // #4340 Phase 3: resolved BEFORE the `!node` guard below, because "there is no
+    // node row" is a meaningful VALUE here ('unknown'), not a missing field.
+    if (prop === 'completeness') {
+      return node ? (isNodeComplete(node) ? 'complete' : 'incomplete') : 'unknown';
+    }
+    if (!node) return undefined;
     if (prop === 'ageMinutes') {
       if (node.lastHeard == null) return undefined;
       const lastMs = node.lastHeard > 1e12 ? node.lastHeard : node.lastHeard * 1000; // tolerate s or ms

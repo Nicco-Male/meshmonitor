@@ -10,6 +10,8 @@ import type { DbMessage } from '../../../services/database.js';
 import type { MeshCoreMessage } from '../../meshcoreManager.js';
 import type { TriggerType } from '../../../types/automation.js';
 import { compileUserRegex } from '../../../utils/safeRegex.js';
+import { hopCountEmoji } from '../../../utils/hopEmoji.js';
+import { autoAckIsZeroHop } from '../../utils/autoAckDecision.js';
 
 /** Meshtastic broadcast address (0xFFFFFFFF); also defined inline in the manager. */
 export const BROADCAST_ADDR = 0xffffffff;
@@ -19,9 +21,32 @@ export interface TriggerContext {
   sourceId: string | null;
   /** Subject node for node/sourceNode variable scope binding (sender / telemetry / updated node). */
   subjectNodeNum: number | null;
+  /**
+   * Protocol-agnostic subject identity, for cooldown scoping (#4340 Phase 2).
+   *
+   * `undefined` (the default, and what every Meshtastic builder leaves it as)
+   * means "derive it from subjectNodeNum". Set EXPLICITLY only where the
+   * subject has an identity that is not a Meshtastic node number — today that
+   * is only MeshCore, whose senders are pubkey strings. An explicit `null`
+   * means "this event has no stable per-subject identity at all".
+   *
+   * Deliberately NOT reused for variable scoping or node hydration: both call
+   * getNode(sourceId, nodeNum) / buildScopeKey with a NUMBER and must keep
+   * doing so. This field is cooldown-only.
+   */
+  subjectNodeKey?: string | null;
   timestamp: number;
   /** `trigger.*` values, keyed WITHOUT the `trigger.` prefix. */
   fields: Record<string, unknown>;
+}
+
+/**
+ * The subject's cooldown identity, or null when the event has none.
+ * Explicit `subjectNodeKey` wins; otherwise derive from `subjectNodeNum`.
+ */
+export function subjectKeyOf(ctx: TriggerContext): string | null {
+  if (ctx.subjectNodeKey !== undefined) return ctx.subjectNodeKey;
+  return ctx.subjectNodeNum == null ? null : String(ctx.subjectNodeNum);
 }
 
 /** Derived hop count: hopStart − hopLimit when both present (0 ⇒ direct/zero-hop). */
@@ -65,6 +90,7 @@ export function buildMessageContext(
   const fromName = (labels?.fromName && String(labels.fromName).trim()) || fromId;
   const channelName = isDM ? undefined : (labels?.channelName ?? undefined);
   const senderLabel = fromName || channelName || fromId;
+  const hops = deriveHops(msg);
   const fields: Record<string, unknown> = {
     from: Number(msg.fromNodeNum),
     fromId: msg.fromNodeId,
@@ -77,9 +103,21 @@ export function buildMessageContext(
     senderLabel,
     portnum: msg.portnum,
     packetId: Number.isFinite(parsedPacketId) ? parsedPacketId : undefined,
-    hops: deriveHops(msg),
+    hops,
+    // #4340: hopCountEmoji clamps a negative hop count to 0 (*️⃣), but `hops`
+    // above is deriveHops' raw (possibly negative, on a malformed hopStart <
+    // hopLimit packet) value — deliberately NOT aligned. Changing deriveHops to
+    // guard against this would silently alter every existing condition.numeric
+    // on field `hops`, so the divergence is documented here instead.
+    hopEmoji: hopCountEmoji(hops),
     hopStart: msg.hopStart,
     hopLimit: msg.hopLimit,
+    // #4340 Phase 4. AutoAck floors a missing/malformed hop count to 0 and treats it
+    // as ZeroHop (meshtasticManager.ts:10170-10178). `hops` above deliberately keeps
+    // deriveHops' raw value (undefined / possibly negative) — see the Phase 1 note.
+    // `zeroHop` is the AutoAck-faithful, TOTAL 1/0 form: it is never NaN, so a rule
+    // can branch on it inside a flat AND-chain instead of needing condition ports.
+    zeroHop: autoAckIsZeroHop(typeof hops === 'number' && hops > 0 ? hops : 0, msg.viaMqtt) ? 1 : 0,
     isDM,
     isChannel: isBroadcast,
     isBroadcast,
@@ -143,6 +181,7 @@ export function buildMeshCoreMessageContext(
   // (channel posts may carry no name prefix), else the channel name, else the raw
   // id (a pubkey for DMs/rooms, or the synthetic `channel-<idx>` key).
   const senderLabel = fromName || channelName || fromId;
+  const hops = msg.hopCount ?? undefined;
   const fields: Record<string, unknown> = {
     // MeshCore senders are pubkey strings; channel messages have no per-sender
     // pubkey, so `from` is the synthetic `channel-<idx>` key. `fromName` carries
@@ -159,7 +198,13 @@ export function buildMeshCoreMessageContext(
     isDM,
     isChannel,
     isBroadcast: isChannel,
-    hops: msg.hopCount ?? undefined,
+    hops,
+    // #4340: same shared table as the Meshtastic context; MeshCore has no
+    // tapback concept, but the token is usable in action.sendMessage bodies.
+    hopEmoji: hopCountEmoji(hops),
+    // #4340 Phase 4: same derivation as buildMessageContext. MeshCore messages
+    // carry no viaMqtt concept — `undefined` reads as not-MQTT, never NaN.
+    zeroHop: autoAckIsZeroHop(typeof hops === 'number' && hops > 0 ? hops : 0, undefined) ? 1 : 0,
     snr: msg.snr,
     rssi: msg.rssi,
     // MeshCore scope/region (#3833). `scopeCode` 0 = explicitly unscoped, null/
@@ -177,6 +222,15 @@ export function buildMeshCoreMessageContext(
     sourceId,
     // No Meshtastic-style numeric node → no node.* hydration for MeshCore messages.
     subjectNodeNum: null,
+    // #4340 Phase 2: MeshCore has no node numbers, so per-node cooldown keys off
+    // the sender pubkey instead — the same identity meshcoreManager's own auto-ack
+    // cooldown uses (meshcoreManager.ts:6909). A DM/room post carries the real
+    // sender key. A CHANNEL post does not: `fromPublicKey` is the synthetic
+    // `channel-<idx>` slot key SHARED by every sender on that channel (see
+    // parseMeshCoreChannelIdx above), so keying by it would look per-node while
+    // actually being per-channel. Null there, which degrades to the automation-wide
+    // key rather than lying.
+    subjectNodeKey: isChannel ? null : (msg.fromPublicKey ?? null),
     timestamp,
     fields,
   };
@@ -285,16 +339,18 @@ export function buildScheduleContext(sourceId: string | null, timestamp: number)
  * Extract the channel names a `trigger.message` filter targets via the multi-select
  * `channels` field (#3974). Entries are `{ name, protocol? }` — the same shape the
  * builder's `channelMulti` renderer emits and `action.sendMessage` resolves. Matching
- * is name-based (protocol is a UI hint only), mirroring the legacy scalar `channelName`
- * check. Empty/blank names are dropped (Primary can't be name-matched, same as legacy).
+ * is name-based (protocol is a UI hint only). An empty string is a legitimate,
+ * meaningful entry here — it's how the "(Primary)" checkbox represents a source's
+ * unnamed slot-0 channel (#4507) — so it is kept, not dropped; only entries that
+ * aren't a `{ name: string }` object are excluded.
  */
 export function messageFilterChannelNames(params: Record<string, unknown> = {}): string[] {
   if (!Array.isArray(params.channels)) return [];
   return (params.channels as unknown[])
     .map((c) => (c && typeof c === 'object' && typeof (c as Record<string, unknown>).name === 'string'
       ? ((c as Record<string, unknown>).name as string)
-      : ''))
-    .filter((n) => n.length > 0);
+      : null))
+    .filter((n): n is string => n !== null);
 }
 
 /**
@@ -319,10 +375,13 @@ export function messageMatchesFilter(msg: DbMessage, params: Record<string, unkn
   if (params.to != null && Number(msg.toNodeNum) !== Number(params.to)) return false;
   // Multi-channel OR-list (#3974) takes precedence over the legacy scalar
   // channel/channelName fields: fire if the resolved name matches ANY entry.
+  // A resolved name of '' (Primary's unnamed slot-0) is a legitimate match
+  // target (#4507) — only an unresolved (null/undefined) name never matches.
   const channelNames = messageFilterChannelNames(params);
   if (channelNames.length > 0) {
-    const resolved = channelName?.toLowerCase();
-    if (!resolved || !channelNames.some((n) => n.toLowerCase() === resolved)) return false;
+    if (channelName == null) return false;
+    const resolved = channelName.toLowerCase();
+    if (!channelNames.some((n) => n.toLowerCase() === resolved)) return false;
   } else {
     if (params.channel != null && Number(msg.channel) !== Number(params.channel)) return false;
     // Channel-by-name: portable across sources where the channel sits in a
@@ -367,8 +426,9 @@ export function meshCoreMessageMatchesFilter(
   const channelIdx = parseMeshCoreChannelIdx(msg.fromPublicKey);
   const channelNames = messageFilterChannelNames(params);
   if (channelNames.length > 0) {
-    const resolved = channelName?.toLowerCase();
-    if (!resolved || !channelNames.some((n) => n.toLowerCase() === resolved)) return false;
+    if (channelName == null) return false;
+    const resolved = channelName.toLowerCase();
+    if (!channelNames.some((n) => n.toLowerCase() === resolved)) return false;
   } else {
     if (params.channel != null && Number(channelIdx) !== Number(params.channel)) return false;
     if (typeof params.channelName === 'string' && params.channelName.length > 0) {
@@ -408,8 +468,8 @@ export function describeMessageFilterMiss(
   if (params.to != null && Number(msg.toNodeNum) !== Number(params.to)) return `recipient #${msg.toNodeNum} ≠ to #${params.to}`;
   const channelNames = messageFilterChannelNames(params);
   if (channelNames.length > 0) {
-    const resolved = channelName?.toLowerCase();
-    if (!resolved || !channelNames.some((n) => n.toLowerCase() === resolved)) {
+    const resolved = channelName == null ? null : channelName.toLowerCase();
+    if (resolved == null || !channelNames.some((n) => n.toLowerCase() === resolved)) {
       return `channel name "${channelName ?? '(unresolved)'}" not in [${channelNames.join(', ')}]`;
     }
   } else {
@@ -444,8 +504,8 @@ export function describeMeshCoreFilterMiss(
   const channelIdx = parseMeshCoreChannelIdx(msg.fromPublicKey);
   const channelNames = messageFilterChannelNames(params);
   if (channelNames.length > 0) {
-    const resolved = channelName?.toLowerCase();
-    if (!resolved || !channelNames.some((n) => n.toLowerCase() === resolved)) {
+    const resolved = channelName == null ? null : channelName.toLowerCase();
+    if (resolved == null || !channelNames.some((n) => n.toLowerCase() === resolved)) {
       return `channel name "${channelName ?? '(unresolved)'}" not in [${channelNames.join(', ')}]`;
     }
   } else {
