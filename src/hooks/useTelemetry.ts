@@ -61,9 +61,10 @@ export interface TelemetryData {
 
 /**
  * Merge telemetry received by multiple MeshMonitor sources without turning one
- * radio packet into multiple graph samples. Packet id is preferred; the exact
- * metric/timestamp/value tuple is the conservative fallback for records where
- * packet metadata is unavailable (for example averaged query rows).
+ * radio packet into multiple graph samples. Packet id is preferred; when the
+ * API returns averaged rows (which intentionally omit packet metadata), the
+ * metric + bucket timestamp identifies the one logical sample. This keeps one
+ * source's value instead of summing or averaging source copies together.
  */
 function mergeTelemetrySources(rows: TelemetryData[][]): TelemetryData[] {
   const merged = rows
@@ -74,8 +75,8 @@ function mergeTelemetrySources(rows: TelemetryData[][]): TelemetryData[] {
   return merged.filter((row) => {
     const sampleTimestamp = row.packetTimestamp ?? row.timestamp;
     const key = row.packetId != null
-      ? `packet:${row.nodeId}:${row.packetId}:${row.telemetryType}:${sampleTimestamp}`
-      : `sample:${row.nodeId}:${row.telemetryType}:${sampleTimestamp}:${row.value}:${row.unit ?? ''}`;
+      ? `packet:${row.nodeId}:${row.packetId}:${row.telemetryType}`
+      : `sample:${row.nodeId}:${row.telemetryType}:${sampleTimestamp}`;
 
     if (seen.has(key)) return false;
     seen.add(key);
@@ -294,7 +295,7 @@ export function useSolarEstimatesLatest({
       return estimatesMap;
     },
     enabled,
-    refetchInterval: 300000, // Refetch every 5 minutes (solar data changes slowly)
+    refetchInterval: 300000, // Refetch every 5 minutes
     staleTime: 290000, // Data considered fresh for ~5 minutes
     gcTime: 10 * 60 * 1000, // Keep in cache for 10 minutes
     refetchOnWindowFocus: false,
