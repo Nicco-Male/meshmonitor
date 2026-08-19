@@ -3,9 +3,11 @@
  *
  * Pure, React-free, leaflet-free — safe to import from anywhere (including
  * node-env tests) without pulling in `window`/`leaflet`. This is the SINGLE
- * home for four previously-duplicated behaviors:
+ * home for five previously-duplicated / map-consistency behaviors:
  *   - #1862 — snapshot route positions (render historical traceroutes where
  *     nodes were at capture time, not where they are now).
+ *   - stale-trace invalidation — stop rendering an entire historical route
+ *     when any snapshotted node has moved materially since capture.
  *   - #2051 — the empty-routeBack guard (don't draw a fictitious direct
  *     return line when the return path hasn't been recorded yet).
  *   - #2931 — the firmware unknown-SNR sentinel (MQTT-bridged / relay-role /
@@ -22,8 +24,9 @@
  * sentinel — don't add a leaflet/react-leaflet import here.
  */
 
-// `nullIsland` is pure (no leaflet) — safe to import without breaking the
-// leaflet-free guarantee above.
+// `nullIsland` and `distance` are pure (no leaflet) — safe to import without
+// breaking the leaflet-free guarantee above.
+import { calculateDistance } from './distance.js';
 import { isBogusPosition } from './nullIsland.js';
 
 // ---------------------------------------------------------------------------
@@ -90,8 +93,16 @@ export function isUnknownRouteNode(nodeNum: number): boolean {
 }
 
 // ---------------------------------------------------------------------------
-// #1862 — snapshot route positions
+// #1862 — snapshot route positions + stale-route movement invalidation
 // ---------------------------------------------------------------------------
+
+/**
+ * A traceroute is considered spatially stale when a node has moved at least
+ * this far from the position stored when the trace was captured. This is
+ * intentionally well above normal GPS jitter while still invalidating mobile
+ * nodes quickly enough that an old RF link is not presented as current.
+ */
+export const TRACEROUTE_MOVEMENT_INVALIDATION_METERS = 100;
 
 /**
  * Parse the `routePositions` JSON snapshot stored on a traceroute row.
@@ -131,11 +142,52 @@ export function parseSnapshotRoutePositions(
 }
 
 /**
+ * Return true when any real node present in both the capture-time snapshot
+ * and the current live-node position map has moved far enough that the old
+ * traceroute no longer represents the current radio geometry.
+ *
+ * Missing live positions are ignored: absence alone is not evidence that the
+ * node moved. Traceroutes created before `routePositions` existed likewise
+ * cannot be movement-validated and continue to rely on the normal age TTL.
+ */
+export function hasTracerouteSnapshotMoved(
+  snapshot: Map<number, [number, number]>,
+  liveNodes: Map<number, [number, number]>,
+  thresholdMeters = TRACEROUTE_MOVEMENT_INVALIDATION_METERS,
+): boolean {
+  if (snapshot.size === 0 || liveNodes.size === 0) return false;
+
+  for (const [nodeNum, [snapshotLat, snapshotLng]] of snapshot) {
+    if (!isValidRouteNode(nodeNum)) continue;
+    const livePosition = liveNodes.get(nodeNum);
+    if (!livePosition) continue;
+
+    const distanceMeters = calculateDistance(
+      snapshotLat,
+      snapshotLng,
+      livePosition[0],
+      livePosition[1],
+    ) * 1000;
+
+    if (distanceMeters >= thresholdMeters) return true;
+  }
+
+  return false;
+}
+
+/**
  * Resolve a hop's render position, preferring the historical snapshot
  * (#1862) over the live position. Both maps are expected to already be
  * normalized to `[lat, lng]` tuples — normalizing a consumer's own live-node
  * shape (digest array, raw node map with `latitudeI/longitudeI` vs
  * `latitude/longitude`, etc.) is the caller's job, not this function's.
+ *
+ * Before resolving a single hop, the whole snapshot is checked against the
+ * current live positions. If ANY snapshotted node moved by at least
+ * {@link TRACEROUTE_MOVEMENT_INVALIDATION_METERS}, every call for that trace
+ * resolves to `null`; `decomposeTraceroute` therefore emits no segments for
+ * the stale trace. This deliberately invalidates the whole route instead of
+ * leaving detached intermediate links on the map.
  *
  * `requireLive` (issue #4162): when true, a node absent from `liveNodes`
  * resolves to `null` (drop the hop) even if the snapshot still holds a
@@ -153,6 +205,7 @@ export function resolveSegmentPosition(
   liveNodes: Map<number, [number, number]>,
   requireLive = false,
 ): [number, number] | null {
+  if (hasTracerouteSnapshotMoved(snapshot, liveNodes)) return null;
   if (requireLive && !liveNodes.has(nodeNum)) return null;
   return snapshot.get(nodeNum) ?? liveNodes.get(nodeNum) ?? null;
 }
@@ -246,7 +299,7 @@ export interface TracerouteRenderSegment {
   avgSnr: number | null;               // /4-scaled dB; null = no data
   isMqtt: boolean;                      // per-hop sentinel (#2931), NOT node.viaMqtt
   usageCount?: number;                  // weightByUsage
-  occurrences?: number;                 // weightByOccurrence
+  occurrences?: number;                // weightByOccurrence
   timestamp?: number;                   // temporal fade
   snrSamples?: { snr: number; timestamp?: number }[]; // popup/chart + array color/opacity
 }
