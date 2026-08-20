@@ -52,7 +52,7 @@ const getEncryptionStatus = (psk: string | undefined | null): EncryptionStatus =
     return 'default'; // Default/public key - not secure
   }
   return 'secure'; // Custom key - encrypted
-};
+}
 
 // Resolve encryption status for a Channel: prefer the server-derived
 // `encryptionStatus` field (always present on API responses) and fall back
