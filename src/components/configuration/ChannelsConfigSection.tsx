@@ -52,7 +52,7 @@ const getEncryptionStatus = (psk: string | undefined | null): EncryptionStatus =
     return 'default'; // Default/public key - not secure
   }
   return 'secure'; // Custom key - encrypted
-}
+};
 
 // Resolve encryption status for a Channel: prefer the server-derived
 // `encryptionStatus` field (always present on API responses) and fall back
@@ -345,8 +345,15 @@ const ChannelsConfigSection: React.FC<ChannelsConfigSectionProps> = ({
 
 
   const handleExportChannel = async (channelId: number) => {
+    if (!sourceId) {
+      showToast(t('channels_config.toast_export_failed'), 'error');
+      return;
+    }
+
     try {
-      await apiService.exportChannel(channelId);
+      await apiService.download(`/api/channels/${channelId}/export?sourceId=${encodeURIComponent(sourceId)}`, {
+        defaultName: `channel-${channelId}-${Date.now()}.json`,
+      });
       showToast(t('channels_config.toast_channel_exported', { slot: channelId }), 'success');
     } catch (error) {
       logger.error('Error exporting channel:', error);
