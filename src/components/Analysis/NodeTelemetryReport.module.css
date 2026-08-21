@@ -12,7 +12,7 @@
 
 .controlsGrid {
   display: grid;
-  grid-template-columns: minmax(180px, 0.65fr) minmax(320px, 2.8fr);
+  grid-template-columns: minmax(320px, 2.8fr) minmax(180px, 0.65fr);
   gap: 14px;
   align-items: end;
 }
