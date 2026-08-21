@@ -22,6 +22,8 @@ import { meshcoreDeviceLimiter } from '../middleware/rateLimiters.js';
 import meshcorePositionHistoryService from '../services/meshcorePositionHistoryService.js';
 import { isBogusPosition } from '../../utils/nullIsland.js';
 import { managerFor, isValidPublicKey, auditMeshcoreEvent, parseHexPathChain } from './meshcoreRouteShared.js';
+import { ok, fail } from '../utils/apiResponse.js';
+import { buildLocalContactRow, withoutLocalFlag, type MeshCoreContactResponse } from './meshcoreLocalContactRow.js';
 
 const router = Router({ mergeParams: true });
 
@@ -100,19 +102,9 @@ router.get('/contacts', optionalAuth(), requirePermission('nodes', 'read', { sou
     const localNode = manager.getLocalNode();
 
     // Include local node in contacts list if it has coordinates
-    const allContacts = [...contacts];
+    const allContacts: MeshCoreContactResponse[] = withoutLocalFlag(contacts);
     if (localNode && localNode.latitude && localNode.longitude) {
-      allContacts.unshift({
-        publicKey: localNode.publicKey,
-        advName: `${localNode.name} (local)`,
-        name: localNode.name,
-        latitude: localNode.latitude,
-        longitude: localNode.longitude,
-        advType: localNode.advType,
-        rssi: undefined,
-        snr: undefined,
-        lastSeen: Date.now(),
-      });
+      allContacts.unshift(buildLocalContactRow(localNode));
     }
 
     res.json({
@@ -130,14 +122,31 @@ router.get('/contacts', optionalAuth(), requirePermission('nodes', 'read', { sou
  * POST /api/meshcore/contacts/refresh
  * Refresh contacts from device
  * Requires authentication - triggers device communication
+ *
+ * Must return the SAME shape as GET /contacts — including the synthetic
+ * local-node row (#4449). Before this fix, this route returned the raw
+ * device contact map with no local row, while the frontend treats the
+ * response as a wholesale replacement (`useMeshCore.refreshContacts`), so
+ * clicking "Refresh Contacts" dropped the operator's own node from the
+ * contacts list, the node list, and the local-node ref map — and with it,
+ * the local node's exemption from age filtering — until the next snapshot
+ * fetch silently restored it.
  */
 router.post('/contacts/refresh', meshcoreDeviceLimiter, requireAuth(), requirePermission('nodes', 'write', { sourceIdFrom: 'params.id' }), async (req: Request, res: Response) => {
   try {
-    const contacts = await managerFor(req, res).refreshContacts();
+    const manager = managerFor(req, res);
+    const contacts = await manager.refreshContacts();
+    const localNode = manager.getLocalNode();
+
+    const allContacts: MeshCoreContactResponse[] = withoutLocalFlag(Array.from(contacts.values()));
+    if (localNode && localNode.latitude && localNode.longitude) {
+      allContacts.unshift(buildLocalContactRow(localNode));
+    }
+
     res.json({
       success: true,
-      data: Array.from(contacts.values()),
-      count: contacts.size,
+      data: allContacts,
+      count: allContacts.length,
     });
   } catch (error) {
     logger.error('[API] Error refreshing contacts:', error);
@@ -255,8 +264,10 @@ router.post(
         : MeshCoreDiscoverFilter.NEARBY;
       // fetchNames=true: actively pull each discovered repeater/room-server's
       // name via ANON_REQ OWNER so the result is named within seconds (#3820).
-      const { returned, newCount } = await managerFor(req, res).discoverNodes(filter, 8000, true);
-      res.json({ success: true, returned, new: newCount });
+      const { returned, newCount, nodes } = await managerFor(req, res).discoverNodes(filter, 8000, true);
+      // `nodes` is the per-responder detail (#4516). The counts stay for
+      // backwards compatibility with any client reading the old shape.
+      res.json({ success: true, returned, new: newCount, nodes });
     } catch (error) {
       logger.error('[API] Error discovering nodes:', error);
       res.status(500).json({ success: false, error: 'Failed to discover nodes' });
@@ -324,6 +335,56 @@ router.post(
     } catch (error) {
       logger.error('[API] Error tracing contact path:', error);
       res.status(500).json({ success: false, error: 'Failed to trace path' });
+    }
+  },
+);
+
+/**
+ * POST /api/sources/:id/meshcore/contacts/:publicKey/ping
+ *
+ * Zero-hop ping (issue #4393) — the "Ping [zero hops]" action from the MeshCore
+ * phone app. Sends a TRACE along a synthetic one-hop path (the target's own
+ * public-key hash byte), bypassing any cached multi-hop out_path. A reply means
+ * the node answered us with no intermediate repeater, i.e. it is in direct RF
+ * range; a timeout means it is not (or does not repeat traces — see the manager
+ * docstring; plain Companion firmware never forwards a trace).
+ *
+ * Requires nodes:write like the other transmitting actions.
+ *
+ * 200 → { success: true, data: { hopHash, rttMs, snrToTarget, snrFromTarget } }
+ * 409 → guard failure (not a Companion / disconnected / unknown contact)
+ * 504 → no reply (not in direct range)
+ */
+router.post(
+  '/contacts/:publicKey/ping',
+  meshcoreDeviceLimiter,
+  requireAuth(),
+  requirePermission('nodes', 'write', { sourceIdFrom: 'params.id' }),
+  async (req: Request, res: Response) => {
+    try {
+      const publicKey = req.params.publicKey;
+      if (!isValidPublicKey(publicKey)) {
+        return fail(res, 400, 'INVALID_PUBLIC_KEY', 'Invalid public key — must be 64-char hex');
+      }
+      const result = await managerFor(req, res).pingContactZeroHop(publicKey);
+      if (!result.ok) {
+        const status = result.reason === 'no-reply' ? 504 : 409;
+        const code =
+          result.reason === 'no-reply' ? 'MESHCORE_PING_NO_REPLY'
+          : result.reason === 'not-companion' ? 'MESHCORE_PING_NOT_COMPANION'
+          : result.reason === 'disconnected' ? 'MESHCORE_PING_DISCONNECTED'
+          : 'MESHCORE_PING_UNKNOWN_CONTACT';
+        return fail(res, status, code, result.error, { reason: result.reason });
+      }
+      return ok(res, {
+        hopHash: result.hopHash,
+        rttMs: result.rttMs,
+        snrToTarget: result.snrToTarget,
+        snrFromTarget: result.snrFromTarget,
+      });
+    } catch (error) {
+      logger.error('[API] Error pinging contact (zero hop):', error);
+      return fail(res, 500, 'MESHCORE_PING_FAILED', 'Failed to ping contact');
     }
   },
 );

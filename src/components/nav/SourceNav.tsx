@@ -1,0 +1,220 @@
+/**
+ * SourceNav — the one navigation primitive shared by every per-source view
+ * (issue #4473).
+ *
+ * Meshtastic sources and MeshCore sources used to ship two independently-built
+ * navs — `Sidebar` (icon-only rail) and `MeshCoreSubToolbar` (bottom bar with
+ * labels). They didn't share a design, so a fix to one never reached the other;
+ * the phone bottom bar in particular crushed 11 items to ~35px each and
+ * ellipsised every label down to a few characters.
+ *
+ * This component owns the *presentation* only. Each consumer keeps its own item
+ * list, permission gating, state ownership and routing model — Meshtastic's nav
+ * is app-level and routed, MeshCore's is view-local `useState`, and unifying
+ * those is deliberately out of scope here.
+ *
+ * Layout hooks for tests are stable `data-*` attributes, not class names: the
+ * styling lives in a CSS module whose class names are hashed at build time.
+ */
+import React, { useEffect, useRef, useState } from 'react';
+import { UiIcon, type UiIconName } from '../icons';
+import styles from './SourceNav.module.css';
+
+export interface SourceNavItem {
+  /** Stable id — compared against `activeId` to mark the active entry. */
+  id: string;
+  label: string;
+  icon: UiIconName;
+  onClick: () => void;
+  /** Renders a red unread dot on the icon (#3891). */
+  unread?: boolean;
+}
+
+export interface SourceNavSection {
+  /** Rendered as a section header when expanded; omit for an unlabelled group. */
+  title?: string;
+  items: SourceNavItem[];
+}
+
+export interface SourceNavProps {
+  sections: SourceNavSection[];
+  activeId: string;
+  /** Icon-only rail (desktop) / compact (mobile). */
+  collapsed: boolean;
+  /**
+   * How the nav presents itself below the 768px breakpoint.
+   * - `bottom-bar`: horizontal, bottom-docked, scrolls sideways with readable
+   *   labels. Items size to their content instead of being split evenly, which
+   *   is what made labels unreadable before.
+   * - `rail`: stays a vertical left rail.
+   *
+   * Meshtastic is still `rail` because the whole app layout keys off
+   * `--sidebar-width`; moving it to `bottom-bar` is follow-up work.
+   */
+  mobileVariant?: 'bottom-bar' | 'rail';
+  /** Slot above the nav (Meshtastic's logo/app-name block). */
+  header?: React.ReactNode;
+  /** Slot below the nav, above the footer (pin/collapse controls). */
+  controls?: React.ReactNode;
+  /** Slot pinned to the bottom (SidebarFooter). */
+  footer?: React.ReactNode;
+  /**
+   * When provided and `controls` is not, renders the built-in collapse toggle.
+   * Consumers with their own control cluster pass `controls` instead.
+   */
+  onToggleCollapsed?: () => void;
+  collapseLabel?: string;
+  expandLabel?: string;
+  /** Extra class on the root, for consumer-specific positioning. */
+  className?: string;
+  ariaLabel?: string;
+}
+
+export const SourceNav: React.FC<SourceNavProps> = ({
+  sections,
+  activeId,
+  collapsed,
+  mobileVariant = 'bottom-bar',
+  header,
+  controls,
+  footer,
+  onToggleCollapsed,
+  collapseLabel = 'Collapse',
+  expandLabel = 'Expand',
+  className,
+  ariaLabel,
+}) => {
+  const rootClasses = [
+    styles.nav,
+    collapsed ? styles.collapsed : styles.expanded,
+    mobileVariant === 'bottom-bar' ? styles.mobileBottomBar : styles.mobileRail,
+    className,
+  ]
+    .filter(Boolean)
+    .join(' ');
+
+  /**
+   * Which edges of the bottom bar still have tabs beyond them (#4497). The
+   * stylesheet turns these into edge fades — the only cue that the row scrolls
+   * at all, since there are more tabs than fit a phone and the scrollbar is
+   * hidden.
+   *
+   * Measured rather than assumed: a bar whose tabs all fit shows no fade.
+   */
+  const navRef = useRef<HTMLElement | null>(null);
+  const [overflow, setOverflow] = useState({ start: false, end: false });
+
+  useEffect(() => {
+    const el = navRef.current;
+    if (!el) return;
+
+    const measure = () => {
+      // 1px slack: fractional scroll offsets otherwise leave a fade stuck on
+      // at a hard end.
+      const atStart = el.scrollLeft <= 1;
+      const atEnd = el.scrollLeft + el.clientWidth >= el.scrollWidth - 1;
+      const scrollable = el.scrollWidth > el.clientWidth + 1;
+      setOverflow(prev => {
+        const next = { start: scrollable && !atStart, end: scrollable && !atEnd };
+        return prev.start === next.start && prev.end === next.end ? prev : next;
+      });
+    };
+
+    measure();
+    el.addEventListener('scroll', measure, { passive: true });
+    // Tab set and viewport both change the answer: permissions can add or drop
+    // entries, and rotation changes how many fit.
+    const observer =
+      typeof ResizeObserver !== 'undefined' ? new ResizeObserver(measure) : null;
+    observer?.observe(el);
+
+    return () => {
+      el.removeEventListener('scroll', measure);
+      observer?.disconnect();
+    };
+  }, [sections, collapsed, mobileVariant]);
+
+  return (
+    <aside
+      ref={navRef}
+      className={rootClasses}
+      data-source-nav=""
+      data-collapsed={collapsed ? 'true' : 'false'}
+      data-mobile-variant={mobileVariant}
+      data-overflow-start={overflow.start ? 'true' : 'false'}
+      data-overflow-end={overflow.end ? 'true' : 'false'}
+      aria-label={ariaLabel}
+    >
+      {/* Wrapped so the bottom-bar variant can hide them: a logo block, a
+          pin/collapse cluster and a footer are all vertical-rail affordances
+          that make no sense laid out in a horizontal bar. */}
+      {header && <div className={styles.headerSlot} data-source-nav-header="">{header}</div>}
+
+      <nav className={styles.list}>
+        {sections.map((section, index) => (
+          <React.Fragment key={section.title ?? `section-${index}`}>
+            {section.title && !collapsed && (
+              <div className={styles.sectionHeader} data-source-nav-section-header="">
+                {section.title}
+              </div>
+            )}
+            <div className={styles.section} data-source-nav-section="">
+              {section.items.map(item => {
+                const isActive = item.id === activeId;
+                return (
+                  <button
+                    key={item.id}
+                    type="button"
+                    className={`${styles.item} ${isActive ? styles.active : ''}`}
+                    data-source-nav-item={item.id}
+                    data-active={isActive ? 'true' : 'false'}
+                    aria-current={isActive ? 'page' : undefined}
+                    onClick={item.onClick}
+                    // Collapsed rails show no text, so the tooltip is the only
+                    // affordance naming the destination.
+                    title={collapsed ? item.label : undefined}
+                  >
+                    <span className={styles.icon} data-source-nav-icon="">
+                      <UiIcon name={item.icon} size={20} />
+                      {item.unread && (
+                        <span
+                          className={styles.unreadDot}
+                          data-source-nav-unread=""
+                          aria-hidden="true"
+                        />
+                      )}
+                    </span>
+                    <span className={styles.label} data-source-nav-label="">
+                      {item.label}
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+          </React.Fragment>
+        ))}
+      </nav>
+
+      {controls ? (
+        <div className={styles.controlsSlot} data-source-nav-controls="">{controls}</div>
+      ) : (onToggleCollapsed && (
+        <div className={`${styles.controls} ${styles.controlsSlot}`} data-source-nav-controls="">
+          <button
+            type="button"
+            className={styles.toggle}
+            data-source-nav-toggle=""
+            onClick={onToggleCollapsed}
+            title={collapsed ? expandLabel : collapseLabel}
+            aria-label={collapsed ? expandLabel : collapseLabel}
+          >
+            <UiIcon name={collapsed ? 'forward' : 'back'} size={18} />
+          </button>
+        </div>
+      ))}
+
+      {footer && <div className={styles.footerSlot} data-source-nav-footer="">{footer}</div>}
+    </aside>
+  );
+};
+
+export default SourceNav;

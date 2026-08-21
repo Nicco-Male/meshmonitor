@@ -7,7 +7,7 @@
  */
 import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { TRIGGERS, CONDITIONS, ACTIONS, BLOCK_BY_TYPE, fieldsFor, type BlockDef, type FieldDef } from './catalog';
+import { TRIGGERS, CONDITIONS, ACTIONS, BLOCK_BY_TYPE, fieldsFor, fieldVisible, type BlockDef, type FieldDef } from './catalog';
 import type { WorkflowForm, FormBlock, Rule } from './compile';
 import SubstitutionsHelpDrawer from './SubstitutionsHelp';
 import GeofenceFieldInput from './GeofenceFieldInput';
@@ -16,7 +16,16 @@ import type { GeofenceShape } from '../auto-responder/types';
 import { UiIcon } from '../icons';
 
 export interface VariableOption { name: string; type: string; }
-export interface SourceOption { id: string; name: string; type?: string; enabled?: boolean; txEnabled?: boolean; }
+export interface SourceOption {
+  id: string;
+  name: string;
+  type?: string;
+  enabled?: boolean;
+  /** Raw radio TX flag. */
+  txEnabled?: boolean;
+  /** `txEnabled || udpRelayEnabled` — the real "can this source send?" answer (#4394). */
+  canTransmit?: boolean;
+}
 export interface UnifiedChannelOption {
   name: string; protocol?: string; encryption?: string;
   sources?: Array<{ sourceId: string; sourceName?: string; slot: number }>;
@@ -166,7 +175,10 @@ function FieldInput({ field, value, onChange, variables, sources, channels, scri
                 <input type="checkbox" checked={sel.includes(s.id)} onChange={(e) =>
                   onChange(e.target.checked ? [...sel, s.id] : sel.filter((x) => x !== s.id))} />
                 {' '}{s.name}{badge ? <span className="ae-chip">{badge}</span> : null}
-                {s.txEnabled === false && (
+                {/* Prefer canTransmit: a TX-disabled radio with UDP Broadcast on
+                    still delivers, so it must not be flagged (#4394). Older
+                    servers omit the field — fall back to the raw radio flag. */}
+                {(s.canTransmit ?? s.txEnabled) === false && (
                   <span className="ae-tx-warn" title={txWarning}>
                     <UiIcon name="alert" size={14} /> {txWarning}
                   </span>
@@ -224,7 +236,7 @@ function BlockFields({ block, triggerType, variables, sources, channels, scripts
   if (!def) return null;
   return (
     <>
-      {def.fields.map((f) => {
+      {def.fields.filter((f) => fieldVisible(f, block.params)).map((f) => {
         const field = f.kind === 'fieldselect' ? { ...f, groups: fieldsFor(block.type, triggerType) } : f;
         return <FieldInput key={f.name} field={field} value={block.params[f.name]} variables={variables} sources={sources} channels={channels} scripts={scripts} regions={regions} triggerType={triggerType}
           onChange={(v) => onParams({ ...block.params, [f.name]: v })} />;

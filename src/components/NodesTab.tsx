@@ -22,7 +22,7 @@ import { getTilesetById } from '../config/tilesets';
 import { getEffectiveHops, getMapHoverTooltipMeta } from '../utils/nodeHops';
 import { buildNodeExportRows, nodesToCsv, nodesToHtml, downloadTextFile } from '../utils/nodeExport';
 import { useMapContext } from '../contexts/MapContext';
-import { useTelemetryNodes, useDeviceConfig, useNodes, setNodeFieldInCache } from '../hooks/useServerData';
+import { useTelemetryNodes, useDeviceConfig, useNodes, useChannels, setNodeFieldInCache } from '../hooks/useServerData';
 import { useQueryClient } from '@tanstack/react-query';
 import { useUI } from '../contexts/UIContext';
 import { useSettings } from '../contexts/SettingsContext';
@@ -50,6 +50,8 @@ import { BaseMap } from './map/BaseMap';
 import { MapLoadingOverlay } from './map/MapLoadingOverlay';
 import { MapModeIndicator } from './map/MapModeIndicator';
 import { NodeUnmessageableBadge } from './NodeUnmessageableBadge';
+import { NodeDetailsButton } from './NodeDetailsButton';
+import nodeRowStyles from './NodeRowActions.module.css';
 import { NeighborLinksLayer, type NeighborLinkDescriptor } from './map/layers/NeighborLinksLayer';
 import { AccuracyRegionsLayer, type AccuracyRegionDescriptor } from './map/layers/AccuracyRegionsLayer';
 import { NodeCard } from './map/popups/NodeCard';
@@ -58,10 +60,10 @@ import { toNodeCardModel, type NodeCardModel } from './map/popups/nodeCardModel'
 import { useCsrfFetch } from '../hooks/useCsrfFetch';
 import api from '../services/api';
 import type { GeoJsonLayer } from '../server/services/geojsonService.js';
-import type { MapStyle } from '../server/services/mapStyleService.js';
 import { CopyNodeInfoModal } from './CopyNodeInfoModal';
 import { UiIcon } from './icons';
 import { useToast } from './ToastContainer';
+import { logger } from '../utils/logger';
 
 interface NodesTabProps {
   processedNodes: DeviceInfo[];
@@ -243,18 +245,59 @@ const DefaultCenterController: React.FC<{
   const hadSavedPosition = useRef(localStorage.getItem('mapCenter') !== null);
 
   useEffect(() => {
-    console.log('[DefaultCenterController] effect fired', {
+    logger.debug('[DefaultCenterController] effect fired', {
       applied: applied.current,
       hadSaved: hadSavedPosition.current,
       lat, lon, zoom,
     });
     if (applied.current || hadSavedPosition.current) return;
     if (lat !== null && lon !== null && zoom !== null) {
-      console.log('[DefaultCenterController] applying configured default', lat, lon, zoom);
+      logger.debug('[DefaultCenterController] applying configured default', lat, lon, zoom);
       applied.current = true;
       map.setView([lat, lon], zoom, { animate: false });
     }
   }, [map, lat, lon, zoom]);
+
+  return null;
+};
+
+/**
+ * Zooms the map to fit every positioned node (#4496).
+ *
+ * The button lives in `.map-controls`, a SIBLING of MapContainer with no access
+ * to the map instance. Rather than plumb the instance outward, this follows the
+ * same shape as TracerouteBoundsController below — a controller inside the map
+ * reacting to a prop. `request` is a monotonically increasing counter so
+ * repeated clicks re-fit even when the node set hasn't changed; a boolean would
+ * only ever fire once.
+ */
+const FitAllNodesController: React.FC<{
+  request: number;
+  positions: Array<[number, number]>;
+}> = ({ request, positions }) => {
+  const map = useMap();
+  const lastHandled = useRef(0);
+
+  useEffect(() => {
+    if (request === 0 || request === lastHandled.current) return;
+    lastHandled.current = request;
+    if (positions.length === 0) return;
+
+    if (positions.length === 1) {
+      // fitBounds on zero-area bounds snaps to max zoom; centring reads better.
+      map.setView(positions[0], Math.max(map.getZoom(), 14), { animate: true });
+      return;
+    }
+
+    map.fitBounds(positions, {
+      padding: [50, 50],
+      animate: true,
+      duration: 0.5,
+      // Matches TracerouteBoundsController: a tight cluster shouldn't slam to
+      // street level.
+      maxZoom: 15,
+    });
+  }, [request, positions, map]);
 
   return null;
 };
@@ -303,8 +346,10 @@ const TracerouteBoundsController: React.FC<{
  * - Right-click anywhere (when `canCreate`) opens the editor with that
  *   location seeded as the new waypoint's coordinates.
  *
- * Toggles the `waypoint-placing` class on the leaflet container so CSS can
- * change the cursor to a crosshair during placement.
+ * Toggles the `waypoint-placing` class on the leaflet container. That class
+ * drives the crosshair cursor AND (issue #4342) makes interactive overlay
+ * geometry click-through, so the pick below always wins over a feature popup —
+ * see the rule in WaypointEditorModal.css for why that is load-bearing.
  */
 const WaypointMapEventBridge: React.FC<{
   placing: boolean;
@@ -315,8 +360,14 @@ const WaypointMapEventBridge: React.FC<{
 
   useEffect(() => {
     const container = map.getContainer();
-    if (placing) container.classList.add('waypoint-placing');
-    else container.classList.remove('waypoint-placing');
+    if (placing) {
+      container.classList.add('waypoint-placing');
+      // A popup left open from a previous click floats above the map with its
+      // own pointer-events, so it would eat the placement click (#4342).
+      map.closePopup();
+    } else {
+      container.classList.remove('waypoint-placing');
+    }
     return () => container.classList.remove('waypoint-placing');
   }, [placing, map]);
 
@@ -450,7 +501,6 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
     setNodesNodeFilter,
     securityFilter,
     channelFilter,
-    showIncompleteNodes,
     sortField,
     setSortField,
     sortDirection,
@@ -478,12 +528,19 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
     nodeDimmingMinOpacity,
     maxNodeAgeHours,
     nodeHopsCalculation,
+    // #4412 Phase 3: moved here from UIContext with the rest of the
+    // per-source Node Display group.
+    showIncompleteNodes,
     neighborInfoMinZoom,
     overlayColors,
     defaultMapCenterLat,
     defaultMapCenterLon,
     defaultMapCenterZoom,
     mapCenterTargetZoom,
+    mapStyles,
+    activeStyleId,
+    activeStyleJson,
+    setActiveMapStyleId,
   } = useSettings();
 
   // Effective map age cap from the Map Features age slider (#3322), clamped to
@@ -527,6 +584,9 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
 
   // ----- Waypoint authoring state -----
   const canWriteWaypoints = hasPermission('waypoints', 'write');
+  // Channels come from the poll cache, which is already keyed on the active
+  // source — so the picker only ever offers the waypoint's own source (#4341).
+  const { channels: sourceChannels } = useChannels();
   const waypointMutations = useWaypoints(currentSourceId);
   const [waypointEditorOpen, setWaypointEditorOpen] = useState(false);
   const [waypointEditorInitial, setWaypointEditorInitial] = useState<Waypoint | null>(null);
@@ -835,11 +895,13 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
   // Track if packet logging is enabled on the server
   const [packetLogEnabled, setPacketLogEnabled] = useState<boolean>(false);
   const [geoJsonLayers, setGeoJsonLayers] = useState<GeoJsonLayer[]>([]);
-  const [mapStyles, setMapStyles] = useState<MapStyle[]>([]);
-  const [activeStyleId, setActiveStyleId] = useState<string | null>(() => {
-    try { return localStorage.getItem('meshmonitor-activeMapStyleId') || null; } catch { return null; }
-  });
-  const [activeStyleJson, setActiveStyleJson] = useState<Record<string, unknown> | null>(null);
+  // mapStyles/activeStyleId/activeStyleJson now live in SettingsContext
+  // (issue #4348) so DashboardMap can share the same active style.
+
+  // Zoom-to-fit-all request counter (#4496). A counter rather than a boolean so
+  // repeated taps re-fit even when the node set is unchanged; FitAllNodesController
+  // inside the map watches it.
+  const [fitAllRequest, setFitAllRequest] = useState(0);
 
   // Track if map controls are collapsed
   const [isMapControlsCollapsed, setIsMapControlsCollapsed] = useState(() => {
@@ -995,42 +1057,8 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
     void fetchGeoJsonLayers();
   }, []);
 
-  useEffect(() => {
-    const fetchMapStyles = async () => {
-      try {
-        const data = await api.get<MapStyle[]>('/api/map-styles/styles');
-        setMapStyles(data);
-
-        // Determine which style to use: localStorage > server default > none
-        let resolvedStyleId = activeStyleId;
-
-        if (!resolvedStyleId) {
-          // No localStorage value — check server default
-          try {
-            const settings = await api.get<{ activeMapStyleId?: string }>('/api/settings');
-            if (settings.activeMapStyleId) {
-              resolvedStyleId = settings.activeMapStyleId;
-              setActiveStyleId(resolvedStyleId);
-            }
-          } catch { /* ignore settings fetch failure */ }
-        }
-
-        // Load style data if we have a resolved ID
-        if (resolvedStyleId && data.some((s: MapStyle) => s.id === resolvedStyleId)) {
-          try {
-            setActiveStyleJson(await api.get<Record<string, unknown>>(`/api/map-styles/styles/${resolvedStyleId}/data`));
-          } catch { /* ignore style data fetch failure */ }
-        } else if (resolvedStyleId) {
-          // Saved style no longer exists, clear it
-          setActiveStyleId(null);
-          try { localStorage.removeItem('meshmonitor-activeMapStyleId'); } catch { /* ignore */ }
-        }
-      } catch (err) {
-        console.error('Failed to fetch map styles:', err);
-      }
-    };
-    void fetchMapStyles();
-  }, []);
+  // mapStyles/activeStyleId/activeStyleJson are fetched and resolved once by
+  // SettingsContext's own mount effect (issue #4348) — no local fetch needed.
 
   // Refs to access latest values without recreating listeners
   const processedNodesRef = useRef(processedNodes);
@@ -1162,18 +1190,6 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
     };
   }, [toggleFavoriteLock]);
 
-  // "Send Direct Message" (#4325). Selecting the node already opened the
-  // conversation; openDmForCompose additionally asks the DM view to focus its
-  // compose box, so the button leaves you able to type instead of on a
-  // conversation you still have to click into.
-  const handleDMClick = useCallback((node: DeviceInfo) => {
-    return (e: React.MouseEvent) => {
-      e.stopPropagation();
-      openDmForCompose(node.user?.id || '');
-      setActiveTab('messages');
-    };
-  }, [openDmForCompose, setActiveTab]);
-
   const handleCopyNodeInfoClick = useCallback((node: DeviceInfo) => {
     return (e: React.MouseEvent) => {
       e.stopPropagation();
@@ -1188,22 +1204,38 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
     };
   }, [setSelectedDMNode, setActiveTab]);
 
-  // #4326: unmessageable nodes get no DM button in the node list, and the
-  // badge that replaces it used to be an inert <span> — a genuine dead end,
-  // since the list was then offering no route at all to the node's details.
-  // The badge now reaches Node Details, matching what the map popup's "More
-  // Details" action already does for these nodes (that popup has never gated
-  // on messageability). Messaging itself stays unavailable: this uses
-  // setSelectedDMNode rather than openDmForCompose, so the compose box isn't
-  // focused, and MessagesTab independently hides the composer behind its
+  // "Open Node Details" — the NodeDetailsButton on every row, and row
+  // double-click (#4379). #4326/#4333 reached this same destination by making
+  // the unmessageable badge itself clickable; that affordance was invisible
+  // among the inert status icons and misdescribed where it went, so it now
+  // has its own labelled control on every node instead of just unmessageable
+  // ones. Matches what the map popup's "More Details" action has always done
+  // (that popup has never gated on messageability).
+  //
+  // This is also what used to be the Send-DM button. That button sat directly
+  // beside this one and went to the same place, so #4379 folded the two
+  // together rather than shipping a row with two near-identical controls.
+  // The merge has to preserve #4325: `openDmForCompose` additionally asks the
+  // DM view to focus its compose box, which is what lets you click a node and
+  // start typing instead of landing on a conversation you must click into
+  // again. It was the ONLY caller of that path, so branching here is what
+  // keeps the whole pendingComposeFocus chain alive.
+  //
+  // Unmessageable nodes take the plain `setSelectedDMNode` route: there is no
+  // composer to focus, because MessagesTab hides it behind the
   // `dmReadOnlyReason === 'unmessageable'` banner.
   const handleNodeDetailsClick = useCallback((node: DeviceInfo) => {
     return (e: React.MouseEvent) => {
       e.stopPropagation();
-      setSelectedDMNode(node.user?.id || '');
+      const nodeId = node.user?.id || '';
+      if (node.isUnmessagable) {
+        setSelectedDMNode(nodeId);
+      } else {
+        openDmForCompose(nodeId);
+      }
       setActiveTab('messages');
     };
-  }, [setSelectedDMNode, setActiveTab]);
+  }, [setSelectedDMNode, openDmForCompose, setActiveTab]);
 
   // Simple toggle callbacks
   const handleCollapseNodeList = useCallback(() => {
@@ -1527,6 +1559,17 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
   // needed. `markerRefs` itself is still populated (via each descriptor's
   // `add` event handler below) purely for App.tsx's "open popup for selected
   // node" effect and this component's `onOmsClick`.
+
+  // Zoom-to-fit-all target set (#4496). Uses the same OFFSET marker positions
+  // as the pins and the measure tool, per the #4016/#4155 single-position rule —
+  // fitting to raw centres could leave a visible pin just outside the viewport.
+  const fitAllPositions: Array<[number, number]> = React.useMemo(
+    () => nodesWithPosition
+      .map(node => nodePositions.get(node.nodeNum))
+      .filter((p): p is [number, number] => Array.isArray(p)),
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- keyed on nodePositions like measurePoints below
+    [nodePositions, nodesWithPosition.map(n => n.nodeNum).join(',')],
+  );
 
   // #3636: measurement endpoints — nearest-node snapping picks from these.
   // Use the OFFSET marker position (nodePositions), not the raw center, so the
@@ -2168,6 +2211,10 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
                   key={node.nodeNum}
                   className={`node-item ${selectedNodeId === node.user?.id ? 'selected' : ''}`}
                   onClick={handleNodeClick(node)}
+                  /* Second path to Node Details, matching MeshCore's node list
+                     (#4379). Single-click is already taken — it selects the node
+                     and centers the map on it — so double-click is the free slot. */
+                  onDoubleClick={hasPermission('messages', 'read') ? handleNodeDetailsClick(node) : undefined}
                 >
                   <div className="node-header">
                     <div className="node-name">
@@ -2203,50 +2250,60 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
                       </div>
                     </div>
                     <div className="node-actions">
-                      {node.position && node.position.latitude != null && node.position.longitude != null && (
-                        <span className="node-indicator-icon" title={t('nodes.location')}><UiIcon name="location" size={15} /></span>
-                      )}
-                      {node.viaMqtt && (
-                        <span className="node-indicator-icon" title={t('nodes.via_mqtt')}><UiIcon name="network" size={15} /></span>
-                      )}
-                      {node.isStoreForwardServer && (
-                        <span className="node-indicator-icon" title={t('nodes.store_forward_server', 'Store & Forward Server')}><UiIcon name="package" size={15} /></span>
-                      )}
-                      {node.user?.id && nodesWithTelemetry.has(node.user.id) && (
-                        <span className="node-indicator-icon" title={t('nodes.has_telemetry')}><UiIcon name="telemetry" size={15} /></span>
-                      )}
-                      {node.user?.id && nodesWithWeatherTelemetry.has(node.user.id) && (
-                        <span className="node-indicator-icon" title={t('nodes.has_weather')}><UiIcon name="weather" size={15} /></span>
-                      )}
-                      {node.user?.id && nodesWithPKC.has(node.user.id) && (
-                        <span className="node-indicator-icon" title={t('nodes.has_pkc')}><UiIcon name="encryptedKey" size={15} /></span>
-                      )}
-                      {node.hasRemoteAdmin && (
-                        <span className="node-indicator-icon" title={t('nodes.has_remote_admin')}><UiIcon name="wrench" size={15} /></span>
-                      )}
-                      {hasPermission('messages', 'read') && !node.isUnmessagable && (
-                        <button
-                          className="dm-icon"
-                          title={t('nodes.send_dm')}
-                          onClick={handleDMClick(node)}
-                        >
-                          <UiIcon name="messages" size={16} />
-                        </button>
-                      )}
-                      {hasPermission('messages', 'read') && node.isUnmessagable && (
-                        <NodeUnmessageableBadge onOpenDetails={handleNodeDetailsClick(node)} />
-                      )}
-                      {!isNodeComplete(node) && hasPermission('nodes', 'write') && (
-                        <button
-                          className="dm-icon"
-                          title={t('nodes.copy_nodeinfo')}
-                          onClick={handleCopyNodeInfoClick(node)}
-                        >
-                          <UiIcon name="copy" size={16} />
-                        </button>
-                      )}
-                      {(node.keyIsLowEntropy || node.duplicateKeyDetected || node.keySecurityIssueDetails) && (
-                        hasPermission('security', 'write') ? (
+                      {/* #4379: inert status icons and interactive controls used to
+                          share one undifferentiated strip, so nothing signalled which
+                          of them you could click. They are now two groups with a rule
+                          between them — facts on the left, actions on the right. */}
+                      <span className={nodeRowStyles.indicators}>
+                        {node.position && node.position.latitude != null && node.position.longitude != null && (
+                          <span className="node-indicator-icon" title={t('nodes.location')}><UiIcon name="location" size={15} /></span>
+                        )}
+                        {node.viaMqtt && (
+                          <span className="node-indicator-icon" title={t('nodes.via_mqtt')}><UiIcon name="network" size={15} /></span>
+                        )}
+                        {node.isStoreForwardServer && (
+                          <span className="node-indicator-icon" title={t('nodes.store_forward_server', 'Store & Forward Server')}><UiIcon name="package" size={15} /></span>
+                        )}
+                        {node.user?.id && nodesWithTelemetry.has(node.user.id) && (
+                          <span className="node-indicator-icon" title={t('nodes.has_telemetry')}><UiIcon name="telemetry" size={15} /></span>
+                        )}
+                        {node.user?.id && nodesWithWeatherTelemetry.has(node.user.id) && (
+                          <span className="node-indicator-icon" title={t('nodes.has_weather')}><UiIcon name="weather" size={15} /></span>
+                        )}
+                        {node.user?.id && nodesWithPKC.has(node.user.id) && (
+                          <span className="node-indicator-icon" title={t('nodes.has_pkc')}><UiIcon name="encryptedKey" size={15} /></span>
+                        )}
+                        {node.hasRemoteAdmin && (
+                          <span className="node-indicator-icon" title={t('nodes.has_remote_admin')}><UiIcon name="wrench" size={15} /></span>
+                        )}
+                        {node.isUnmessagable && <NodeUnmessageableBadge />}
+                        {/* The read-only half of the security warning. Its clickable
+                            twin lives in the action group below. */}
+                        {(node.keyIsLowEntropy || node.duplicateKeyDetected || node.keySecurityIssueDetails) && !hasPermission('security', 'write') && (
+                          <span
+                            className="security-warning-icon"
+                            title={node.keySecurityIssueDetails || t('nodes.security_risk_generic', 'Key security issue detected')}
+                            style={{
+                              fontSize: '16px',
+                              color: '#f44336',
+                              cursor: 'help'
+                            }}
+                          >
+                            <UiIcon name={node.keyMismatchDetected ? 'unlock' : 'alert'} size={16} />
+                          </span>
+                        )}
+                      </span>
+                      <span className={nodeRowStyles.actions}>
+                        {!isNodeComplete(node) && hasPermission('nodes', 'write') && (
+                          <button
+                            className="dm-icon"
+                            title={t('nodes.copy_nodeinfo')}
+                            onClick={handleCopyNodeInfoClick(node)}
+                          >
+                            <UiIcon name="copy" size={16} />
+                          </button>
+                        )}
+                        {(node.keyIsLowEntropy || node.duplicateKeyDetected || node.keySecurityIssueDetails) && hasPermission('security', 'write') && (
                           <button
                             className="security-warning-icon"
                             title={t(
@@ -2267,7 +2324,6 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
                             style={{
                               fontSize: '16px',
                               color: '#f44336',
-                              marginLeft: '4px',
                               background: 'none',
                               border: 'none',
                               padding: 0,
@@ -2277,21 +2333,19 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
                           >
                             <UiIcon name={node.keyMismatchDetected ? 'unlock' : 'alert'} size={16} />
                           </button>
-                        ) : (
-                          <span
-                            className="security-warning-icon"
-                            title={node.keySecurityIssueDetails || t('nodes.security_risk_generic', 'Key security issue detected')}
-                            style={{
-                              fontSize: '16px',
-                              color: '#f44336',
-                              marginLeft: '4px',
-                              cursor: 'help'
-                            }}
-                          >
-                            <UiIcon name={node.keyMismatchDetected ? 'unlock' : 'alert'} size={16} />
-                          </span>
-                        )
-                      )}
+                        )}
+                        {/* Every node gets this, messageable or not — #4379 asks for
+                            one consistent route to Node Details rather than an
+                            affordance that only appears on unmessageable rows. It
+                            also replaces the Send-DM button that used to sit right
+                            here: two adjacent controls going to the same place was
+                            the redundancy #4379 set out to remove. It stays gated
+                            on messages:read because Node Details still lives inside
+                            the Messages tab. */}
+                        {hasPermission('messages', 'read') && (
+                          <NodeDetailsButton onOpenDetails={handleNodeDetailsClick(node)} />
+                        )}
+                      </span>
                       <div className="node-short">
                         {node.user?.shortName || '-'}
                       </div>
@@ -2413,6 +2467,23 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
                 <div className="map-controls-title">
                   Features
                 </div>
+                {/* Zoom to fit all nodes (#4496). Sits in the header so it stays
+                    reachable when the panel is collapsed — the whole point is a
+                    one-tap re-frame, which a click-to-expand-first would spoil. */}
+                <button
+                  className="map-controls-fit-btn"
+                  onClick={() => setFitAllRequest(n => n + 1)}
+                  disabled={fitAllPositions.length === 0}
+                  title={
+                    fitAllPositions.length === 0
+                      ? 'No positioned nodes to zoom to'
+                      : `Zoom to fit all ${fitAllPositions.length} positioned nodes`
+                  }
+                  aria-label="Zoom to fit all nodes"
+                  onMouseDown={(e) => e.stopPropagation()}
+                >
+                  <UiIcon name="target" size={16} />
+                </button>
                 <button
                   className="map-controls-collapse-btn"
                   onClick={handleCollapseMapControls}
@@ -2690,28 +2761,9 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
                         Map Style
                         <select
                           value={activeStyleId ?? ''}
-                          onChange={async (e) => {
+                          onChange={(e) => {
                             const styleId = e.target.value || null;
-                            setActiveStyleId(styleId);
-                            try { localStorage.setItem('meshmonitor-activeMapStyleId', styleId ?? ''); } catch { /* ignore */ }
-                            // Save as server default so incognito/new browsers get this style
-                            void api.getBaseUrl().then(baseUrl => {
-                              csrfFetch(`${baseUrl}/api/settings`, {
-                                method: 'POST',
-                                headers: { 'Content-Type': 'application/json' },
-                                body: JSON.stringify({ activeMapStyleId: styleId ?? '' }),
-                              }).catch(err => console.error('Failed to save map style setting:', err));
-                            });
-                            if (styleId) {
-                              try {
-                                const data = await api.get<Record<string, unknown>>(`/api/map-styles/styles/${styleId}/data`);
-                                setActiveStyleJson(data);
-                              } catch (err) {
-                                console.error('Failed to fetch map style data:', err);
-                              }
-                            } else {
-                              setActiveStyleJson(null);
-                            }
+                            void setActiveMapStyleId(styleId);
                           }}
                           style={{ padding: '2px 6px', border: '1px solid var(--border-color, #ccc)', borderRadius: '3px', background: 'var(--input-bg, #fff)', color: 'var(--text-color, #000)' }}
                         >
@@ -2785,6 +2837,7 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
                 targetZoom={mapCenterTargetZoom}
               />
               <TracerouteBoundsController bounds={tracerouteBounds} />
+              <FitAllNodesController request={fitAllRequest} positions={fitAllPositions} />
               <ZoomHandler onZoomChange={setMapZoom} />
               <MapPositionHandler />
               <WaypointMapEventBridge
@@ -2941,6 +2994,7 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
       <WaypointEditorModal
         isOpen={waypointEditorOpen}
         initial={waypointEditorInitial}
+        channels={sourceChannels}
         defaultCoords={waypointDefaultCoords}
         selfNodeNum={localNodeNum ?? null}
         onClose={() => setWaypointEditorOpen(false)}

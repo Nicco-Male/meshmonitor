@@ -7,7 +7,7 @@
  * but not between messages sent on the same day.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { render, screen, fireEvent, waitFor } from '@testing-library/react';
+import { render, screen, fireEvent, waitFor, act } from '@testing-library/react';
 
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
@@ -227,6 +227,183 @@ describe('MeshCoreMessageStream entry scroll (#3810)', () => {
   });
 });
 
+describe('MeshCoreMessageStream load older (#4460)', () => {
+  let scrollHeightValue = 0;
+
+  beforeEach(() => {
+    // Run rAF callbacks synchronously so the scroll-restore effect commits
+    // during the test instead of on a later animation frame.
+    vi.stubGlobal('requestAnimationFrame', (cb: (time: number) => void) => {
+      cb(0);
+      return 0;
+    });
+    scrollHeightValue = 300;
+    Object.defineProperty(HTMLElement.prototype, 'scrollHeight', {
+      configurable: true,
+      get() { return scrollHeightValue; },
+    });
+    Object.defineProperty(HTMLElement.prototype, 'clientHeight', {
+      configurable: true,
+      get() { return 200; },
+    });
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    delete (HTMLElement.prototype as { scrollHeight?: number }).scrollHeight;
+    delete (HTMLElement.prototype as { clientHeight?: number }).clientHeight;
+  });
+
+  const twoMessages = () => [
+    msg('b', 2000, 'second'),
+    msg('c', 3000, 'third'),
+  ];
+
+  it('calls onLoadOlder when scrolled near the top and an older page exists', () => {
+    const onLoadOlder = vi.fn();
+    const { container } = render(
+      <MeshCoreMessageStream
+        messages={twoMessages()}
+        conversationKey="channel-0"
+        onSend={async () => true}
+        onLoadOlder={onLoadOlder}
+        hasMoreOlder
+      />,
+    );
+    const list = container.querySelector('.meshcore-message-list') as HTMLElement;
+    list.scrollTop = 10;
+    fireEvent.scroll(list);
+    expect(onLoadOlder).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not call onLoadOlder when there is no older page', () => {
+    const onLoadOlder = vi.fn();
+    const { container } = render(
+      <MeshCoreMessageStream
+        messages={twoMessages()}
+        conversationKey="channel-0"
+        onSend={async () => true}
+        onLoadOlder={onLoadOlder}
+        hasMoreOlder={false}
+      />,
+    );
+    const list = container.querySelector('.meshcore-message-list') as HTMLElement;
+    list.scrollTop = 10;
+    fireEvent.scroll(list);
+    expect(onLoadOlder).not.toHaveBeenCalled();
+  });
+
+  it('does not call onLoadOlder while a load is already in flight', () => {
+    const onLoadOlder = vi.fn();
+    const { container } = render(
+      <MeshCoreMessageStream
+        messages={twoMessages()}
+        conversationKey="channel-0"
+        onSend={async () => true}
+        onLoadOlder={onLoadOlder}
+        hasMoreOlder
+        loadingOlder
+      />,
+    );
+    const list = container.querySelector('.meshcore-message-list') as HTMLElement;
+    list.scrollTop = 10;
+    fireEvent.scroll(list);
+    expect(onLoadOlder).not.toHaveBeenCalled();
+  });
+
+  it('does not call onLoadOlder when not scrolled near the top', () => {
+    const onLoadOlder = vi.fn();
+    const { container } = render(
+      <MeshCoreMessageStream
+        messages={twoMessages()}
+        conversationKey="channel-0"
+        onSend={async () => true}
+        onLoadOlder={onLoadOlder}
+        hasMoreOlder
+      />,
+    );
+    const list = container.querySelector('.meshcore-message-list') as HTMLElement;
+    list.scrollTop = 150;
+    fireEvent.scroll(list);
+    expect(onLoadOlder).not.toHaveBeenCalled();
+  });
+
+  it('restores the viewport to the same content once older messages are prepended', () => {
+    const onLoadOlder = vi.fn();
+    const { container, rerender } = render(
+      <MeshCoreMessageStream
+        messages={twoMessages()}
+        conversationKey="channel-0"
+        onSend={async () => true}
+        onLoadOlder={onLoadOlder}
+        hasMoreOlder
+        loadingOlder={false}
+      />,
+    );
+    const list = container.querySelector('.meshcore-message-list') as HTMLElement;
+    list.scrollTop = 10;
+    fireEvent.scroll(list);
+    expect(onLoadOlder).toHaveBeenCalledTimes(1);
+
+    // Simulate the fetch resolving: the parent prepends an older message
+    // (growing scrollHeight by 80px of new content) and flips loadingOlder
+    // back to false.
+    scrollHeightValue = 380;
+    rerender(
+      <MeshCoreMessageStream
+        messages={[msg('a', 1000, 'first'), ...twoMessages()]}
+        conversationKey="channel-0"
+        onSend={async () => true}
+        onLoadOlder={onLoadOlder}
+        hasMoreOlder={false}
+        loadingOlder={false}
+      />,
+    );
+
+    // newScrollTop = scrollHeightAfter(380) - scrollHeightBefore(300) + scrollTopBefore(10)
+    expect(list.scrollTop).toBe(90);
+  });
+
+  it('discards a pending restore when the conversation changes mid-load', () => {
+    const onLoadOlder = vi.fn();
+    const { container, rerender } = render(
+      <MeshCoreMessageStream
+        messages={twoMessages()}
+        conversationKey="channel-0"
+        onSend={async () => true}
+        onLoadOlder={onLoadOlder}
+        hasMoreOlder
+        loadingOlder={false}
+      />,
+    );
+    const list = container.querySelector('.meshcore-message-list') as HTMLElement;
+    list.scrollTop = 10;
+    fireEvent.scroll(list);
+    expect(onLoadOlder).toHaveBeenCalledTimes(1);
+
+    // The operator switches channels before that load settles. The parent
+    // resets its load-older state on a channel switch, so the request never
+    // resolves back into this component — the captured metrics are now stale.
+    scrollHeightValue = 380;
+    rerender(
+      <MeshCoreMessageStream
+        messages={[msg('x', 5000, 'other channel'), msg('y', 6000, 'other channel 2')]}
+        conversationKey="channel-1"
+        onSend={async () => true}
+        onLoadOlder={onLoadOlder}
+        hasMoreOlder={false}
+        loadingOlder={false}
+      />,
+    );
+
+    // The new conversation must land at the bottom via the entry scroll (380),
+    // NOT at 380 - 300 + 10 = 90, which is what channel-0's abandoned snapshot
+    // would produce if the restore ref survived the conversation change.
+    expect(list.scrollTop).toBe(380);
+    expect(list.scrollTop).not.toBe(90);
+  });
+});
+
 describe('MeshCoreMessageStream focus restore (#3823)', () => {
   it('returns focus to the input after a send resolves', async () => {
     // Controllable send so we can observe the disabled→enabled transition.
@@ -292,5 +469,187 @@ describe('MeshCoreMessageStream route-detail popup', () => {
       <MeshCoreMessageStream messages={[message]} onSend={async () => true} />,
     );
     expect(container.querySelector('.mc-route-chain-link')).toBeNull();
+  });
+});
+
+/**
+ * Regression: the mobile two-pane layout mounts the conversation but hides it
+ * until the operator drills in from the channel/peer list. Measured on the
+ * running app in that state: scrollHeight 0, clientHeight 0, offsetParent null.
+ * The entry scroll fired there, `scrollTop = scrollHeight` was `0 = 0` (a silent
+ * no-op), and the one shot was spent — so drilling in left the view pinned at
+ * the top of a 17,000px backlog with nothing left to re-trigger it.
+ */
+describe('MeshCoreMessageStream entry scroll on a hidden pane (#4473 follow-up)', () => {
+  let resizeCallbacks: Array<() => void>;
+  let scrollHeightValue: number;
+
+  beforeEach(() => {
+    vi.stubGlobal('requestAnimationFrame', (cb: (time: number) => void) => { cb(0); return 0; });
+    resizeCallbacks = [];
+    scrollHeightValue = 0; // hidden: no layout
+    vi.stubGlobal('ResizeObserver', class {
+      constructor(cb: () => void) { resizeCallbacks.push(cb); }
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    });
+    Object.defineProperty(HTMLElement.prototype, 'scrollHeight', {
+      configurable: true,
+      get() { return scrollHeightValue; },
+    });
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    delete (HTMLElement.prototype as { scrollHeight?: number }).scrollHeight;
+  });
+
+  const msgs = () => {
+    const now = Date.now();
+    return [msg('a', now - 2000, 'first'), msg('b', now - 1000, 'second')];
+  };
+
+  it('defers the entry scroll while the pane is hidden, then runs it on reveal', () => {
+    const { container } = render(
+      <MeshCoreMessageStream
+        messages={msgs()}
+        conversationKey="channel-0"
+        onSend={async () => true}
+      />,
+    );
+    const list = container.querySelector('.meshcore-message-list') as HTMLElement;
+    // Hidden — the shot must NOT be spent.
+    expect(list.scrollTop).toBe(0);
+
+    // Operator drills in: the pane gains layout and the observer fires.
+    scrollHeightValue = 900;
+    act(() => { resizeCallbacks.forEach(cb => cb()); });
+
+    expect(list.scrollTop).toBe(900);
+  });
+
+  it('does not spend the entry scroll on an EMPTY list that has layout', () => {
+    // The empty state ("No messages on this channel yet") is itself laid out,
+    // so the container has a real height before any message arrives. The
+    // observer used to fire there, scroll to the bottom of the placeholder,
+    // trivially succeed, and burn the one shot — leaving the view at the top
+    // once the backlog landed.
+    //
+    // Seen on the anonymous read-only view, where the absent compose box shifts
+    // render timing enough to expose it (list went 1 child -> 203 in one step,
+    // scrollTop stuck at 0 over a 16,000px history).
+    const { container, rerender } = render(
+      <MeshCoreMessageStream
+        messages={[]}
+        conversationKey="channel-0"
+        onSend={async () => true}
+      />,
+    );
+    const list = container.querySelector('.meshcore-message-list') as HTMLElement;
+
+    // Empty, but laid out — this must NOT consume the shot.
+    scrollHeightValue = 741;
+    act(() => { resizeCallbacks.forEach(cb => cb()); });
+    expect(list.scrollTop).toBe(0);
+
+    // Backlog arrives and the list grows: the shot must still be available.
+    scrollHeightValue = 16148;
+    rerender(
+      <MeshCoreMessageStream
+        messages={msgs()}
+        conversationKey="channel-0"
+        onSend={async () => true}
+      />,
+    );
+    act(() => { resizeCallbacks.forEach(cb => cb()); });
+
+    expect(list.scrollTop).toBe(16148);
+  });
+
+  it('does not re-scroll on later resizes once the entry scroll has run', () => {
+    const { container } = render(
+      <MeshCoreMessageStream
+        messages={msgs()}
+        conversationKey="channel-0"
+        onSend={async () => true}
+      />,
+    );
+    const list = container.querySelector('.meshcore-message-list') as HTMLElement;
+
+    scrollHeightValue = 900;
+    act(() => { resizeCallbacks.forEach(cb => cb()); });
+    expect(list.scrollTop).toBe(900);
+
+    // User scrolls up to read history; a later resize (keyboard, rotate) must
+    // not yank them back to the bottom.
+    list.scrollTop = 120;
+    scrollHeightValue = 1400;
+    act(() => { resizeCallbacks.forEach(cb => cb()); });
+    expect(list.scrollTop).toBe(120);
+  });
+});
+
+/**
+ * #4504 — a directly-received message showed nothing but the word "direct".
+ * SNR is the only thing left that says anything about the link.
+ */
+describe('MeshCoreMessageStream direct-message signal (#4504)', () => {
+  const now = Date.now();
+
+  it('shows SNR on a directly-received message', () => {
+    render(
+      <MeshCoreMessageStream
+        messages={[{ ...msg('a', now, 'hello'), hopCount: 0, snr: 7.25 }]}
+        conversationKey="channel-0"
+        onSend={async () => true}
+      />,
+    );
+    expect(screen.getByText(/SNR 7\.3 dB/)).toBeTruthy();
+  });
+
+  it('adds RSSI only when the message actually carries it', () => {
+    const { container, rerender } = render(
+      <MeshCoreMessageStream
+        messages={[{ ...msg('a', now, 'hello'), hopCount: 0, snr: 5 }]}
+        conversationKey="channel-0"
+        onSend={async () => true}
+      />,
+    );
+    // MeshCore's message push carries SNR but no RSSI, so this is the normal case.
+    expect(container.textContent).not.toMatch(/RSSI/);
+
+    rerender(
+      <MeshCoreMessageStream
+        messages={[{ ...msg('a', now, 'hello'), hopCount: 0, snr: 5, rssi: -92 }]}
+        conversationKey="channel-0"
+        onSend={async () => true}
+      />,
+    );
+    expect(container.textContent).toMatch(/RSSI -92 dBm/);
+  });
+
+  it('does NOT show signal on a relayed message — it would misattribute the link', () => {
+    // On a multi-hop message these values describe the hop from the LAST
+    // repeater, not from the sender whose name sits beside them.
+    const { container } = render(
+      <MeshCoreMessageStream
+        messages={[{ ...msg('a', now, 'hello'), hopCount: 2, routePath: 'a3,7f', snr: 7 }]}
+        conversationKey="channel-0"
+        onSend={async () => true}
+      />,
+    );
+    expect(container.textContent).not.toMatch(/SNR/);
+  });
+
+  it('still renders "direct" when the message carries no SNR at all', () => {
+    render(
+      <MeshCoreMessageStream
+        messages={[{ ...msg('a', now, 'hello'), hopCount: 0 }]}
+        conversationKey="channel-0"
+        onSend={async () => true}
+      />,
+    );
+    expect(screen.getByText(/direct/)).toBeTruthy();
   });
 });

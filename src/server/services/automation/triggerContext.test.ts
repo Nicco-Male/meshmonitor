@@ -6,6 +6,7 @@ import {
   buildTelemetryContext,
   buildSystemContext,
   buildScheduleContext,
+  buildGeofenceContext,
   deriveHops,
   messageMatchesFilter,
   meshCoreMessageMatchesFilter,
@@ -14,7 +15,9 @@ import {
   messageFilterChannelNames,
   messageFilterUsesChannelName,
   resolveTriggerPath,
+  subjectKeyOf,
   BROADCAST_ADDR,
+  type TriggerContext,
 } from './triggerContext.js';
 import type { DbMessage } from '../../../services/database.js';
 import type { MeshCoreMessage } from '../../meshcoreManager.js';
@@ -106,6 +109,27 @@ describe('buildMessageContext', () => {
     expect(buildMessageContext(msg(), 'default', 1).fields.senderLabel).toBe('!0000006f');
     expect(buildMessageContext(msg(), 'default', 1).fields.protocol).toBe('meshtastic');
   });
+
+  // hopEmoji (#4340)
+  it('sets hopEmoji from the derived hop count', () => {
+    const ctx = buildMessageContext(msg({ hopStart: 3, hopLimit: 1 }), 'default', 1);
+    expect(ctx.fields.hops).toBe(2);
+    expect(ctx.fields.hopEmoji).toBe('2️⃣');
+  });
+
+  it('hopEmoji is undefined when hopStart/hopLimit are absent (unknown hops)', () => {
+    const ctx = buildMessageContext(msg({ hopStart: undefined, hopLimit: undefined }), 'default', 1);
+    expect(ctx.fields.hops).toBeUndefined();
+    expect(ctx.fields.hopEmoji).toBeUndefined();
+  });
+
+  it('documented divergence: a negative derived hop count clamps hopEmoji to *️⃣ while `hops` stays negative', () => {
+    // deriveHops has no hopStart >= hopLimit guard (unlike AutoAck's hopsTraveled) —
+    // this is deliberate, see §4.3 of the hop-tapback spec. Do NOT "fix" deriveHops.
+    const ctx = buildMessageContext(msg({ hopStart: 1, hopLimit: 3 }), 'default', 1);
+    expect(ctx.fields.hops).toBe(-2);
+    expect(ctx.fields.hopEmoji).toBe('*️⃣');
+  });
 });
 
 describe('other trigger contexts', () => {
@@ -133,6 +157,48 @@ describe('other trigger contexts', () => {
     expect(ctx.subjectNodeNum).toBeNull();
     expect(ctx.fields.timestamp).toBe(1234);
   });
+
+  // #4340 Phase 2: every Meshtastic-side builder leaves subjectNodeKey undefined
+  // — subjectKeyOf() then derives it from subjectNodeNum.
+  it('every Meshtastic builder leaves subjectNodeKey undefined', () => {
+    expect(buildMessageContext(msg(), 'default', 1).subjectNodeKey).toBeUndefined();
+    expect(buildNodeContext('trigger.nodeUpdated', 999, [], 'default', 5).subjectNodeKey).toBeUndefined();
+    expect(buildTelemetryContext(7, 'batteryLevel', 18, '%', 'default', 5).subjectNodeKey).toBeUndefined();
+    expect(buildSystemContext('bootup', null, null, undefined, 5).subjectNodeKey).toBeUndefined();
+    expect(buildScheduleContext(null, 1234).subjectNodeKey).toBeUndefined();
+    expect(buildGeofenceContext(5, 'enter', 0, 0, 1, 'default', 5).subjectNodeKey).toBeUndefined();
+  });
+});
+
+describe('subjectKeyOf (#4340 Phase 2)', () => {
+  it('derives from subjectNodeNum for a Meshtastic message context', () => {
+    const ctx = buildMessageContext(msg(), 'default', 1234);
+    expect(subjectKeyOf(ctx)).toBe('111');
+  });
+
+  it('is null for a schedule context (no subject node)', () => {
+    const ctx = buildScheduleContext(null, 1234);
+    expect(subjectKeyOf(ctx)).toBeNull();
+  });
+
+  it('is the stringified nodeNum for a system context that carries one, null otherwise', () => {
+    const withNode = buildSystemContext('source-connected', 'default', 42, undefined, 5);
+    expect(subjectKeyOf(withNode)).toBe('42');
+    const withoutNode = buildSystemContext('bootup', null, null, undefined, 5);
+    expect(subjectKeyOf(withoutNode)).toBeNull();
+  });
+
+  it('an explicit subjectNodeKey: null wins over a non-null subjectNodeNum', () => {
+    const ctx: TriggerContext = {
+      triggerType: 'trigger.message',
+      sourceId: 'default',
+      subjectNodeNum: 111,
+      subjectNodeKey: null,
+      timestamp: 1,
+      fields: {},
+    };
+    expect(subjectKeyOf(ctx)).toBeNull();
+  });
 });
 
 describe('messageMatchesFilter', () => {
@@ -146,6 +212,22 @@ describe('messageMatchesFilter', () => {
     expect(messageMatchesFilter(msg(), { from: 999 })).toBe(false);
     expect(messageMatchesFilter(msg(), { channel: 2 })).toBe(false);
   });
+  it('matches regex case-SENSITIVELY, unlike textContains (#4507 follow-up)', () => {
+    // These two fields sit next to each other in the trigger form and disagree
+    // about casing. The regex field's help text now says so; this pins the
+    // behaviour that claim rests on.
+    expect(messageMatchesFilter(msg({ text: 'PING' }), { textContains: 'ping' })).toBe(true);
+    expect(messageMatchesFilter(msg({ text: 'PING' }), { regex: '^(test|ping)' })).toBe(false);
+  });
+
+  it('honours an inline (?i) flag on the trigger regex (#4507 follow-up)', () => {
+    // Only true because the engine compiles with RE2 (src/utils/safeRegex.ts);
+    // stock JS RegExp rejects inline flags outright. If the engine is ever
+    // swapped, this fails and the help text stops being true.
+    expect(messageMatchesFilter(msg({ text: 'PING' }), { regex: '(?i)^(test|ping)' })).toBe(true);
+    expect(messageMatchesFilter(msg({ text: 'pong' }), { regex: '(?i)^(test|ping)' })).toBe(false);
+  });
+
   it('matches textContains case-insensitively', () => {
     expect(messageMatchesFilter(msg({ text: 'PING me' }), { textContains: 'ping' })).toBe(true);
     expect(messageMatchesFilter(msg({ text: 'hello' }), { textContains: 'ping' })).toBe(false);
@@ -176,8 +258,8 @@ describe('multi-channel trigger filter (#3974)', () => {
     it('extracts non-empty names from the channels array', () => {
       expect(messageFilterChannelNames({ channels: chans('gauntlet', 'ops') })).toEqual(['gauntlet', 'ops']);
     });
-    it('drops blank names and ignores non-object entries', () => {
-      expect(messageFilterChannelNames({ channels: [{ name: '' }, { name: 'ops' }, 'x', null, {}] })).toEqual(['ops']);
+    it('keeps a blank name (the Primary/unnamed-slot-0 marker, #4507) but drops non-object entries', () => {
+      expect(messageFilterChannelNames({ channels: [{ name: '' }, { name: 'ops' }, 'x', null, {}] })).toEqual(['', 'ops']);
     });
     it('returns [] when channels is absent or not an array', () => {
       expect(messageFilterChannelNames({})).toEqual([]);
@@ -192,10 +274,12 @@ describe('multi-channel trigger filter (#3974)', () => {
     it('is true for a populated channels array', () => {
       expect(messageFilterUsesChannelName({ channels: chans('gauntlet') })).toBe(true);
     });
-    it('is false when neither is set / all blank', () => {
+    it('is false when neither is set', () => {
       expect(messageFilterUsesChannelName({})).toBe(false);
       expect(messageFilterUsesChannelName({ channelName: '' })).toBe(false);
-      expect(messageFilterUsesChannelName({ channels: [{ name: '' }] })).toBe(false);
+    });
+    it('is true for a Primary-only selection (a blank-name entry, #4507)', () => {
+      expect(messageFilterUsesChannelName({ channels: [{ name: '' }] })).toBe(true);
     });
   });
 
@@ -227,6 +311,12 @@ describe('multi-channel trigger filter (#3974)', () => {
       expect(messageMatchesFilter(msg({ text: 'ping' }), { channels: chans('ops'), textContains: 'ping' }, 'Ops')).toBe(true);
       expect(messageMatchesFilter(msg({ text: 'pong' }), { channels: chans('ops'), textContains: 'ping' }, 'Ops')).toBe(false);
     });
+    it('fires on the Primary/unnamed slot-0 channel when its blank name is selected (#4507)', () => {
+      const withPrimary = [...chans('ops'), { name: '', protocol: 'meshtastic' }];
+      expect(messageMatchesFilter(msg(), { channels: withPrimary }, '')).toBe(true);
+      // Selecting only Primary must not fall through to "no filter" and match every channel.
+      expect(messageMatchesFilter(msg(), { channels: [{ name: '', protocol: 'meshtastic' }] }, 'gauntlet')).toBe(false);
+    });
   });
 
   describe('meshCoreMessageMatchesFilter OR-list (MeshCore)', () => {
@@ -247,6 +337,10 @@ describe('multi-channel trigger filter (#3974)', () => {
     it('Meshtastic-only filters (from/to/portnum) still force a non-match', () => {
       expect(meshCoreMessageMatchesFilter(mcMsg({ fromPublicKey: 'channel-1' }), { channels: chans('ops'), from: 5 }, 'Ops')).toBe(false);
     });
+    it('fires on the Primary/unnamed channel when its blank name is selected (#4507)', () => {
+      const withPrimary = [...chans('ops'), { name: '', protocol: 'meshcore' }];
+      expect(meshCoreMessageMatchesFilter(mcMsg({ fromPublicKey: 'channel-1' }), { channels: withPrimary }, '')).toBe(true);
+    });
   });
 
   describe('describeMessageFilterMiss / describeMeshCoreFilterMiss OR-list reasons', () => {
@@ -263,6 +357,10 @@ describe('multi-channel trigger filter (#3974)', () => {
       expect(describeMeshCoreFilterMiss(mcMsg({ fromPublicKey: 'channel-1' }), { channels: chans('ops') }, 'Primary'))
         .toBe('channel name "Primary" not in [ops]');
     });
+    it('returns undefined when a blank resolved name matches a selected Primary entry (#4507)', () => {
+      const withPrimary = [...chans('gauntlet'), { name: '', protocol: 'meshtastic' }];
+      expect(describeMessageFilterMiss(msg(), { channels: withPrimary }, '')).toBeUndefined();
+    });
   });
 });
 
@@ -275,6 +373,9 @@ describe('buildMeshCoreMessageContext (#3833)', () => {
     );
     expect(ctx.triggerType).toBe('trigger.message');
     expect(ctx.subjectNodeNum).toBeNull();
+    // #4340 Phase 2: a channel post's fromPublicKey is the synthetic channel-<idx>
+    // slot key SHARED by every sender — cooldown must degrade, not key off it.
+    expect(ctx.subjectNodeKey).toBeNull();
     expect(ctx.fields.channel).toBe(3);
     expect(ctx.fields.isBroadcast).toBe(true);
     expect(ctx.fields.isDM).toBe(false);
@@ -284,6 +385,13 @@ describe('buildMeshCoreMessageContext (#3833)', () => {
     expect(ctx.fields.scopeName).toBe('paris');
     expect(ctx.fields.scoped).toBe(true);
     expect(ctx.fields.hops).toBe(2);
+    expect(ctx.fields.hopEmoji).toBe('2️⃣'); // #4340
+  });
+
+  it('hopEmoji is undefined when msg.hopCount is absent (#4340)', () => {
+    const ctx = buildMeshCoreMessageContext(mcMsg({ fromPublicKey: 'aabbcc' }), 'default', 1);
+    expect(ctx.fields.hops).toBeUndefined();
+    expect(ctx.fields.hopEmoji).toBeUndefined();
   });
 
   it('maps a DM: recipient pubkey present, no channel, isDM', () => {
@@ -298,6 +406,8 @@ describe('buildMeshCoreMessageContext (#3833)', () => {
     expect(ctx.fields.from).toBe('aabbcc');
     // scopeCode 0 = explicitly unscoped → not "scoped"
     expect(ctx.fields.scoped).toBe(false);
+    // #4340 Phase 2: a DM carries the real sender pubkey as its cooldown key.
+    expect(ctx.subjectNodeKey).toBe('aabbcc');
   });
 
   it('a room post is neither DM nor broadcast and has no channel', () => {
@@ -309,6 +419,8 @@ describe('buildMeshCoreMessageContext (#3833)', () => {
     expect(ctx.fields.channel).toBeUndefined();
     expect(ctx.fields.isDM).toBe(false);
     expect(ctx.fields.isBroadcast).toBe(false);
+    // #4340 Phase 2: a room post's author pubkey is a real per-sender identity.
+    expect(ctx.subjectNodeKey).toBe('authorkey');
   });
 
   // Universal cross-protocol tokens (#3978)

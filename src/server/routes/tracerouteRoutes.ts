@@ -2,7 +2,12 @@ import { Router, Request, Response } from 'express';
 import { requirePermission } from '../auth/authMiddleware.js';
 import databaseService from '../../services/database.js';
 import { ALL_SOURCES } from '../../db/repositories/index.js';
+import { isMqttSourceType } from '../../db/repositories/sources.js';
 import { logger } from '../../utils/logger.js';
+import { ok, fail } from '../utils/apiResponse.js';
+import { maskTraceroutesByChannel } from '../utils/nodeEnhancer.js';
+import { hasRouteData, parseHopArray } from '../../utils/tracerouteSegments.js';
+import { getMaxNodeAgeHours } from '../services/nodeDisplaySettings.js';
 
 const router = Router();
 
@@ -11,18 +16,19 @@ router.get('/recent', async (req: Request, res: Response) => {
     const hoursParam = req.query.hours ? parseInt(req.query.hours as string) : 24;
     const cutoffTime = Date.now() - hoursParam * 60 * 60 * 1000;
 
+    const recentSourceId = typeof req.query.sourceId === 'string' ? req.query.sourceId : undefined;
+
     let limit: number;
     if (req.query.limit) {
       limit = parseInt(req.query.limit as string);
     } else {
       const tracerouteIntervalMinutes = parseInt(await databaseService.settings.getSetting('tracerouteIntervalMinutes') || '5');
-      const maxNodeAgeHours = parseInt(await databaseService.settings.getSetting('maxNodeAgeHours') || '24');
+      const maxNodeAgeHours = await getMaxNodeAgeHours(databaseService.settings, recentSourceId ?? null);
       const traceroutesPerHour = tracerouteIntervalMinutes > 0 ? 60 / tracerouteIntervalMinutes : 12;
       limit = Math.ceil(traceroutesPerHour * maxNodeAgeHours * 1.1);
       limit = Math.max(limit, 100);
     }
 
-    const recentSourceId = typeof req.query.sourceId === 'string' ? req.query.sourceId : undefined;
     const allTraceroutes = await databaseService.traceroutes.getAllTraceroutes(limit, recentSourceId ?? ALL_SOURCES); // intentional cross-source when sourceId omitted
 
     const recentTraceroutes = allTraceroutes.filter(tr => tr.timestamp >= cutoffTime);
@@ -94,5 +100,107 @@ router.get('/history/:fromNodeNum/:toNodeNum', requirePermission('traceroute', '
     res.status(500).json({ error: 'Failed to fetch traceroute history' });
   }
 });
+
+// GET /api/traceroutes/participation/:nodeNum?sourceId=…&hours=168&limit=100
+//
+// Stored traceroutes on ONE source that this node took part in. What counts as
+// "took part" depends on the source's type:
+//
+//   MQTT (mqtt_bridge / mqtt_broker) — endpoint OR intermediate hop. An MQTT
+//     source has no origin node of its own and therefore no own-request
+//     traceroute, so relayed rows are the only way its nodes can render the
+//     strip at all. This is what the picker was built for (epic phase 2).
+//
+//   Everything else (meshtastic_tcp / meshcore) — endpoint only. These sources
+//     DO have an origin node, and the picker should list the routes between it
+//     and the selected node. Listing routes between two other nodes that merely
+//     passed through the selected one is confusing, and it made the picker's
+//     list disagree with the statistical aggregate's route count for the same
+//     node (the aggregate is pair-scoped).
+//
+// An unknown/missing source falls back to endpoint-only: the narrower, less
+// surprising list is the safe default when the type can't be established.
+//
+// sourceId is REQUIRED: the picker is per-source by definition, and a silent
+// ALL_SOURCES fallback would mix another source's rows for the same nodeNum.
+//
+// `hours` is OPTIONAL (amendment, SR_PHASE2_SPEC.md D14/S1): omitted entirely
+// by the picker so it lists the node's most recent stored traceroutes with no
+// time window — parity with the Traceroute History dialog, per direct user
+// request. When present, `hours` still validates and windows exactly as before.
+router.get(
+  '/participation/:nodeNum',
+  requirePermission('traceroute', 'read', { sourceIdFrom: 'query' }),
+  async (req: Request, res: Response) => {
+    try {
+      const sourceId = typeof req.query.sourceId === 'string' ? req.query.sourceId.trim() : '';
+      if (!sourceId) {
+        return fail(res, 400, 'MISSING_SOURCE_ID', 'sourceId query parameter is required');
+      }
+
+      const nodeNum = Number.parseInt(req.params.nodeNum, 10);
+      if (!Number.isFinite(nodeNum) || nodeNum < 0 || nodeNum > 0xffffffff) {
+        return fail(res, 400, 'INVALID_NODE_NUM', 'nodeNum must be between 0 and 4294967295');
+      }
+
+      // `hours` is optional (amendment, SR_PHASE2_SPEC.md D14/S1): when absent,
+      // the picker gets the node's most recent stored traceroutes with no time
+      // window, matching the Traceroute History dialog. When present, the
+      // existing window validation applies unchanged.
+      let sinceTimestamp: number | undefined;
+      if (req.query.hours !== undefined) {
+        const hours = Number.parseInt(req.query.hours as string, 10);
+        if (!Number.isFinite(hours) || hours < 1 || hours > 24 * 90) {
+          return fail(res, 400, 'INVALID_HOURS', 'hours must be between 1 and 2160');
+        }
+        sinceTimestamp = Date.now() - hours * 60 * 60 * 1000;
+      }
+
+      const limit = req.query.limit ? Number.parseInt(req.query.limit as string, 10) : 100;
+      if (!Number.isFinite(limit) || limit < 1 || limit > 200) {
+        return fail(res, 400, 'INVALID_LIMIT', 'limit must be between 1 and 200');
+      }
+
+      // Relayed (hop) participation is MQTT-only — see the header comment.
+      const source = await databaseService.sources.getSource(sourceId);
+      const endpointOnly = !isMqttSourceType(source?.type);
+
+      const rows = await databaseService.traceroutes.getTraceroutesInvolvingNode(nodeNum, {
+        sourceId,
+        endpointOnly,
+        sinceTimestamp,
+        limit,
+      });
+
+      // Same channel gate GET /api/sources/:id/traceroutes applies (#3092) — a
+      // traceroute on a channel the caller can't view must not surface here.
+      const visible = await maskTraceroutesByChannel(rows, req.user ?? null, sourceId);
+
+      const entries = visible.map(tr => ({
+        id: Number(tr.id),
+        timestamp: tr.timestamp,
+        fromNodeNum: Number(tr.fromNodeNum),
+        toNodeNum: Number(tr.toNodeNum),
+        fromNodeId: tr.fromNodeId,
+        toNodeId: tr.toNodeId,
+        route: tr.route ?? null,
+        routeBack: tr.routeBack ?? null,
+        snrTowards: tr.snrTowards ?? null,
+        snrBack: tr.snrBack ?? null,
+        channel: tr.channel ?? null,
+        participation: tr.participation,
+        // null (not the 999 sentinel the map/dashboard paths use) when the
+        // forward route is absent or unparseable: a label wants honest absence,
+        // and 999 would render as "999 hops".
+        hopCount: hasRouteData(tr.route) ? parseHopArray(tr.route).length : null,
+      }));
+
+      return ok(res, { nodeNum, sourceId, entries });
+    } catch (error) {
+      logger.error('Error fetching traceroute participation:', error);
+      return fail(res, 500, 'TRACEROUTE_PARTICIPATION_FAILED', 'Failed to fetch traceroute participation');
+    }
+  },
+);
 
 export default router;

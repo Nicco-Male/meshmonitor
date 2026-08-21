@@ -7,8 +7,8 @@
  * explaining types and scopes.
  */
 import { useCallback, useEffect, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { isValidCron } from 'cron-validator';
-import { appBasename } from '../../init';
 import apiService from '../../services/api';
 import AutomationBuilder, { type VariableOption, type SourceOption, type UnifiedChannelOption, type ScriptOption } from './AutomationBuilder';
 import AutomationTester from './AutomationTester';
@@ -67,11 +67,15 @@ function validateForm(form: WorkflowForm): string[] {
 
 export default function AutomationsPage() {
   const [view, setView] = useState<'automations' | 'variables'>('automations');
+  const navigate = useNavigate();
   return (
     <div className="ae-page">
       <div className="ae-container">
         <div className="ae-topbar">
-          <button className="ae-btn ae-btn--ghost" onClick={() => { window.location.href = `${appBasename}/`; }}><UiIcon name="back" size={15} /> Dashboard</button>
+          {/* Router navigation, not window.location: only a client-side navigate
+              carries `showList`, which is what tells DashboardPage to show the
+              source list instead of bouncing to the default landing page (#4447). */}
+          <button className="ae-btn ae-btn--ghost" onClick={() => navigate('/', { state: { showList: true } })}><UiIcon name="back" size={15} /> Dashboard</button>
         </div>
         <h1 className="ae-title">Automation Engine</h1>
         <p className="ae-subtitle">Advanced Mode (beta) — global “when this happens, do that” workflows across every source.</p>
@@ -189,8 +193,18 @@ function AutomationEditor({ automation, onClose }: { automation: Automation | 'n
     apiService.get<Variable[]>('/api/automations/variables')
       .then((vs) => setVariables(vs.map((v) => ({ name: v.name, type: v.type }))))
       .catch(() => setVariables([]));
-    apiService.get<Array<{ id: string; name: string; type?: string; enabled?: boolean; radio?: { txEnabled?: boolean } }>>('/api/sources')
-      .then((ss) => setSources(ss.map((s) => ({ id: s.id, name: s.name, type: s.type, enabled: s.enabled, txEnabled: s.radio?.txEnabled }))))
+    apiService.get<Array<{ id: string; name: string; type?: string; enabled?: boolean; radio?: { txEnabled?: boolean; canTransmit?: boolean } }>>('/api/sources')
+      // `canTransmit` includes the UDP-broadcast relay path — a TX-disabled radio
+      // with UDP Broadcast on still delivers automation sends (#4394). The
+      // builder prefers it and falls back to `txEnabled` on older servers.
+      .then((ss) => setSources(ss.map((s) => ({
+        id: s.id,
+        name: s.name,
+        type: s.type,
+        enabled: s.enabled,
+        txEnabled: s.radio?.txEnabled,
+        canTransmit: s.radio?.canTransmit,
+      }))))
       .catch(() => setSources([]));
     apiService.get<UnifiedChannelOption[]>('/api/automations/channels')
       .then((cs) => setChannels(cs))

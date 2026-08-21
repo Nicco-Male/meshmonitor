@@ -7,7 +7,7 @@
  *   - filters messages per channel (received + locally-sent)
  *   - passes the active channelIdx to actions.sendMessage on broadcast
  */
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, screen, fireEvent, waitFor, act } from '@testing-library/react';
 
 vi.mock('react-i18next', () => ({
@@ -31,8 +31,10 @@ vi.mock('react-i18next', () => ({
   initReactI18next: { type: '3rdParty', init: () => {} },
 }));
 
+// Mutable so a test can simulate a read-only / anonymous viewer.
+let permissionFn: (resource: string, action: string) => boolean = () => true;
 vi.mock('../../contexts/AuthContext', () => ({
-  useAuth: () => ({ hasPermission: () => true }),
+  useAuth: () => ({ hasPermission: (r: string, a: string) => permissionFn(r, a) }),
 }));
 
 const csrfFetchMock = vi.fn();
@@ -394,6 +396,103 @@ describe('MeshCoreChannelsView — per-channel backlog fetch (#3442)', () => {
   });
 });
 
+describe('MeshCoreChannelsView — infinite scroll pagination (#4460)', () => {
+  // Routes the per-channel-messages endpoint to a different page depending on
+  // whether the request carries an offset, so a scroll-to-top can be observed
+  // fetching (and prepending) the older page.
+  function pagedFetch(page0: MeshCoreMessage[], olderPage: MeshCoreMessage[]) {
+    return vi.fn((url: string) => {
+      if (url.includes('/api/channels/all')) {
+        return Promise.resolve(jsonResponse([{ id: 0, name: 'Public' }]));
+      }
+      if (url.includes('/messages/channel-counts')) {
+        return Promise.resolve(jsonResponse({ success: true, counts: {} }));
+      }
+      if (url.includes('/messages/channel/0')) {
+        const offsetMatch = /[?&]offset=(\d+)/.exec(url);
+        const offset = offsetMatch ? Number(offsetMatch[1]) : 0;
+        return offset > 0
+          ? Promise.resolve(jsonResponse({ success: true, data: olderPage, hasMore: false }))
+          : Promise.resolve(jsonResponse({ success: true, data: page0, hasMore: true }));
+      }
+      return Promise.resolve(jsonResponse({ success: true, data: [] }));
+    });
+  }
+
+  it('fetches and prepends an older page when scrolled to the top of the channel', async () => {
+    csrfFetchMock.mockImplementation(pagedFetch(
+      [{ id: 'p0', fromPublicKey: 'channel-0', text: 'recent message', timestamp: 200 }],
+      [{ id: 'p-old', fromPublicKey: 'channel-0', text: 'much older message', timestamp: 100 }],
+    ));
+
+    const { container } = render(
+      <MeshCoreChannelsView
+        messages={[]}
+        contacts={contacts}
+        status={makeStatus()}
+        actions={makeActions()}
+        baseUrl=""
+        sourceId="src-a"
+      />,
+    );
+
+    await waitFor(() => expect(screen.getByText('recent message')).toBeTruthy());
+    expect(screen.queryByText('much older message')).toBeNull();
+
+    const list = container.querySelector('.meshcore-message-list') as HTMLElement;
+    fireEvent.scroll(list);
+
+    await waitFor(() => expect(screen.getByText('much older message')).toBeTruthy());
+    // Still there — the older page is prepended, not swapped in.
+    expect(screen.getByText('recent message')).toBeTruthy();
+
+    const hitOlderPage = csrfFetchMock.mock.calls.some(
+      (c) => typeof c[0] === 'string' && (c[0] as string).includes('/meshcore/messages/channel/0') && (c[0] as string).includes('offset=1'),
+    );
+    expect(hitOlderPage).toBe(true);
+  });
+
+  it('does not request an older page once hasMore is false', async () => {
+    csrfFetchMock.mockImplementation((url: string) => {
+      if (url.includes('/api/channels/all')) {
+        return Promise.resolve(jsonResponse([{ id: 0, name: 'Public' }]));
+      }
+      if (url.includes('/messages/channel-counts')) {
+        return Promise.resolve(jsonResponse({ success: true, counts: {} }));
+      }
+      if (url.includes('/messages/channel/0')) {
+        return Promise.resolve(jsonResponse({
+          success: true,
+          data: [{ id: 'p0', fromPublicKey: 'channel-0', text: 'only message', timestamp: 200 }],
+          hasMore: false,
+        }));
+      }
+      return Promise.resolve(jsonResponse({ success: true, data: [] }));
+    });
+
+    const { container } = render(
+      <MeshCoreChannelsView
+        messages={[]}
+        contacts={contacts}
+        status={makeStatus()}
+        actions={makeActions()}
+        baseUrl=""
+        sourceId="src-a"
+      />,
+    );
+
+    await waitFor(() => expect(screen.getByText('only message')).toBeTruthy());
+    const callCountBeforeScroll = csrfFetchMock.mock.calls.length;
+
+    const list = container.querySelector('.meshcore-message-list') as HTMLElement;
+    fireEvent.scroll(list);
+
+    // No new request should follow — hasMore was false, so there's nothing to page into.
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(csrfFetchMock.mock.calls.length).toBe(callCountBeforeScroll);
+  });
+});
+
 describe('MeshCoreChannelsView — sending', () => {
   it('passes the active channel idx to actions.sendMessage', async () => {
     csrfFetchMock.mockImplementation((url: string) => {
@@ -712,5 +811,207 @@ describe('MeshCoreChannelsView — explicit Unscoped send (#3888)', () => {
     // handleReply set overrideScope to '' — the Unscoped button reflects it.
     const unscopedBtn = await screen.findByRole('button', { name: 'Unscoped' });
     expect(unscopedBtn.getAttribute('aria-pressed')).toBe('true');
+  });
+});
+
+describe('MeshCoreChannelsView — delete prunes the fetched backlog', () => {
+  /**
+   * The stream renders `filtered` = merge(history, messages). `actions.deleteMessage`
+   * only prunes the shared `messages` pool, so a message served from the
+   * per-channel backlog (#4460) was deleted server-side and then immediately
+   * re-rendered from `history` — the delete button looked inert. Verified against
+   * the live API: the row was already gone from the database while still on screen.
+   */
+  function routedFetch(backlog: MeshCoreMessage[]) {
+    return vi.fn((url: string) => {
+      if (url.includes('/api/channels/all')) {
+        return Promise.resolve(jsonResponse([{ id: 0, name: 'Public' }]));
+      }
+      if (url.includes('/messages/channel-counts')) {
+        return Promise.resolve(jsonResponse({ success: true, counts: { 0: backlog.length } }));
+      }
+      if (/\/messages\/channel\/\d+/.test(url)) {
+        return Promise.resolve(jsonResponse({ success: true, data: backlog, count: backlog.length }));
+      }
+      return Promise.resolve(jsonResponse({ success: true, data: [] }));
+    });
+  }
+
+  const confirmSpy = vi.spyOn(window, 'confirm');
+
+  it('removes a backlog-sourced message from the view once the delete succeeds', async () => {
+    confirmSpy.mockReturnValue(true);
+    csrfFetchMock.mockImplementation(routedFetch([
+      { id: 'from-history', fromPublicKey: 'channel-0', text: 'delete me', timestamp: 100 },
+    ]));
+    const deleteMessage = vi.fn().mockResolvedValue(true);
+
+    render(
+      <MeshCoreChannelsView
+        messages={[]}                       // deliberately empty: this row exists ONLY in history
+        contacts={contacts}
+        status={makeStatus()}
+        actions={makeActions({ deleteMessage })}
+        baseUrl=""
+        sourceId="src-a"
+      />,
+    );
+
+    await waitFor(() => expect(screen.getByText('delete me')).toBeTruthy());
+
+    await act(async () => {
+      fireEvent.click(document.querySelector('.mc-message-delete') as Element);
+    });
+
+    expect(deleteMessage).toHaveBeenCalledWith('from-history');
+    await waitFor(() => expect(screen.queryByText('delete me')).toBeNull());
+  });
+
+  it('keeps the message when the delete request fails', async () => {
+    confirmSpy.mockReturnValue(true);
+    csrfFetchMock.mockImplementation(routedFetch([
+      { id: 'from-history', fromPublicKey: 'channel-0', text: 'keep me', timestamp: 100 },
+    ]));
+
+    render(
+      <MeshCoreChannelsView
+        messages={[]}
+        contacts={contacts}
+        status={makeStatus()}
+        actions={makeActions({ deleteMessage: vi.fn().mockResolvedValue(false) })}
+        baseUrl=""
+        sourceId="src-a"
+      />,
+    );
+
+    await waitFor(() => expect(screen.getByText('keep me')).toBeTruthy());
+    await act(async () => {
+      fireEvent.click(document.querySelector('.mc-message-delete') as Element);
+    });
+    // Server said no — the row must stay rather than vanish optimistically.
+    expect(screen.getByText('keep me')).toBeTruthy();
+  });
+
+  it('does not delete when the operator cancels the confirm', async () => {
+    confirmSpy.mockReturnValue(false);
+    csrfFetchMock.mockImplementation(routedFetch([
+      { id: 'from-history', fromPublicKey: 'channel-0', text: 'still here', timestamp: 100 },
+    ]));
+    const deleteMessage = vi.fn().mockResolvedValue(true);
+
+    render(
+      <MeshCoreChannelsView
+        messages={[]}
+        contacts={contacts}
+        status={makeStatus()}
+        actions={makeActions({ deleteMessage })}
+        baseUrl=""
+        sourceId="src-a"
+      />,
+    );
+
+    await waitFor(() => expect(screen.getByText('still here')).toBeTruthy());
+    await act(async () => {
+      fireEvent.click(document.querySelector('.mc-message-delete') as Element);
+    });
+    expect(deleteMessage).not.toHaveBeenCalled();
+    expect(screen.getByText('still here')).toBeTruthy();
+  });
+
+  it('clears the whole backlog when the channel clear succeeds', async () => {
+    confirmSpy.mockReturnValue(true);
+    csrfFetchMock.mockImplementation(routedFetch([
+      { id: 'h1', fromPublicKey: 'channel-0', text: 'first', timestamp: 100 },
+      { id: 'h2', fromPublicKey: 'channel-0', text: 'second', timestamp: 200 },
+    ]));
+
+    render(
+      <MeshCoreChannelsView
+        messages={[]}
+        contacts={contacts}
+        status={makeStatus()}
+        actions={makeActions({ clearChannelMessages: vi.fn().mockResolvedValue(true) })}
+        baseUrl=""
+        sourceId="src-a"
+      />,
+    );
+
+    await waitFor(() => expect(screen.getByText('first')).toBeTruthy());
+    await act(async () => {
+      fireEvent.click(document.querySelector('.meshcore-clear-conversation-btn') as Element);
+    });
+    await waitFor(() => expect(screen.queryByText('first')).toBeNull());
+    expect(screen.queryByText('second')).toBeNull();
+  });
+});
+
+describe('MeshCoreChannelsView — read-only viewers skip send-side lookups', () => {
+  /**
+   * `config/default-scope` and `saved-regions` are `requireAuth()` +
+   * `configuration: read`, and exist only to populate the scope-override
+   * control (a send-side affordance). Firing them for an anonymous viewer
+   * always 401s; `fetchSavedRegions` then surfaced the raw body
+   * ("Authentication required") as a banner over an otherwise-working channel,
+   * which read as "you can't view this channel".
+   */
+  function routedFetch() {
+    return vi.fn((url: string) => {
+      if (url.includes('/api/channels/all')) {
+        return Promise.resolve(jsonResponse([{ id: 0, name: 'Public' }]));
+      }
+      if (url.includes('/messages/channel-counts')) {
+        return Promise.resolve(jsonResponse({ success: true, counts: { 0: 0 } }));
+      }
+      if (/\/messages\/channel\/\d+/.test(url)) {
+        return Promise.resolve(jsonResponse({ success: true, data: [], count: 0 }));
+      }
+      return Promise.resolve(jsonResponse({ success: true, data: [] }));
+    });
+  }
+
+  afterEach(() => { permissionFn = () => true; });
+
+  it('does not call the auth-only scope lookups without messages:write', async () => {
+    permissionFn = (resource, action) => !(resource === 'messages' && action === 'write');
+    csrfFetchMock.mockImplementation(routedFetch());
+    const getDefaultScope = vi.fn().mockResolvedValue('');
+    const fetchSavedRegions = vi.fn().mockResolvedValue([]);
+
+    render(
+      <MeshCoreChannelsView
+        messages={[]}
+        contacts={contacts}
+        status={makeStatus()}
+        actions={makeActions({ getDefaultScope, fetchSavedRegions })}
+        baseUrl=""
+        sourceId="src-a"
+      />,
+    );
+
+    // Wait for the channel list to settle so the effects have had their chance.
+    await waitFor(() => expect(document.querySelector('.mc-channel-row')).toBeTruthy());
+    expect(getDefaultScope).not.toHaveBeenCalled();
+    expect(fetchSavedRegions).not.toHaveBeenCalled();
+  });
+
+  it('still calls them for a viewer who can send', async () => {
+    permissionFn = () => true;
+    csrfFetchMock.mockImplementation(routedFetch());
+    const getDefaultScope = vi.fn().mockResolvedValue('');
+    const fetchSavedRegions = vi.fn().mockResolvedValue([]);
+
+    render(
+      <MeshCoreChannelsView
+        messages={[]}
+        contacts={contacts}
+        status={makeStatus()}
+        actions={makeActions({ getDefaultScope, fetchSavedRegions })}
+        baseUrl=""
+        sourceId="src-a"
+      />,
+    );
+
+    await waitFor(() => expect(fetchSavedRegions).toHaveBeenCalled());
+    expect(getDefaultScope).toHaveBeenCalled();
   });
 });

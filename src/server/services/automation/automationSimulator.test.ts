@@ -38,6 +38,28 @@ describe('simulateAutomation', () => {
     expect((r.actions[0].resolvedParams as any).replyId).toBe(42); // reply to triggering packet
   });
 
+  // #4340 Phase 2: the simulator has no lastFired map and never gates on
+  // cooldownScope — a dry-run must always show the operator what WOULD happen,
+  // regardless of the rule's real-world cooldown state. Pinned so nobody adds
+  // cooldown modelling to the tester later without a deliberate decision.
+  it('cooldownScope is a no-op in the simulator: the same subject fires on every dry-run', async () => {
+    const graph: AutomationGraph = {
+      version: 1,
+      nodes: [
+        { id: 't', type: 'trigger.message', params: { textContains: 'ping', cooldownSeconds: 60, cooldownScope: 'node' } },
+        { id: 'a', type: 'action.tapback', params: { emoji: '👍' } },
+      ],
+      edges: [{ from: 't', to: 'a' }],
+    };
+    const opts = { graph, varsRepo, event: { kind: 'message' as const, text: 'ping', from: 111 }, now: 1_000_000 };
+    const first = await simulateAutomation(opts);
+    const second = await simulateAutomation(opts); // same subject, same `now` — still fires
+    expect(first.matched).toBe(true);
+    expect(first.actions).toHaveLength(1);
+    expect(second.matched).toBe(true);
+    expect(second.actions).toHaveLength(1);
+  });
+
   it('false branch is not taken (condition routes correctly)', async () => {
     const graph: AutomationGraph = {
       version: 1,
@@ -173,6 +195,72 @@ describe('simulateAutomation', () => {
 
     const fail = await simulateAutomation({ graph, varsRepo, event: { kind: 'message', text: 'hi', sourceId: 'other' } });
     expect(fail.conditionResults['c']).toBe(false);
+  });
+
+  // ── action.tapback emojiMode=hopCount (#4340) ───────────────────────────
+  it("tapback emojiMode 'hopCount': dry-run resolves the derived emoji, no IO", async () => {
+    const graph: AutomationGraph = {
+      version: 1,
+      nodes: [
+        { id: 't', type: 'trigger.message', params: {} },
+        { id: 'a', type: 'action.tapback', params: { emojiMode: 'hopCount' } },
+      ],
+      edges: [{ from: 't', to: 'a' }],
+    };
+    const r = await simulateAutomation({
+      graph, varsRepo,
+      event: { kind: 'message', text: 'ping', from: 111, hopStart: 3, hopLimit: 0, packetId: 1 },
+    });
+    expect(r.status).toBe('completed');
+    expect(r.actions).toHaveLength(1);
+    expect(r.actions[0].type).toBe('action.tapback');
+    expect((r.actions[0].resolvedParams as any).emoji).toBe('3️⃣');
+  });
+
+  it("tapback emojiMode 'hopCount' with no hop fields: the recorded skip surfaces as the action's resolved params", async () => {
+    const graph: AutomationGraph = {
+      version: 1,
+      nodes: [
+        { id: 't', type: 'trigger.message', params: {} },
+        { id: 'a', type: 'action.tapback', params: { emojiMode: 'hopCount' } },
+      ],
+      edges: [{ from: 't', to: 'a' }],
+    };
+    const r = await simulateAutomation({
+      graph, varsRepo,
+      event: { kind: 'message', text: 'ping', from: 111 }, // no hopStart/hopLimit
+    });
+    expect(r.status).toBe('completed');
+    expect(r.actions).toHaveLength(1);
+    expect(r.actions[0].ok).toBe(true); // a recorded skip is not an execution failure
+    expect(r.actions[0].resolvedParams).toMatchObject({ skipped: true, reason: expect.stringMatching(/no hop count/) });
+  });
+
+  // #4340 Phase 3, WP3: drift guard. automationSimulator.ts (the SOURCE file) is
+  // NOT edited for this feature — recordingDeps().sendMessage already spreads
+  // its received argument object (`{ action: 'sendMessage', ...a }`), so a new
+  // ActionDeps.sendMessage field reaches the dry-run for free. This test pins
+  // that so a future refactor of recordingDeps can't silently drop it.
+  it('maxAttempts (#4340 Phase 3): dry-run surfaces it via the recordingDeps spread with no simulator source change', async () => {
+    const graph: AutomationGraph = {
+      version: 1,
+      nodes: [
+        { id: 't', type: 'trigger.message', params: {} },
+        { id: 'a', type: 'action.sendMessage', params: { text: 'pong', to: '{{ trigger.from }}', maxAttempts: 2 } },
+      ],
+      edges: [{ from: 't', to: 'a' }],
+    };
+    const r = await simulateAutomation({
+      graph, varsRepo,
+      event: { kind: 'message', text: 'ping', from: 111, packetId: 1 },
+    });
+    expect(r.status).toBe('completed');
+    expect(r.actions).toHaveLength(1);
+    expect((r.actions[0].resolvedParams as any).maxAttempts).toBe(2);
+    // Dry-run performs no real send: the recorded result carries no queue
+    // artifact (messageId/queued) — proof no messageQueue was reached.
+    expect((r.actions[0].resolvedParams as any).queued).toBeUndefined();
+    expect((r.actions[0].resolvedParams as any).messageId).toBeUndefined();
   });
 
   it('runScript: dry-run records the action without spawning a process', async () => {

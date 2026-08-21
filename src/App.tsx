@@ -242,8 +242,11 @@ function App() {
   // Monitor server health and auto-reload on version change (e.g., after auto-upgrade)
   useHealth({ baseUrl, reloadOnVersionChange: true });
 
-  // Monitor device TX status to show warning banner when TX is disabled
-  const { isTxDisabled } = useTxStatus({ baseUrl, sourceId });
+  // Monitor device TX status to show warning banner when TX is disabled.
+  // `isTxDisabled` already accounts for the UDP-broadcast relay path: a radio
+  // with TX off but UDP Broadcast on can still send, and reports isUdpRelay
+  // instead so the banner stays honest about how packets leave (#4394).
+  const { isTxDisabled, isUdpRelay } = useTxStatus({ baseUrl, sourceId });
   // MQTT-bridge sources are never gated (different transport, not affected by radio TX state)
   const txGated = isTxDisabled && !isMqttBridge;
 
@@ -302,6 +305,9 @@ function App() {
     setSolarMonitoringAzimuth,
     setSolarMonitoringDeclination,
     overlayColors: schemeColors,
+    // showIncompleteNodes moved here from UIContext (#4412 Phase 3 WP3) —
+    // still needed to pass down to MessagesTab below.
+    showIncompleteNodes,
   } = useSettings();
 
   // isChannelMuted/isDMMuted moved into useMessagingView (#3962 5.4 PR7) —
@@ -543,8 +549,6 @@ function App() {
     setNodePopup,
     showNodeFilterPopup,
     setShowNodeFilterPopup,
-    showIncompleteNodes,
-    setShowIncompleteNodes,
   } = useUI();
 
   // When the user clicks a source row in the Unified map's node popup, we
@@ -652,7 +656,11 @@ function App() {
       info: () => hasPermission('info', 'read'),
       messages: () => hasPermission('messages', 'read'),
       channels: hasAnyChannelPermission,
-      settings: () => hasPermission('settings', 'read'),
+      // 'settings' is a sourcey resource (Phase 6 #4416). This tab gate is
+      // cross-source (no single sourceId in view here), and 34 of the 36
+      // settings routes it protects are unscoped, so { anySource: true }
+      // mirrors checkPermissionAsync's union branch for the same routes.
+      settings: () => hasPermission('settings', 'read', { anySource: true }),
       automation: () => !isMqttBridge && hasPermission('automation', 'read'),
       configuration: () => !isMqttBridge && hasPermission('configuration', 'read'),
       'mqtt-config': () => isMqttBridge && hasPermission('sources', 'read'),
@@ -966,36 +974,11 @@ function App() {
           const settings = await settingsResponse.json();
 
           // Apply server settings if they exist, otherwise use localStorage/defaults
-          if (settings.maxNodeAgeHours) {
-            const value = parseInt(settings.maxNodeAgeHours);
-            setMaxNodeAgeHours(value);
-            localStorage.setItem('maxNodeAgeHours', value.toString());
-          }
-
-          if (settings.inactiveNodeThresholdHours) {
-            const value = parseInt(settings.inactiveNodeThresholdHours);
-            if (!isNaN(value) && value > 0) {
-              setInactiveNodeThresholdHours(value);
-              localStorage.setItem('inactiveNodeThresholdHours', value.toString());
-            }
-          }
-
-          if (settings.inactiveNodeCheckIntervalMinutes) {
-            const value = parseInt(settings.inactiveNodeCheckIntervalMinutes);
-            if (!isNaN(value) && value > 0) {
-              setInactiveNodeCheckIntervalMinutes(value);
-              localStorage.setItem('inactiveNodeCheckIntervalMinutes', value.toString());
-            }
-          }
-
-          if (settings.inactiveNodeCooldownHours) {
-            const value = parseInt(settings.inactiveNodeCooldownHours);
-            if (!isNaN(value) && value > 0) {
-              setInactiveNodeCooldownHours(value);
-              localStorage.setItem('inactiveNodeCooldownHours', value.toString());
-            }
-          }
-
+          // maxNodeAgeHours / the inactive-node trio / hideIncompleteNodes are no
+          // longer loaded here — they are Node Display settings and SettingsContext
+          // is their sole owner (#4412 Phase 3 WP3, D4). This loader used to write
+          // the same states from an unscoped fetch, racing SettingsContext's scoped
+          // one and occasionally reverting a per-source value on reload/source switch.
           if (settings.temperatureUnit) {
             setTemperatureUnit(settings.temperatureUnit as TemperatureUnit);
             localStorage.setItem('temperatureUnit', settings.temperatureUnit);
@@ -1221,13 +1204,6 @@ function App() {
             }
           }
 
-          // Hide incomplete nodes setting
-          if (settings.hideIncompleteNodes !== undefined) {
-            logger.debug(`📋 Loading hideIncompleteNodes setting: ${settings.hideIncompleteNodes}`);
-            setShowIncompleteNodes(settings.hideIncompleteNodes !== '1');
-          } else {
-            logger.debug('📋 hideIncompleteNodes setting not found in database');
-          }
         }
 
         // Check connection status
@@ -3318,6 +3294,7 @@ function App() {
 
       <AppBanners
         isTxDisabled={isTxDisabled}
+        isUdpRelay={isUdpRelay}
         configIssues={configIssues}
         updateAvailable={updateAvailable}
         latestVersion={latestVersion}

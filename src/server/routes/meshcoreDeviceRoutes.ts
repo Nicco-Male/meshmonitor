@@ -13,6 +13,8 @@ import { logger } from '../../utils/logger.js';
 import { requireAuth, optionalAuth, requirePermission } from '../auth/authMiddleware.js';
 import { meshcoreDeviceLimiter } from '../middleware/rateLimiters.js';
 import { managerFor, isValidConnectionParams } from './meshcoreRouteShared.js';
+import databaseService from '../../services/database.js';
+import { buildLocalContactRow, withoutLocalFlag, type MeshCoreContactResponse } from './meshcoreLocalContactRow.js';
 
 const router = Router({ mergeParams: true });
 
@@ -146,6 +148,13 @@ router.get(
  * GET /api/sources/:id/meshcore/snapshot
  * Single-call initial load: status, localNode, contacts, nodes, messages, and a seqCursor
  * (the timestamp of the newest message) for reconnect catch-up.
+ *
+ * The route itself is gated only by `connection:read` (a viewer needs that
+ * just to see the source at all), but `messages` carries DM content, which
+ * has its own, stricter `messages:read` grant ("Node Details & DM"). A
+ * caller with `connection:read` but not `messages:read` — e.g. an anonymous
+ * user given view-only status access — must not receive message content via
+ * this bundled payload (issue #4422).
  */
 router.get('/snapshot', optionalAuth(), requirePermission('connection', 'read', { sourceIdFrom: 'params.id' }), async (req: Request, res: Response) => {
   try {
@@ -154,23 +163,22 @@ router.get('/snapshot', optionalAuth(), requirePermission('connection', 'read', 
     const localNode = manager.getLocalNode();
     const contacts = manager.getContacts();
     const nodes = await manager.getAllNodes();
-    const messages = manager.getRecentMessages(50);
+
+    const sourceId = (req.params as { id: string }).id;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- #4422 req.user is untyped on Express.Request, matches existing pattern (sourceRoutes.ts)
+    const user = (req as any).user;
+    const isAdmin = user?.isAdmin ?? false;
+    const canReadMessages = isAdmin || (user
+      ? await databaseService.checkPermissionAsync(user.id, 'messages', 'read', sourceId)
+      : false);
+    const messages = canReadMessages ? manager.getRecentMessages(50) : [];
     const seqCursor = messages.length > 0 ? Math.max(...messages.map(m => m.timestamp)) : 0;
 
-    // Mirror the contacts-with-localNode logic from GET /contacts
-    const allContacts = [...contacts];
+    // Shares the local-row construction site with GET /contacts and
+    // POST /contacts/refresh (#4438 / #4449) — see meshcoreLocalContactRow.ts.
+    const allContacts: MeshCoreContactResponse[] = withoutLocalFlag(contacts);
     if (localNode && localNode.latitude && localNode.longitude) {
-      allContacts.unshift({
-        publicKey: localNode.publicKey,
-        advName: `${localNode.name} (local)`,
-        name: localNode.name,
-        latitude: localNode.latitude,
-        longitude: localNode.longitude,
-        advType: localNode.advType,
-        rssi: undefined,
-        snr: undefined,
-        lastSeen: Date.now(),
-      });
+      allContacts.unshift(buildLocalContactRow(localNode));
     }
 
     res.json({

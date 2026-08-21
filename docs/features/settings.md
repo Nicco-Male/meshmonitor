@@ -285,6 +285,32 @@ When information is unavailable, the block displays "N/A" for that metric. This 
 - Information isn't available from the device type
 - Connection was lost before all data was received
 
+### Traceroute Path
+
+::: tip New in 4.13
+:::
+
+When the selected node has traceroute data, the Node Details block draws the forward and return paths as a strip of node icons instead of two lines of text.
+
+- Each node in the path renders as a role icon — a tower for a repeater, and similar icons for sensors, room servers, and companion devices — colored by hop count. Hop count follows your [Node Hops Calculation](/features/link-quality#node-hops-calculation) setting, the same one that colors the node list and map markers. A node marked unmessagable (it can't receive direct messages) keeps its usual corner badge.
+- Each node's short name sits underneath its icon. Hover it, or tab to it with the keyboard, to see its long name, role, and node ID. The card also carries a **More Details** button that loads that node into the Node Details panel — with the keyboard, press Enter or Space on the node itself. Unknown hops offer no button.
+- Arrows connect the nodes and show which way each path runs. The forward path's SNR values sit above the row; the return path's sit below, and its line is dashed. Hover or tap a link to see its direction, both endpoints, the distance between them (in your configured distance unit, shown only when both ends have a position), and the hop's SNR.
+- A hop no relay identified itself for shows as a neutral "Unknown" placeholder rather than being skipped, so the path length stays visible. An SNR value the firmware didn't record shows as "?".
+
+**Reading the overlap**: a node that both the forward and return paths pass through is drawn only once. That single icon is where the two paths meet.
+
+**Reading a branch**: Meshtastic's flood routing doesn't guarantee the return trip takes the same path as the forward one. When it doesn't, the node(s) that only the return path visits drop to a branch row below the main one, with the return arrow routed through them.
+
+**Choosing which traceroute to show**: when the node took part in more than one of its 50 most recent stored traceroutes — as an endpoint or as a relay hop (marked "relayed") — a dropdown above the strip lists them by date, endpoints, and hop count. It defaults to the newest. This is also what brings the strip to MQTT sources: they have no node of their own to run traceroutes from, so the strip draws from traceroutes the selected node took part in anywhere on that source's mesh.
+
+**Statistical route**: on a Meshtastic TCP source, the dropdown gains a **Statistical (N routes)** entry when two or more stored traceroutes exist between your node and the selected node — all stored history for the pair, not just the 50 the dropdown lists. It merges every route into one diagram: each node and link fades by how often it appeared, so the relays your traffic actually depends on stand out at full strength while one-off detours fade back. Hover any node or link to see the exact count — "Seen in 12 of 16 routes (75%)". The aggregate makes no direction claim, so there are no arrows, no SNR values, and no copy links; pick any dated entry to get the single-route view back. Rare hops never fade below a floor, so they stay visible and hoverable.
+
+The strip scrolls horizontally on narrow screens and uses a smaller size in the split-view side panel. Viewing it needs the `traceroute` read (or write) permission; requesting a new traceroute still needs write. The "last traced X ago" line and pending/failed badges describe whichever traceroute is displayed.
+
+::: tip
+This is separate from the Dashboard's [Traceroute Widget](/features/settings#traceroute-widget), which still shows the route as plain text.
+:::
+
 ### Share a Meshtastic Contact
 
 For a node with a stored Meshtastic identity, expand **Share contact** to create
@@ -635,7 +661,11 @@ Click the **+** button in the dashboard header to add new widgets. Two widget ty
 
 #### Traceroute Widget
 
-**Description**: Displays the last successful traceroute results to and from a selected node.
+**Description**: Displays the last successful traceroute results to and from a selected node, as plain text.
+
+::: tip
+Looking for the icon-based traceroute strip instead? That's a different surface — the Messages page's [Node Details block](/features/settings#traceroute-path).
+:::
 
 **Features**:
 - Shows the forward path (from your node to the target)

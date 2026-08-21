@@ -357,6 +357,14 @@ Every CLI command, login outcome, and credential mutation writes an `audit_log` 
 
 The `details` JSON captures `sourceId`, `publicKey` (where relevant), command text, reply length, and elapsed milliseconds. **The plaintext password never appears in audit details**, verified by the canary test referenced above.
 
+## Analyzer Observer
+
+::: tip Added in 4.14 (#4457)
+A Companion source can publish the packets it hears to a MeshCore Analyzer MQTT broker (FL Mesh, LetsMesh, or compatible), so your node shows up as a regional observer.
+:::
+
+It's observation-only — MeshMonitor never subscribes to the broker or transmits on your behalf. Enable it in the source's edit modal, then fetch or paste the signing key on the Configuration page. See the [MeshCore Analyzer Observer guide](/features/meshcore-analyzer-observer) for setup, a troubleshooting table, and what data leaves your network.
+
 ## Path Visualization
 
 The MeshCore map can render **route lines** between your local node and each contact, colored by hop count:
@@ -441,6 +449,18 @@ Auto-Responder matches incoming messages against operator-defined patterns and r
 - **Per-trigger pre-send delay** — wait a configurable number of seconds (0–120, `0` = immediate) after a match before replying, so a relaying repeater can finish its own transmission before your reply floods. Mirrors the Auto-Acknowledge pre-send delay; the wait applies once per fire, ahead of both text and script responses.
 - **Two actions** — reply with a **text response** (same token expansion as Auto-Announce) or **run a script** (with token-expanded script args). Script execution reuses the shared script runner, with `MESHCORE_*` environment variables injected so a script can branch on which stack invoked it.
 - **Reply scope/region** — choose which region the reply floods to: **Inherit** the channel/source default, **Match the triggering message's scope** (answer back on the same region it arrived on), send **Unscoped**, or pick **a specific region**. This mirrors the MeshCore scope control in the [Automation Engine](/features/automation-engine#actions).
+
+### Route tokens
+
+Auto-Acknowledge and Auto-Responder templates can quote the path the triggering message took:
+
+| Token | Meaning | Example |
+|-------|---------|---------|
+| `{ROUTE}` | Relay-hash chain the message took | `a3→7f` |
+| `{ROUTE_NAMES}` | Same chain, with each hop resolved to the repeater or room-server name where known | `Hilltop→7f` |
+| `{HASH_SIZE}` | Per-hop path-hash width in bytes (1–3), as the sender stamped it | `1` |
+
+A hop MeshMonitor cannot resolve stays as raw hex. When several repeaters share a hash prefix, MeshMonitor picks the one closest to the neighbouring hops' positions — a best guess, not a certainty. The same resolution backs the clickable route line on a received message (see [Message route line](#message-route-line)).
 
 ## Timer Triggers
 
