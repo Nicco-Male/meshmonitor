@@ -110,8 +110,7 @@ export const TRACEROUTE_MOVEMENT_INVALIDATION_METERS = 100;
  *
  * Presence is checked with `typeof === 'number'`, not a truthy check — a
  * node sitting exactly on the equator or prime meridian (`lat===0` or
- * `lng===0`) must still resolve to its stored snapshot position rather than
- * silently falling through to the live position.
+ * `lng===0`) must still resolve to its stored snapshot position.
  */
 export function parseSnapshotRoutePositions(
   routePositions: string | null | undefined,
@@ -132,8 +131,9 @@ export function parseSnapshotRoutePositions(
     if (entry && typeof entry.lat === 'number' && typeof entry.lng === 'number') {
       // A snapshot captured while the node was at Null Island (a garbage GPS
       // default, e.g. the 2^15 value 0.0032768) must NOT anchor a route
-      // segment there — skip it so resolveSegmentPosition falls through to the
-      // live position (#02ecd5e0 "Jupiter Dad" routes shooting to 0,0).
+      // segment there. Skip it; a partial capture snapshot is authoritative,
+      // so a missing/invalid endpoint will not be replaced with today's live
+      // position (#02ecd5e0 "Jupiter Dad" routes shooting to 0,0).
       if (isBogusPosition(entry.lat, entry.lng)) continue;
       result.set(nodeNum, [entry.lat, entry.lng]);
     }
@@ -176,11 +176,11 @@ export function hasTracerouteSnapshotMoved(
 }
 
 /**
- * Resolve a hop's render position, preferring the historical snapshot
- * (#1862) over the live position. Both maps are expected to already be
- * normalized to `[lat, lng]` tuples — normalizing a consumer's own live-node
- * shape (digest array, raw node map with `latitudeI/longitudeI` vs
- * `latitude/longitude`, etc.) is the caller's job, not this function's.
+ * Resolve a hop's render position from the historical capture snapshot.
+ * Both maps are expected to already be normalized to `[lat, lng]` tuples —
+ * normalizing a consumer's own live-node shape (digest array, raw node map
+ * with `latitudeI/longitudeI` vs `latitude/longitude`, etc.) is the caller's
+ * job, not this function's.
  *
  * Before resolving a single hop, the whole snapshot is checked against the
  * current live positions. If ANY snapshotted node moved by at least
@@ -189,15 +189,23 @@ export function hasTracerouteSnapshotMoved(
  * the stale trace. This deliberately invalidates the whole route instead of
  * leaving detached intermediate links on the map.
  *
+ * When at least one usable capture-time position exists, that snapshot is
+ * authoritative: a node missing from it resolves to `null` instead of falling
+ * back to its current live position. This prevents an old traceroute from
+ * visually following a mobile node after the fact. Traceroutes created before
+ * `routePositions` existed (empty snapshot) retain the legacy live-position
+ * fallback and are still bounded by the normal age TTL.
+ *
  * `requireLive` (issue #4162): when true, a node absent from `liveNodes`
  * resolves to `null` (drop the hop) even if the snapshot still holds a
  * historical position for it. `liveNodes` is the caller's *rendered-marker*
  * position map, so this keeps route segments attached to actual markers —
  * a node that has aged out, been purged, or is hidden ("Hide from Map") has
- * no marker and must not anchor a dangling line. When the node IS live, the
- * #1862 snapshot-then-live preference is preserved. Route-segment overlays
- * pass `true`; the single-traceroute display leaves it `false` so it can show
- * every hop (including hidden/aged relays) of one specific traceroute.
+ * no marker and must not anchor a dangling line. When the node IS live and a
+ * capture snapshot exists, its historical snapshot position remains the only
+ * render position. Route-segment overlays pass `true`; the single-traceroute
+ * display leaves it `false` so it can show every snapshotted hop (including
+ * hidden/aged relays) of one specific traceroute.
  */
 export function resolveSegmentPosition(
   nodeNum: number,
@@ -207,7 +215,8 @@ export function resolveSegmentPosition(
 ): [number, number] | null {
   if (hasTracerouteSnapshotMoved(snapshot, liveNodes)) return null;
   if (requireLive && !liveNodes.has(nodeNum)) return null;
-  return snapshot.get(nodeNum) ?? liveNodes.get(nodeNum) ?? null;
+  if (snapshot.size > 0) return snapshot.get(nodeNum) ?? null;
+  return liveNodes.get(nodeNum) ?? null;
 }
 
 /**
