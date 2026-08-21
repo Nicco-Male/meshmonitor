@@ -235,14 +235,17 @@ function collectEstimatedHopMarkers(segments: TracerouteRenderSegment[]): Estima
 function TraceroutePathsLayerImpl(props: TraceroutePathsLayerProps): ReactElement {
   const { segments, showArrows = false } = props;
 
-  // Normal map overlays use `snr` (route segments) or `fixed` (Dashboard's
-  // yellow traceroute highlight). Enforce the same 4-hour freshness policy at
-  // the shared render layer so every map surface, including Dashboard/Unified,
-  // drops stale traces even if an upstream consumer accidentally keeps a wider
-  // age window. Explicit selected/history visualizations use `custom` or
-  // `fixed-leg`, so they remain inspectable. Legacy segments with no timestamp
-  // are left untouched because their age cannot be established reliably.
-  const mapOverlaySegments = props.colorMode === 'snr' || props.colorMode === 'fixed'
+  // Normal interactive map overlays are the SNR/fixed-color layers that carry
+  // a route popup and no selected-trace arrows. Enforce the 4-hour freshness
+  // policy here as a final safety net so Dashboard/Unified cannot accidentally
+  // render a 9h/22h line just because its own upstream age slider is wider.
+  // Other consumers (Map Analysis, widgets, explicit selected/history traces)
+  // keep their existing behavior.
+  const isNormalMapOverlay =
+    !!props.renderPopup &&
+    !showArrows &&
+    (props.colorMode === 'snr' || props.colorMode === 'fixed');
+  const mapOverlaySegments = isNormalMapOverlay
     ? segments.filter((seg) => {
         if (typeof seg.timestamp !== 'number' || seg.timestamp <= 0) return true;
         const cutoff = Date.now() - TRACEROUTE_MAP_MAX_AGE_HOURS * 60 * 60 * 1000;
