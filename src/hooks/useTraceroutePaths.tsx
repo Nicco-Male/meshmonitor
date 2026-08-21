@@ -126,6 +126,9 @@ export interface UseTraceroutePathsResult {
 
 const BROADCAST_ADDR = 4294967295;
 
+/** Maximum age for traceroute lines shown on the normal map overlay. */
+export const TRACEROUTE_MAP_MAX_AGE_HOURS = 4;
+
 /** Stable unordered identity for one physical hop. Anonymous relay placeholders
  * carry trace-scoped hop keys from `decomposeTraceroute`, so they never merge
  * with an unrelated hidden relay from another trace. */
@@ -172,7 +175,6 @@ export function useTraceroutePaths({
   nodesPositionDigest,
   traceroutesDigest,
   distanceUnit,
-  maxNodeAgeHours,
   themeColors,
   callbacks,
   visibleNodeNums,
@@ -205,8 +207,13 @@ export function useTraceroutePaths({
     const segmentLatestTimestamp = new Map<string, number>();
     const segmentsList: TracerouteRenderSegment[] = [];
 
-    // Filter traceroutes by age using the same maxNodeAgeHours setting
-    const cutoffTime = Date.now() - maxNodeAgeHours * 60 * 60 * 1000;
+    // The normal map overlay is intentionally short-lived: a traceroute may
+    // stay visible for at most 4 hours if its capture-time geometry is still
+    // valid. Movement invalidation is handled separately by
+    // resolveSegmentPosition/hasTracerouteSnapshotMoved. Historical traces
+    // remain available elsewhere; they just stop being presented as current
+    // map links after this TTL.
+    const cutoffTime = Date.now() - TRACEROUTE_MAP_MAX_AGE_HOURS * 60 * 60 * 1000;
     const recentTraceroutes = traceroutesDigest.filter(tr => {
       const timestamp = tr.timestamp || tr.createdAt || 0;
       return timestamp >= cutoffTime;
@@ -444,7 +451,7 @@ export function useTraceroutePaths({
         }}
       />,
     ];
-  }, [showPaths, traceroutesDigest, nodesPositionDigest, distanceUnit, maxNodeAgeHours, themeColors.snrColors, themeColors.mqttSegment, themeColors.overlay0, callbacks, visibleNodeNums, mapZoom, liveNodePositions]);
+  }, [showPaths, traceroutesDigest, nodesPositionDigest, distanceUnit, themeColors.snrColors, themeColors.mqttSegment, themeColors.overlay0, callbacks, visibleNodeNums, mapZoom, liveNodePositions]);
 
   // Separate memoization for selected node traceroute (showRoute)
   // This can change independently without re-rendering the base map markers
