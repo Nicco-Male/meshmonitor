@@ -18,6 +18,15 @@ import {
 
 const CURVE_SEGMENTS = 20;
 
+/**
+ * Neighbor links are rendered in Leaflet's default overlay pane and use a
+ * wide invisible hit target. Put traceroute strokes in the built-in
+ * shadowPane (z-index 500): above overlay vectors (400), below node markers
+ * (600). This makes an overlapping traceroute win pointer hit-testing without
+ * changing the visual stacking of node markers or creating a custom pane.
+ */
+const TRACEROUTE_PANE = 'shadowPane';
+
 export interface TraceroutePathsLayerProps {
   segments: TracerouteRenderSegment[];
   snrColors: SnrColorScale;                          // theme palette (prop, not useSettings)
@@ -255,6 +264,7 @@ function TraceroutePathsLayerImpl(props: TraceroutePathsLayerProps): ReactElemen
       {resolved.map(({ seg, color, weight, opacity, dashArray, positions, className }) => (
         <Polyline
           key={seg.key}
+          pane={TRACEROUTE_PANE}
           positions={positions}
           pathOptions={{ color, weight, opacity, dashArray }}
           className={className}
