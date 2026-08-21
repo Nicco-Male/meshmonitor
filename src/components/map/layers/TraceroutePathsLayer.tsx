@@ -17,6 +17,7 @@ import {
 } from '../../../utils/tracerouteSegments';
 
 const CURVE_SEGMENTS = 20;
+const TRACEROUTE_MAP_MAX_AGE_HOURS = 4;
 
 /**
  * Neighbor links are rendered in Leaflet's default overlay pane and use a
@@ -233,10 +234,29 @@ function collectEstimatedHopMarkers(segments: TracerouteRenderSegment[]): Estima
  */
 function TraceroutePathsLayerImpl(props: TraceroutePathsLayerProps): ReactElement {
   const { segments, showArrows = false } = props;
+
+  // Normal interactive map overlays are the SNR/fixed-color layers that carry
+  // a route popup and no selected-trace arrows. Enforce the 4-hour freshness
+  // policy here as a final safety net so Dashboard/Unified cannot accidentally
+  // render a 9h/22h line just because its own upstream age slider is wider.
+  // Other consumers (Map Analysis, widgets, explicit selected/history traces)
+  // keep their existing behavior.
+  const isNormalMapOverlay =
+    !!props.renderPopup &&
+    !showArrows &&
+    (props.colorMode === 'snr' || props.colorMode === 'fixed');
+  const mapOverlaySegments = isNormalMapOverlay
+    ? segments.filter((seg) => {
+        if (typeof seg.timestamp !== 'number' || seg.timestamp <= 0) return true;
+        const cutoff = Date.now() - TRACEROUTE_MAP_MAX_AGE_HOURS * 60 * 60 * 1000;
+        return seg.timestamp >= cutoff;
+      })
+    : segments;
+
   // One physical node must have one position. Pool all route-local fallback
   // candidates before resolving geometry, popups, arrows, and markers so every
   // link terminates at the same consensus point.
-  const consolidatedSegments = consolidateEstimatedNodePositions(segments);
+  const consolidatedSegments = consolidateEstimatedNodePositions(mapOverlaySegments);
 
   // Resolve each segment's color/weight/opacity/dash/curvature/positions
   // exactly once and reuse the result for both the Polyline pass and the
