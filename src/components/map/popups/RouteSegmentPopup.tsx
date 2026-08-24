@@ -16,6 +16,10 @@ import {
   isUnknownSnr,
   type TracerouteRenderSegment,
 } from '../../../utils/tracerouteSegments';
+import type {
+  DirectionalTracerouteRenderSegment,
+  TracerouteDirectionSummary,
+} from '../../../utils/tracerouteDirections';
 import { UiIcon } from '../../icons';
 
 interface ChartDatum {
@@ -236,6 +240,27 @@ function EndpointName({
   );
 }
 
+function directionEndpoint(
+  nodeNum: number,
+  segment: TracerouteRenderSegment,
+  fromName: string,
+  toName: string,
+  onFromNodeClick?: () => void,
+  onToNodeClick?: () => void,
+): { name: string; onClick?: () => void } {
+  if (nodeNum === segment.fromNodeNum) return { name: fromName, onClick: onFromNodeClick };
+  if (nodeNum === segment.toNodeNum) return { name: toName, onClick: onToNodeClick };
+  return { name: `!${nodeNum.toString(16)}` };
+}
+
+function directionAverage(summary: TracerouteDirectionSummary): string | null {
+  const values = summary.snrSamples
+    .filter((sample) => Number.isFinite(sample.snr) && !isUnknownSnr(sample.snr))
+    .map((sample) => sample.snr);
+  if (values.length === 0) return null;
+  return (values.reduce((sum, value) => sum + value, 0) / values.length).toFixed(1);
+}
+
 /**
  * Shared advanced popup for a physical traceroute segment.
  *
@@ -257,6 +282,48 @@ export default function RouteSegmentPopup({
   onToNodeClick,
   onUsageClick,
 }: RouteSegmentPopupProps) {
+  const directionalSegment = segment as DirectionalTracerouteRenderSegment;
+  const directionSummaries = directionalSegment.directionSummaries ?? [];
+  const directSummary = directionSummaries.find(
+    (summary) =>
+      summary.fromNodeNum === segment.fromNodeNum &&
+      summary.toNodeNum === segment.toNodeNum,
+  );
+  const reverseSummary = directionSummaries.find(
+    (summary) =>
+      summary.fromNodeNum === segment.toNodeNum &&
+      summary.toNodeNum === segment.fromNodeNum,
+  );
+  const isBidirectional = !!directSummary && !!reverseSummary;
+  const singleDirection = !isBidirectional && directionSummaries.length === 1
+    ? directionSummaries[0]
+    : null;
+
+  const topFrom = singleDirection
+    ? directionEndpoint(
+        singleDirection.fromNodeNum,
+        segment,
+        fromName,
+        toName,
+        onFromNodeClick,
+        onToNodeClick,
+      )
+    : { name: fromName, onClick: onFromNodeClick };
+  const topTo = singleDirection
+    ? directionEndpoint(
+        singleDirection.toNodeNum,
+        segment,
+        fromName,
+        toName,
+        onFromNodeClick,
+        onToNodeClick,
+      )
+    : { name: toName, onClick: onToNodeClick };
+
+  const effectiveIsMqtt = directionSummaries.length > 0
+    ? directionSummaries.some((summary) => summary.hasMqtt)
+    : isMqtt;
+
   const finiteSnrSamples = snrSamples.filter(
     (sample) => Number.isFinite(sample.snr) && !isUnknownSnr(sample.snr),
   );
@@ -312,13 +379,17 @@ export default function RouteSegmentPopup({
     <Popup>
       <div className="route-popup">
         <h4>Route Segment</h4>
-        {isMqtt && <div className="mqtt-badge">via IP</div>}
-        <div className="route-endpoints">
-          <EndpointName name={fromName} onClick={onFromNodeClick} />
+        {effectiveIsMqtt && <div className="mqtt-badge">via IP</div>}
+        <div
+          className="route-endpoints"
+          data-testid="route-direction"
+          data-direction={directionSummaries.length > 0 ? (isBidirectional ? 'bidirectional' : 'one-way') : 'unknown'}
+        >
+          <EndpointName name={topFrom.name} onClick={topFrom.onClick} />
           {' '}
-          <UiIcon name="bidirectional" size={14} />
+          <UiIcon name={isBidirectional || directionSummaries.length === 0 ? 'bidirectional' : 'forward'} size={14} />
           {' '}
-          <EndpointName name={toName} onClick={onToNodeClick} />
+          <EndpointName name={topTo.name} onClick={topTo.onClick} />
         </div>
         <div className="route-usage">
           Used in {usageValue} traceroute{usageCount !== 1 ? 's' : ''}
@@ -338,7 +409,55 @@ export default function RouteSegmentPopup({
             Last traced: <strong>{formatRelativeTime(lastSeen)}</strong>
           </div>
         )}
-        {snrStats && (
+        {directionSummaries.length > 0 && (
+          <div className="route-snr-stats">
+            <h5>Directional evidence:</h5>
+            {directionSummaries.map((summary) => {
+              const from = directionEndpoint(
+                summary.fromNodeNum,
+                segment,
+                fromName,
+                toName,
+                onFromNodeClick,
+                onToNodeClick,
+              );
+              const to = directionEndpoint(
+                summary.toNodeNum,
+                segment,
+                fromName,
+                toName,
+                onFromNodeClick,
+                onToNodeClick,
+              );
+              const avg = directionAverage(summary);
+              const validSamples = summary.snrSamples.filter(
+                (sample) => Number.isFinite(sample.snr) && !isUnknownSnr(sample.snr),
+              );
+              return (
+                <div
+                  key={`${summary.fromNodeNum}-${summary.toNodeNum}`}
+                  data-testid={`direction-${summary.fromNodeNum}-${summary.toNodeNum}`}
+                  className="route-usage"
+                  style={{ marginTop: '6px' }}
+                >
+                  <div className="route-endpoints">
+                    <EndpointName name={from.name} onClick={from.onClick} />
+                    {' '}
+                    <UiIcon name="forward" size={13} />
+                    {' '}
+                    <EndpointName name={to.name} onClick={to.onClick} />
+                  </div>
+                  <div>
+                    <strong>{summary.usageCount}</strong> traceroute{summary.usageCount !== 1 ? 's' : ''}
+                    {avg !== null && <> · <strong>{avg} dB avg</strong></>}
+                    {validSamples.length > 0 && <> · {validSamples.length} sample{validSamples.length !== 1 ? 's' : ''}</>}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+        {directionSummaries.length === 0 && snrStats && (
           <div className="route-snr-stats">
             {snrStats.count === 1 ? (
               <>

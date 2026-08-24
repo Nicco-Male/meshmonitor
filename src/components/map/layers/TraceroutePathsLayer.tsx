@@ -15,6 +15,7 @@ import {
   isValidRouteNode,
   type TracerouteRenderSegment,
 } from '../../../utils/tracerouteSegments';
+import { annotateTracerouteDirections } from '../../../utils/tracerouteDirections';
 
 const CURVE_SEGMENTS = 20;
 const TRACEROUTE_MAP_MAX_AGE_HOURS = 4;
@@ -253,10 +254,16 @@ function TraceroutePathsLayerImpl(props: TraceroutePathsLayerProps): ReactElemen
       })
     : segments;
 
+  // Compute A->B / B->A evidence only after the map TTL guard. This prevents
+  // an expired reverse traversal from keeping a stale bidirectional popup.
+  const directionalSegments = isNormalMapOverlay
+    ? annotateTracerouteDirections(mapOverlaySegments)
+    : mapOverlaySegments;
+
   // One physical node must have one position. Pool all route-local fallback
   // candidates before resolving geometry, popups, arrows, and markers so every
   // link terminates at the same consensus point.
-  const consolidatedSegments = consolidateEstimatedNodePositions(mapOverlaySegments);
+  const consolidatedSegments = consolidateEstimatedNodePositions(directionalSegments);
 
   // Resolve each segment's color/weight/opacity/dash/curvature/positions
   // exactly once and reuse the result for both the Polyline pass and the
