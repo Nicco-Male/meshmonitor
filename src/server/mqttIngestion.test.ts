@@ -122,7 +122,13 @@ function envFor(from: number, portnum: number): ServiceEnvelopeShape {
       from,
       to: 0xffffffff,
       channel: 0,
-      decoded: { portnum, payload: new Uint8Array([0]) },
+      decoded: {
+        portnum,
+        payload: new Uint8Array([0]),
+        // TRACEROUTE_APP fixtures represent completed responses unless a test
+        // explicitly overrides this to 0 for an initiating request.
+        ...(portnum === 70 ? { requestId: 0xabcdef01 } : {}),
+      },
     },
   };
 }
@@ -751,6 +757,20 @@ describe('ingestServiceEnvelope — TRACEROUTE_APP', () => {
     expect(telemetryCall).toBeDefined();
     expect(telemetryCall[0].value).toBe(1); // route.length + 1
     expect(telemetryCall[1]).toBe('bridge-1');
+  });
+
+  it('skips an MQTT traceroute request instead of saving a completed direct trace', async () => {
+    const envelope = envFor(NODE_IN, 70 /* TRACEROUTE_APP */);
+    envelope.packet!.to = NODE_OUT;
+    envelope.packet!.decoded!.requestId = 0;
+
+    const result = await ingestServiceEnvelope({
+      sourceId: 'bridge-1',
+      envelope,
+    });
+
+    expect(result.ingested).toBe(true);
+    expect(databaseService.insertTracerouteAsync).not.toHaveBeenCalled();
   });
 
   it('upserts the sender node when it has not been seen before', async () => {

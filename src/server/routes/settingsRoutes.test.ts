@@ -218,6 +218,25 @@ describe('settingsRoutes', () => {
       expect(databaseService.settings.setSettings).toHaveBeenCalled();
     });
 
+    it('persists node telemetry channel labels', async () => {
+      const app = createApp(adminUser);
+      const telemetryChannelLabels = JSON.stringify({
+        'source-a:!e1820fa0': {
+          1: 'Solar panel',
+          2: 'Battery',
+        },
+      });
+
+      await request(app)
+        .post('/api/settings')
+        .send({ telemetryChannelLabels })
+        .expect(200);
+
+      expect(databaseService.settings.setSettings).toHaveBeenCalledWith(
+        expect.objectContaining({ telemetryChannelLabels }),
+      );
+    });
+
     it('should return 401 when not authenticated', async () => {
       const app = createApp(null);
       (databaseService as any).findUserByIdAsync.mockResolvedValue(null);

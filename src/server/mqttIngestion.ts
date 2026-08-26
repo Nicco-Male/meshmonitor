@@ -257,6 +257,8 @@ async function ingestServiceEnvelopeInner(input: MqttIngestionInput): Promise<Mq
             payload?: Uint8Array;
             emoji?: number;
             replyId?: number;
+            requestId?: number;
+            wantResponse?: boolean;
             channelDatabaseId?: number;
             // The originator's ok_to_mqtt bit must survive server-side decrypt —
             // violation detection reads it off the synthesized shape (#4114).
@@ -267,6 +269,8 @@ async function ingestServiceEnvelopeInner(input: MqttIngestionInput): Promise<Mq
           payload: r.payload,
           emoji: r.emoji,
           replyId: r.replyId,
+          requestId: r.requestId,
+          wantResponse: r.wantResponse,
           channelDatabaseId: r.channelDatabaseId,
           bitfield: r.bitfield,
         };
@@ -641,6 +645,16 @@ async function ingestServiceEnvelopeInner(input: MqttIngestionInput): Promise<Mq
     }
 
     case PortNum.TRACEROUTE_APP: {
+      const tracerouteRequestId = Number(
+        decoded.requestId ?? decoded.request_id ?? 0,
+      );
+      const isTracerouteResponse = tracerouteRequestId !== 0;
+      if (!isTracerouteResponse) {
+        // MQTT sees both legs of the exchange. The initiating packet contains
+        // no completed path, so skip it exactly like the direct-radio ingest
+        // path does. The later response is normalized before persistence.
+        return { ingested: true, portnum };
+      }
       await ingestTraceroute(sourceId, packet, payload as Record<string, any>, fromNum, fromNodeId, toNum, toNodeId, nowMs, effectiveChannel);
       return { ingested: true, portnum };
     }

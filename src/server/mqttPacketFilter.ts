@@ -44,7 +44,17 @@ export interface MeshPacketShape {
   rxRssi?: number;
   hopLimit?: number;
   hopStart?: number;
-  decoded?: { portnum?: number; payload?: Uint8Array; bitfield?: number };
+  decoded?: {
+    portnum?: number;
+    payload?: Uint8Array;
+    bitfield?: number;
+    requestId?: number;
+    request_id?: number;
+    wantResponse?: boolean;
+    emoji?: number;
+    replyId?: number;
+    channelDatabaseId?: number;
+  };
   encrypted?: Uint8Array;
 }
 

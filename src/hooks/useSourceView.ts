@@ -674,12 +674,13 @@ export function useSourceView(params: UseSourceViewParams) {
       routeBack: tr.routeBack,
       snrTowards: tr.snrTowards,
       snrBack: tr.snrBack,
+      routePositions: tr.routePositions,
       timestamp: tr.timestamp,
       createdAt: tr.createdAt,
     }));
   }, [
     traceroutes
-      .map(tr => `${tr.fromNodeNum}-${tr.toNodeNum}-${tr.route}-${tr.routeBack}-${tr.timestamp || tr.createdAt}`)
+      .map(tr => `${tr.fromNodeNum}-${tr.toNodeNum}-${tr.route}-${tr.routeBack}-${tr.routePositions ?? ''}-${tr.timestamp || tr.createdAt}`)
       .join(','),
   ]);
 
@@ -697,16 +698,16 @@ export function useSourceView(params: UseSourceViewParams) {
     [setSelectedNodeId, setMapCenterTarget, setSelectedRouteSegment]
   );
 
-  // Compute visible node numbers for neighbor-info line and traceroute path filtering.
-  // Must mirror the per-marker filter in NodesTab so that lines are hidden whenever
-  // their endpoint nodes are hidden (Issues #1102, #3147).
+  // Compute node numbers eligible for map overlays. Unpositioned nodes remain
+  // eligible here: traceroute rendering can give an intermediate hop a
+  // route-local signal-weighted position and draw its explicit estimated
+  // marker. Neighbor links still require a real endpoint position downstream.
   const visibleNodeNums = useMemo(() => {
     // #4240: one clock read per recompute. Deliberately computed INSIDE the memo
     // rather than listed as a dependency — a fresh timestamp every render would
     // invalidate this memo on every render.
     const transportCutoff = transportCutoffSec(effectiveMapMaxAge);
     const visibleNodes = processedNodes.filter(node => {
-      if (!node.position?.latitude || !node.position?.longitude) return false;
       // #4162/#3549: "Hide from Map" suppresses the marker (NodesTab drops it
       // at nodesWithPosition), so it must also drop from this visible set —
       // otherwise route-segment / neighbor lines dangle to a marker-less node.

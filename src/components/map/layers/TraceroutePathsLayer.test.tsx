@@ -39,7 +39,9 @@ vi.mock('react-leaflet', () => ({
   Marker: (props: { children?: ReactNode }) => <div data-testid="arrow-marker">{props.children}</div>,
   Tooltip: (props: { children?: ReactNode }) => <div data-testid="tooltip">{props.children}</div>,
   Popup: (props: { children?: ReactNode }) => <div data-testid="popup">{props.children}</div>,
-  CircleMarker: (props: { children?: ReactNode }) => <div data-testid="circle-marker">{props.children}</div>,
+  CircleMarker: (props: { center?: [number, number]; children?: ReactNode }) => (
+    <div data-testid="circle-marker" data-center={JSON.stringify(props.center)}>{props.children}</div>
+  ),
 }));
 
 const snrColors: SnrColorScale = {
@@ -55,6 +57,8 @@ function seg(overrides: Partial<TracerouteRenderSegment> = {}): TracerouteRender
     key: 'forward:1-2',
     from: [10, 10],
     to: [20, 20],
+    fromNodeNum: 1,
+    toNodeNum: 2,
     leg: 'forward',
     avgSnr: 5,
     isMqtt: false,
@@ -170,6 +174,127 @@ describe('TraceroutePathsLayer', () => {
         fixedColor: '#facc15',
       });
       expect(screen.getByTestId('polyline').getAttribute('data-color')).toBe('#facc15');
+    });
+  });
+
+  describe('colorMode: custom', () => {
+    it('uses the caller color for each individual hop', () => {
+      renderLayer({
+        segments: [seg({ key: 'hop-a', hopIndex: 2 })],
+        weight: 3,
+        colorMode: 'custom',
+        segmentColor: (segment) => `hop-${segment.hopIndex}`,
+      });
+      expect(screen.getByTestId('polyline').getAttribute('data-color')).toBe('hop-2');
+    });
+  });
+
+  describe('estimated hop markers', () => {
+    it('renders one explicit marker for an estimated interior hop shared by two segments', () => {
+      const estimatedPosition: [number, number] = [15, 15];
+      renderLayer({
+        segments: [
+          seg({
+            key: 'into-unknown',
+            to: estimatedPosition,
+            toNodeNum: 4294967295,
+            toHopKey: 'trace:forward:unknown:0:4294967295',
+            toPositionEstimated: true,
+          }),
+          seg({
+            key: 'out-of-unknown',
+            from: estimatedPosition,
+            fromNodeNum: 4294967295,
+            fromHopKey: 'trace:forward:unknown:0:4294967295',
+            fromPositionEstimated: true,
+          }),
+        ],
+        weight: 3,
+        colorMode: 'snr',
+        showEstimatedHopMarkers: true,
+        estimatedHopName: () => 'Hidden relay',
+      });
+
+      expect(screen.getAllByTestId('circle-marker')).toHaveLength(1);
+      expect(screen.getByText('Hidden relay (estimated)')).toBeInTheDocument();
+      expect(screen.getByText('Estimated Route Hop')).toBeInTheDocument();
+      expect(screen.getByText(/not a reported GPS fix/i)).toBeInTheDocument();
+    });
+
+    it('renders one centroid marker and joins every line there for one real node ID', () => {
+      const nodeNum = 0x1234fb3c;
+      renderLayer({
+        segments: [
+          seg({
+            key: 'trace-1-into',
+            from: [0, 0],
+            to: [10, 20],
+            fromNodeNum: 100,
+            toNodeNum: nodeNum,
+            toHopKey: `node:${nodeNum}`,
+            toPositionEstimated: true,
+            timestamp: 1,
+          }),
+          seg({
+            key: 'trace-1-out',
+            from: [10, 20],
+            to: [30, 30],
+            fromNodeNum: nodeNum,
+            toNodeNum: 200,
+            fromHopKey: `node:${nodeNum}`,
+            fromPositionEstimated: true,
+            timestamp: 1,
+          }),
+          seg({
+            key: 'trace-2-into',
+            from: [40, 40],
+            to: [20, 30],
+            fromNodeNum: 300,
+            toNodeNum: nodeNum,
+            toHopKey: `node:${nodeNum}`,
+            toPositionEstimated: true,
+            timestamp: 2,
+          }),
+          seg({
+            key: 'trace-2-out',
+            from: [20, 30],
+            to: [50, 50],
+            fromNodeNum: nodeNum,
+            toNodeNum: 400,
+            fromHopKey: `node:${nodeNum}`,
+            fromPositionEstimated: true,
+            timestamp: 2,
+          }),
+        ],
+        weight: 3,
+        colorMode: 'snr',
+        showEstimatedHopMarkers: true,
+        estimatedHopName: () => 'Meshtastic fb3c',
+      });
+
+      expect(screen.getAllByTestId('circle-marker')).toHaveLength(1);
+      expect(screen.getByTestId('circle-marker')).toHaveAttribute(
+        'data-center',
+        JSON.stringify([15, 25]),
+      );
+      const positions = screen.getAllByTestId('polyline').map((line) =>
+        JSON.parse(line.getAttribute('data-positions') ?? '[]'),
+      );
+      expect(positions).toEqual([
+        [[0, 0], [15, 25]],
+        [[15, 25], [30, 30]],
+        [[40, 40], [15, 25]],
+        [[15, 25], [50, 50]],
+      ]);
+    });
+
+    it('does not render estimated markers unless explicitly enabled', () => {
+      renderLayer({
+        segments: [seg({ toPositionEstimated: true })],
+        weight: 3,
+        colorMode: 'snr',
+      });
+      expect(screen.queryByTestId('circle-marker')).not.toBeInTheDocument();
     });
   });
 

@@ -24,14 +24,20 @@ export interface CopyNodeInfoResult {
   pushedToDevice: boolean;
 }
 
-/** Canonical "this NodeInfo field is empty" predicate. */
-export function isNodeInfoFieldBlank(value: unknown): boolean {
-  return value == null || value === '';
+/**
+ * Canonical "this NodeInfo field is empty" predicate.
+ *
+ * Most NodeInfo fields are blank only when null/undefined/empty-string. Meshtastic
+ * HardwareModel.UNSET is encoded as numeric 0, though, and must also be treated as
+ * blank. Other numeric zero values (for example role=0) remain valid.
+ */
+export function isNodeInfoFieldBlank(value: unknown, field?: NodeInfoField): boolean {
+  return value == null || value === '' || (field === 'hwModel' && value === 0);
 }
 
 /** Count of NODE_INFO_FIELDS that are non-blank on a node. Used for donor ranking. */
 export function countFilledNodeInfoFields(node: Partial<DbNode>): number {
-  return NODE_INFO_FIELDS.filter(f => !isNodeInfoFieldBlank(node[f as keyof DbNode])).length;
+  return NODE_INFO_FIELDS.filter(f => !isNodeInfoFieldBlank(node[f as keyof DbNode], f)).length;
 }
 
 /** Analysis field set — NODE_INFO_FIELDS minus the derived hasPKC flag. */
@@ -156,12 +162,12 @@ export async function copyNodeInfo(
     if (selected && !selected.has(field)) continue;
 
     const donorVal = (donorNode as any)[field];
-    if (donorVal == null || donorVal === '') continue;
+    if (isNodeInfoFieldBlank(donorVal, field)) continue;
 
     if (!selected) {
       // Legacy path: fill only what the target is missing.
       const targetVal = (targetNode as any)[field];
-      if (targetVal != null && targetVal !== '') continue;
+      if (!isNodeInfoFieldBlank(targetVal, field)) continue;
     }
 
     (updates as any)[field] = donorVal;

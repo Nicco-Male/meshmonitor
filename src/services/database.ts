@@ -35,6 +35,7 @@ import {
   TelemetryRepository,
   AuthRepository,
   TraceroutesRepository,
+  normalizeTracerouteResponseEndpoints,
   NeighborsRepository,
   NotificationsRepository,
   ConversationReadStateRepository,
@@ -2082,13 +2083,13 @@ class DatabaseService {
       if (this.traceroutesRepo) {
         const now = Date.now();
         const pendingTimeoutAgo = now - PENDING_TRACEROUTE_TIMEOUT_MS;
+        const normalizedData = normalizeTracerouteResponseEndpoints(tracerouteData);
         try {
-          // Check for pending traceroute (reversed direction - see note below)
-          // NOTE: When a traceroute response comes in, fromNum is the destination (responder) and toNum is the local node (requester)
-          // But when we created the pending record, fromNodeNum was the local node and toNodeNum was the destination
+          // Completed packets arrive responder -> requester, but stored rows
+          // use requester -> responder so `route` follows the endpoints.
           const pendingRecord = await this.traceroutesRepo.findPendingTraceroute(
-            tracerouteData.toNodeNum,    // Reversed: response's toNum is the requester
-            tracerouteData.fromNodeNum,  // Reversed: response's fromNum is the destination
+            normalizedData.fromNodeNum,
+            normalizedData.toNodeNum,
             pendingTimeoutAgo,
             sourceId
           );
@@ -2097,22 +2098,23 @@ class DatabaseService {
             // Update existing pending record
             await this.traceroutesRepo.updateTracerouteResponse(
               pendingRecord.id,
-              tracerouteData.route || null,
-              tracerouteData.routeBack || null,
-              tracerouteData.snrTowards || null,
-              tracerouteData.snrBack || null,
-              tracerouteData.timestamp,
-              tracerouteData.packetId ?? null
+              normalizedData.route || null,
+              normalizedData.routeBack || null,
+              normalizedData.snrTowards || null,
+              normalizedData.snrBack || null,
+              normalizedData.timestamp,
+              normalizedData.packetId ?? null
             );
           } else {
-            // Insert new traceroute
-            await this.traceroutesRepo.insertTraceroute(tracerouteData, sourceId);
+            // No request row was observed (common for passive MQTT
+            // ingestion). Insert the response in canonical orientation.
+            await this.traceroutesRepo.insertTraceroute(normalizedData, sourceId);
           }
 
           // Cleanup old traceroutes
           await this.traceroutesRepo.cleanupOldTraceroutesForPair(
-            tracerouteData.fromNodeNum,
-            tracerouteData.toNodeNum,
+            normalizedData.fromNodeNum,
+            normalizedData.toNodeNum,
             TRACEROUTE_HISTORY_LIMIT,
             sourceId
           );

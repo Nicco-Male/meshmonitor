@@ -30,6 +30,10 @@ export interface DecryptionResult {
    */
   emoji?: number;
   replyId?: number;
+  /** Data.request_id, used to distinguish request packets from responses. */
+  requestId?: number;
+  /** Data.want_response, preserved for request/response-aware ingestion. */
+  wantResponse?: boolean;
   /**
    * Raw `Data.bitfield` (protobuf field 9). Bit 0 carries the originator's
    * `ok_to_mqtt` preference — see Router.h:177 in the firmware. Undefined
@@ -272,6 +276,8 @@ class ChannelDecryptionService {
     payload?: Uint8Array;
     emoji?: number;
     replyId?: number;
+    requestId?: number;
+    wantResponse?: boolean;
     bitfield?: number;
   } {
     try {
@@ -298,6 +304,14 @@ class ChannelDecryptionService {
       const rawReplyId = decoded.replyId ?? decoded.reply_id;
       const replyId =
         typeof rawReplyId === 'number' && rawReplyId > 0 ? rawReplyId >>> 0 : undefined;
+      const rawRequestId = decoded.requestId ?? decoded.request_id;
+      const requestId =
+        rawRequestId != null && Number.isFinite(Number(rawRequestId))
+          ? Number(rawRequestId) >>> 0
+          : undefined;
+      const rawWantResponse = decoded.wantResponse ?? decoded.want_response;
+      const wantResponse =
+        typeof rawWantResponse === 'boolean' ? rawWantResponse : undefined;
 
       // Bit 0 of Data.bitfield carries the originator's `ok_to_mqtt`
       // preference. MqttBridgeManager reads this to gate uplink
@@ -312,6 +326,8 @@ class ChannelDecryptionService {
         payload: decoded.payload ? new Uint8Array(decoded.payload) : undefined,
         emoji,
         replyId,
+        requestId,
+        wantResponse,
         bitfield,
       };
     } catch {
@@ -347,6 +363,8 @@ class ChannelDecryptionService {
       payload: validation.payload,
       emoji: validation.emoji,
       replyId: validation.replyId,
+      requestId: validation.requestId,
+      wantResponse: validation.wantResponse,
       bitfield: validation.bitfield,
     };
   }
