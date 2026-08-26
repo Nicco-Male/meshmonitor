@@ -3,9 +3,16 @@
  */
 import { useEffect, useRef } from 'react';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen, fireEvent, within } from '@testing-library/react';
+import { render, screen, fireEvent } from '@testing-library/react';
 import DashboardMap from './DashboardMap';
 import { darkOverlayColors } from '../../config/overlayColors';
+// D3's most-permissive cross-source rule (#4412 Phase 3): DashboardMap itself
+// takes maxNodeAgeHours as a plain prop (unchanged by Phase 3), but the value
+// DashboardPage feeds it is `maxAcross(...)` over every source in view. Using
+// the real exported helper here — rather than a disconnected literal — ties
+// these tests to the actual rule instead of a number that happens to match it.
+import { maxAcross } from '../../hooks/useNodeDisplaySettings';
+import { NODE_DISPLAY_NUMERIC_DEFAULTS } from '../../constants/nodeDisplayDefaults';
 
 // Shared, mutable mocks for the map instance and settings so individual tests
 // can assert fitBounds behavior and toggle the Default Map Center (issue #4125).
@@ -18,22 +25,13 @@ const mocks = vi.hoisted(() => ({
     defaultMapCenterLat: null as number | null,
     defaultMapCenterLon: null as number | null,
     defaultMapCenterZoom: null as number | null,
-    distanceUnit: 'km' as 'km' | 'mi',
+    activeStyleJson: null as Record<string, unknown> | null,
   },
-  mapContext: {
-    showPaths: false,
-    showRoute: false,
-    showAccuracyRegions: false,
-    showRfNodes: true,
-    showUdpNodes: true,
-    showMqttNodes: true,
-    showNeighborInfo: true,
-    showWaypoints: false,
-    showAtakContacts: false,
-    showPolarGrid: false,
-    mapMaxAgeHours: null as number | null,
-  },
-  sources: [] as Array<{ id: string; name: string; type: string }>,
+  // #4704: terrain capabilities gate the 2D/3D toggle. Default unavailable so
+  // existing tests stay on the 2D BaseMap; the 3D tests flip it on.
+  terrainCaps: { enabled: false, terrainTiles: false, isLoading: false },
+  rendered3DNodes: [] as unknown[][],
+  geoJsonLayers: [] as Array<{ id: string; name: string; visible: boolean; style: { color: string } }>,
 }));
 
 // ---------------------------------------------------------------------------
@@ -46,8 +44,40 @@ const mocks = vi.hoisted(() => ({
 // side-effecting leafletDefaultIcon module (mutates L.Icon.Default, which the
 // `leaflet` mock below doesn't provide) — both are stubbed the same way
 // BaseMap.test.tsx does it, so this bare-component render stays dependency-free.
+// #4704: the 3D surface (Base3DMap → maplibre-gl) is heavy and irrelevant to
+// these DOM-light 2D tests. Stub Map3DView, exposing the props the 3D tests
+// assert on. Also short-circuit basemap3d/init so DashboardMap's unconditional
+// 3D-basemap derivation and `appBasename` import don't pull real modules.
+vi.mock('../map/Map3DView', () => ({
+  Map3DView: ({ nodes, sourceIds, showNeighbors, showTraceroutes }: any) => {
+    mocks.rendered3DNodes.push(nodes);
+    return (
+      <div
+        data-testid="map-3d-view"
+        data-node-count={nodes.length}
+        data-source-ids={JSON.stringify(sourceIds)}
+        data-show-neighbors={String(showNeighbors)}
+        data-show-traceroutes={String(showTraceroutes)}
+      />
+    );
+  },
+}));
+vi.mock('../../config/basemap3d', () => ({
+  resolve3DBasemap: () => ({ tiles: [], attribution: '', maxZoom: 19, usedFallback: false }),
+  buildTerrainTileUrl: () => '/api/elevation/tiles/{z}/{x}/{y}',
+}));
+vi.mock('../../init', () => ({ appBasename: '' }));
+vi.mock('../../hooks/useTerrainCapabilities', () => ({
+  useTerrainCapabilities: () => mocks.terrainCaps,
+}));
+
 vi.mock('../VectorTileLayer', () => ({
-  VectorTileLayer: () => <div data-testid="vector-tile-layer" />,
+  // Surfaces styleJson as a data attribute (issue #4348) so tests can assert
+  // DashboardMap forwards the active MapLibre style through to the vector
+  // tile layer, matching NodesTab's behavior.
+  VectorTileLayer: ({ styleJson }: { styleJson?: Record<string, unknown> }) => (
+    <div data-testid="vector-tile-layer" data-style-json={styleJson ? JSON.stringify(styleJson) : ''} />
+  ),
 }));
 vi.mock('../map/leafletDefaultIcon', () => ({}));
 
@@ -72,19 +102,9 @@ vi.mock('react-leaflet', () => ({
   // #4042: expose resolved positions so tests can assert a neighbor line
   // terminates at a node's rendered marker position (not the link's raw
   // embedded lat/lng) — mirrors NeighborLinksLayer.test.tsx's mock.
-  Polyline: ({ positions, pathOptions, children }: any) => (
-    <div
-      data-testid="map-polyline"
-      data-positions={JSON.stringify(positions)}
-      data-color={pathOptions?.color}
-    >
-      {children}
-    </div>
+  Polyline: ({ positions }: any) => (
+    <div data-testid="map-polyline" data-positions={JSON.stringify(positions)} />
   ),
-  CircleMarker: ({ center, children }: any) => (
-    <div data-testid="map-circle-marker" data-center={JSON.stringify(center)}>{children}</div>
-  ),
-  Tooltip: ({ children }: any) => <div data-testid="map-tooltip">{children}</div>,
   Rectangle: () => <div data-testid="map-rectangle" />,
   useMap: () => ({ fitBounds: mocks.fitBounds, setView: vi.fn() }),
 }));
@@ -95,18 +115,24 @@ vi.mock('react-leaflet', () => ({
 // filtering doesn't drop existing fixture nodes), traceroute/accuracy off.
 vi.mock('../../contexts/MapContext', () => ({
   useMapContext: () => ({
-    ...mocks.mapContext,
+    showPaths: false,
     setShowPaths: vi.fn(),
+    showRoute: false,
     setShowRoute: vi.fn(),
+    showAccuracyRegions: false,
     setShowAccuracyRegions: vi.fn(),
+    showRfNodes: true,
     setShowRfNodes: vi.fn(),
+    showUdpNodes: true,
     setShowUdpNodes: vi.fn(),
+    showMqttNodes: true,
     setShowMqttNodes: vi.fn(),
+    showNeighborInfo: true,
     setShowNeighborInfo: vi.fn(),
+    showWaypoints: false,
     setShowWaypoints: vi.fn(),
-    setShowAtakContacts: vi.fn(),
+    showPolarGrid: false,
     setShowPolarGrid: vi.fn(),
-    setMapMaxAgeHours: vi.fn(),
   }),
 }));
 
@@ -115,7 +141,7 @@ vi.mock('../../contexts/MapContext', () => ({
 // without a QueryClient/AuthProvider; empty data ⇒ no grid, existing assertions
 // (marker/polyline counts) are unaffected.
 vi.mock('../../hooks/useDashboardData', () => ({
-  useDashboardSources: () => ({ data: mocks.sources }),
+  useDashboardSources: () => ({ data: [] }),
   useSourceStatuses: () => new Map(),
   UNIFIED_SOURCE_ID: '__unified__',
 }));
@@ -127,8 +153,8 @@ vi.mock('../../hooks/useCsrfFetch', () => ({
 }));
 vi.mock('../../services/api', () => ({
   default: {
-    get: vi.fn().mockResolvedValue([]),
     getBaseUrl: vi.fn().mockResolvedValue(''),
+    get: vi.fn().mockImplementation(() => Promise.resolve(mocks.geoJsonLayers)),
   },
 }));
 
@@ -136,6 +162,7 @@ vi.mock('../../services/api', () => ({
 // SettingsContext; mock the display-settings hook so tests don't need a
 // SettingsProvider.
 vi.mock('../../contexts/SettingsContext', () => ({
+  useNodeListStyle: () => 'monochrome',
   useDisplaySettings: () => ({ timeFormat: '24', dateFormat: 'MM/DD/YYYY' }),
   useSettings: () => mocks.settings,
 }));
@@ -156,11 +183,14 @@ vi.mock('../../utils/mapIcons', () => ({
 }));
 
 vi.mock('../../config/tilesets', () => ({
-  getTilesetById: () => ({
-    url: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
-    attribution: '© OSM',
-    maxZoom: 19,
-  }),
+  // Resolves the fixture vector tileset (below) as a vector tileset so
+  // BaseMap takes its VectorTileLayer branch (issue #4348 problem 4); every
+  // other id keeps the pre-existing raster stub the rest of this file relies on.
+  getTilesetById: (id: string) => (
+    id === 'custom-vector-1'
+      ? { url: 'http://tileserver.local/data/v3/{z}/{x}/{y}.pbf', attribution: '', maxZoom: 19, isVector: true }
+      : { url: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png', attribution: '© OSM', maxZoom: 19 }
+  ),
   DEFAULT_TILESET_ID: 'osm',
 }));
 
@@ -312,7 +342,8 @@ const defaultProps = {
   customTilesets: [],
   defaultCenter: { lat: 35.0, lng: -80.0 },
   sourceId: null,
-  maxNodeAgeHours: 24,
+  maxNodeAgeHours: NODE_DISPLAY_NUMERIC_DEFAULTS.maxNodeAgeHours,
+  maxInfraNodeAgeHours: 720, // #4899 infra window (30 days)
 };
 
 // ---------------------------------------------------------------------------
@@ -330,21 +361,11 @@ describe('DashboardMap', () => {
     mocks.settings.defaultMapCenterLat = null;
     mocks.settings.defaultMapCenterLon = null;
     mocks.settings.defaultMapCenterZoom = null;
-    mocks.settings.distanceUnit = 'km';
-    Object.assign(mocks.mapContext, {
-      showPaths: false,
-      showRoute: false,
-      showAccuracyRegions: false,
-      showRfNodes: true,
-      showUdpNodes: true,
-      showMqttNodes: true,
-      showNeighborInfo: true,
-      showWaypoints: false,
-      showAtakContacts: false,
-      showPolarGrid: false,
-      mapMaxAgeHours: null,
-    });
-    mocks.sources = [];
+    mocks.settings.activeStyleJson = null;
+    // Default: terrain unavailable ⇒ no 3D toggle, stays on 2D BaseMap.
+    mocks.terrainCaps = { enabled: false, terrainTiles: false, isLoading: false };
+    mocks.rendered3DNodes.length = 0;
+    mocks.geoJsonLayers.length = 0;
   });
 
   // --- Default Map Center vs auto-fit (issue #4125) ---------------------------
@@ -364,6 +385,21 @@ describe('DashboardMap', () => {
     expect(mocks.fitBounds).not.toHaveBeenCalled();
   });
 
+  // --- Zoom to fit (#4898) ---------------------------------------------------
+
+  it('renders an enabled Zoom to fit button when nodes have positions (#4898)', () => {
+    render(<DashboardMap {...defaultProps} nodes={[nodeWithPosition]} />);
+    const btn = screen.getByLabelText('Zoom to fit all nodes') as HTMLButtonElement;
+    expect(btn).toBeTruthy();
+    expect(btn.disabled).toBe(false);
+  });
+
+  it('disables Zoom to fit when no nodes have positions (#4898)', () => {
+    render(<DashboardMap {...defaultProps} nodes={[]} />);
+    const btn = screen.getByLabelText('Zoom to fit all nodes') as HTMLButtonElement;
+    expect(btn.disabled).toBe(true);
+  });
+
   // --- Features panel collapse (#3912) ---------------------------------------
 
   it('shows the Features panel toggles by default', () => {
@@ -371,18 +407,19 @@ describe('DashboardMap', () => {
     expect(screen.getByText('Show Traceroute')).toBeInTheDocument();
   });
 
-  it('hides the Features panel toggles when the collapse button is clicked', () => {
+  it('collapses the map controls sidebar when the collapse button is clicked (#4909)', () => {
     render(<DashboardMap {...defaultProps} />);
-    fireEvent.click(screen.getByTitle('Collapse controls'));
+    fireEvent.click(screen.getByTitle('Hide Map controls'));
     expect(screen.queryByText('Show Traceroute')).not.toBeInTheDocument();
-    expect(screen.getByText('Features')).toBeInTheDocument();
+    // Collapsed → only the reopen toggle remains.
+    expect(screen.getByTitle('Show Map controls')).toBeInTheDocument();
   });
 
-  it('restores a collapsed Features panel from localStorage (shared with the NodesTab map)', () => {
-    localStorage.setItem('isMapControlsCollapsed', 'true');
+  it('restores the collapsed sidebar from localStorage (#4909)', () => {
+    localStorage.setItem('mm-dashboard-map-sidebar', 'true');
     render(<DashboardMap {...defaultProps} />);
     expect(screen.queryByText('Show Traceroute')).not.toBeInTheDocument();
-    fireEvent.click(screen.getByTitle('Expand controls'));
+    fireEvent.click(screen.getByTitle('Show Map controls'));
     expect(screen.getByText('Show Traceroute')).toBeInTheDocument();
   });
 
@@ -431,6 +468,59 @@ describe('DashboardMap', () => {
     // (newer = more transparent) slipping through, which `< fresh` alone would
     // miss for a node heard just inside a wide window.
     expect(staleOpacity).toBeLessThan(0.7);
+  });
+
+  // #4899: MeshCore infrastructure (advType 2/3) uses the separate infra
+  // window on the cross-source Dashboard map, so repeaters/room servers don't
+  // vanish between adverts even though they're past the companion window.
+  describe('MeshCore infrastructure age window (#4899)', () => {
+    const meshcoreRepeaterStale = {
+      user: { id: 'mc-rpt', shortName: 'RPT', longName: 'Repeater' },
+      position: { latitude: 36.1, longitude: -81.1 },
+      hopsAway: 0, role: 0, lastHeard: stale, isMeshCore: true, advType: 2,
+    };
+    const meshcoreCompanionStale = {
+      user: { id: 'mc-cmp', shortName: 'CMP', longName: 'Companion' },
+      position: { latitude: 36.3, longitude: -81.3 },
+      hopsAway: 0, role: 0, lastHeard: stale, isMeshCore: true, advType: 1,
+    };
+
+    it('keeps a stale repeater (past companion window, within infra window) but hides a stale companion', () => {
+      // Defaults: companion 24h, infra 720h. Both nodes are 48h old.
+      render(
+        <DashboardMap
+          {...defaultProps}
+          nodes={[meshcoreRepeaterStale, meshcoreCompanionStale]}
+        />,
+      );
+      expect(screen.getAllByTestId('map-marker')).toHaveLength(1);
+    });
+
+    it('hides even a repeater once it is past the infra window', () => {
+      render(
+        <DashboardMap
+          {...defaultProps}
+          maxInfraNodeAgeHours={24}
+          nodes={[meshcoreRepeaterStale]}
+        />,
+      );
+      expect(screen.queryAllByTestId('map-marker')).toHaveLength(0);
+    });
+
+    it('never hides infrastructure when the infra window is 0 (never)', () => {
+      const ancientRepeater = {
+        ...meshcoreRepeaterStale,
+        lastHeard: nowSeconds - 60 * 60 * 5000, // ~208 days old
+      };
+      render(
+        <DashboardMap
+          {...defaultProps}
+          maxInfraNodeAgeHours={0}
+          nodes={[ancientRepeater]}
+        />,
+      );
+      expect(screen.getAllByTestId('map-marker')).toHaveLength(1);
+    });
   });
 
   it('forwards the configured map pin style to createNodeIcon (issue #3364)', () => {
@@ -575,9 +665,14 @@ describe('DashboardMap', () => {
   });
 
   it('does not render markers for stale (inactive) nodes outside the maxNodeAgeHours window', () => {
+    // Single source in view: D3's max-across rule over one value is a no-op,
+    // but driving the prop through the real `maxAcross` helper — rather than
+    // a disconnected literal — ties this test to the actual rule.
+    const maxNodeAgeHours = maxAcross([NODE_DISPLAY_NUMERIC_DEFAULTS.maxNodeAgeHours]);
     render(
       <DashboardMap
         {...defaultProps}
+        maxNodeAgeHours={maxNodeAgeHours}
         nodes={[nodeWithPosition, staleNodeWithPosition]}
       />,
     );
@@ -586,9 +681,11 @@ describe('DashboardMap', () => {
   });
 
   it('renders markers for stale nodes that are favorites (favorites bypass age filter)', () => {
+    const maxNodeAgeHours = maxAcross([NODE_DISPLAY_NUMERIC_DEFAULTS.maxNodeAgeHours]);
     render(
       <DashboardMap
         {...defaultProps}
+        maxNodeAgeHours={maxNodeAgeHours}
         nodes={[staleFavoriteNodeWithPosition]}
       />,
     );
@@ -596,251 +693,37 @@ describe('DashboardMap', () => {
     expect(markers.length).toBe(1);
   });
 
-  // --- Dashboard traceroute popups -------------------------------------------
+  // --- D3 most-permissive rule (#4412 Phase 3) --------------------------------
+  //
+  // DashboardMap merges nodes from every source into one view, so it cannot
+  // use a single source's maxNodeAgeHours. DashboardPage instead feeds it
+  // `maxAcross(...)` over every source's window (D3: "never hide a node a
+  // source-scoped view would show"). These two tests exercise that rule at
+  // the DashboardMap boundary directly.
 
-  const tracerouteNodeA = {
-    nodeNum: 1,
-    sourceId: 'source-a',
-    user: { id: '!00000001', shortName: 'A', longName: 'Alpha' },
-    position: { latitude: 35.0, longitude: -80.0 },
-    hopsAway: 1,
-    role: 1,
-    lastHeard: recent,
-  };
-  const tracerouteNodeB = {
-    nodeNum: 2,
-    sourceId: 'source-a',
-    user: { id: '!00000002', shortName: 'B', longName: 'Bravo' },
-    position: { latitude: 35.1, longitude: -80.1 },
-    hopsAway: 1,
-    role: 1,
-    lastHeard: recent,
-  };
-  const tracerouteRecord = {
-    id: 10,
-    sourceId: 'source-a',
-    fromNodeNum: 1,
-    toNodeNum: 2,
-    route: '[]',
-    routeBack: '',
-    snrTowards: '[20]',
-    snrBack: '',
-    timestamp: recent * 1000,
-    createdAt: recent * 1000,
-  };
-
-  it('attaches the advanced popup to Route Segments', () => {
-    mocks.mapContext.showPaths = true;
-    mocks.sources = [{ id: 'source-a', name: 'Source Alpha', type: 'tcp' }];
-
-    const { container } = render(
-      <DashboardMap
-        {...defaultProps}
-        sourceId="source-a"
-        nodes={[tracerouteNodeA, tracerouteNodeB]}
-        traceroutes={[tracerouteRecord]}
-      />,
-    );
-
-    const popups = container.querySelectorAll('.route-popup');
-    expect(popups).toHaveLength(1);
-    expect(popups[0]).toHaveTextContent('Alpha');
-    expect(popups[0]).toHaveTextContent('Bravo');
-    expect(popups[0]).toHaveTextContent('5.0 dB');
-    expect(popups[0]).toHaveTextContent('Source Alpha');
-    expect(popups[0]).toHaveTextContent('Last traced:');
-  });
-
-  it('attaches the same advanced popup to the yellow Traceroute overlay', () => {
-    mocks.mapContext.showRoute = true;
-
-    const { container } = render(
-      <DashboardMap
-        {...defaultProps}
-        sourceId="source-a"
-        nodes={[tracerouteNodeA, tracerouteNodeB]}
-        traceroutes={[tracerouteRecord]}
-      />,
-    );
-
-    expect(container.querySelectorAll('.route-popup')).toHaveLength(1);
-  });
-
-  it('keeps an anonymous relay as two real hops and inserts an estimated marker', () => {
-    mocks.mapContext.showPaths = true;
-    const traceWithAnonymousHop = {
-      ...tracerouteRecord,
-      id: 13,
-      route: '[4294967295]',
-      snrTowards: '[20, 12]',
-    };
-
-    const { container } = render(
-      <DashboardMap
-        {...defaultProps}
-        sourceId="source-a"
-        nodes={[tracerouteNodeA, tracerouteNodeB]}
-        traceroutes={[traceWithAnonymousHop]}
-      />,
-    );
-
-    const lines = screen.getAllByTestId('map-polyline');
-    expect(lines).toHaveLength(2);
-    expect(screen.getAllByTestId('map-circle-marker')).toHaveLength(1);
-    expect(screen.getByText('Unknown hop (estimated)')).toBeInTheDocument();
-
-    const popups = Array.from(container.querySelectorAll<HTMLElement>('.route-popup'));
-    // There must be no fabricated Alpha↔Bravo segment when an anonymous relay
-    // exists between them.
-    expect(popups.some((popup) =>
-      popup.textContent?.includes('Alpha') && popup.textContent?.includes('Bravo')
-    )).toBe(false);
-    expect(popups.some((popup) => popup.textContent?.includes('Alpha') && popup.textContent?.includes('Unknown hop'))).toBe(true);
-    expect(popups.some((popup) => popup.textContent?.includes('Unknown hop') && popup.textContent?.includes('Bravo'))).toBe(true);
-  });
-
-  it('estimates a known intermediate node that has no reported position', () => {
-    mocks.mapContext.showPaths = true;
-    const unpositionedHop = {
-      nodeNum: 300,
-      sourceId: 'source-a',
-      user: { id: '!0000012c', shortName: 'HOP', longName: 'Relay Without GPS' },
-      position: null,
-      hopsAway: 1,
-      role: 1,
-      lastHeard: recent,
-    };
-    const traceViaUnpositionedHop = {
-      ...tracerouteRecord,
-      id: 14,
-      route: '[300]',
-      snrTowards: '[28, 16]',
-    };
-
+  it('D3: with sources A=6h and B=72h in view, a node last heard 48h ago still renders', () => {
+    const maxNodeAgeHours = maxAcross([6, 72]);
     render(
       <DashboardMap
         {...defaultProps}
-        sourceId="source-a"
-        nodes={[tracerouteNodeA, unpositionedHop, tracerouteNodeB]}
-        traceroutes={[traceViaUnpositionedHop]}
+        maxNodeAgeHours={maxNodeAgeHours}
+        nodes={[staleNodeWithPosition]}
       />,
     );
-
-    expect(screen.getAllByTestId('map-polyline')).toHaveLength(2);
-    expect(screen.getAllByTestId('map-circle-marker')).toHaveLength(1);
-    expect(screen.getByText('Relay Without GPS (estimated)')).toBeInTheDocument();
+    const markers = screen.getAllByTestId('map-marker');
+    expect(markers.length).toBe(1);
   });
 
-  it('keeps popups available when both traceroute layers are enabled', () => {
-    mocks.mapContext.showPaths = true;
-    mocks.mapContext.showRoute = true;
-
-    const { container } = render(
+  it('D3 inverse: with every source at 6h, a node last heard 48h ago does not render', () => {
+    const maxNodeAgeHours = maxAcross([6, 6]);
+    render(
       <DashboardMap
         {...defaultProps}
-        sourceId="source-a"
-        nodes={[tracerouteNodeA, tracerouteNodeB]}
-        traceroutes={[tracerouteRecord]}
+        maxNodeAgeHours={maxNodeAgeHours}
+        nodes={[staleNodeWithPosition]}
       />,
     );
-
-    // Each layer gets the same popup renderer; the yellow layer is on top and
-    // therefore remains clickable when both are drawn.
-    expect(container.querySelectorAll('.route-popup')).toHaveLength(2);
-  });
-
-  it('aggregates popup history per source without mixing Unified statistics', () => {
-    mocks.mapContext.showPaths = true;
-    mocks.sources = [
-      { id: 'source-a', name: 'Source Alpha', type: 'tcp' },
-      { id: 'source-b', name: 'Source Bravo', type: 'tcp' },
-    ];
-    const traces = [
-      tracerouteRecord,
-      {
-        ...tracerouteRecord,
-        id: 11,
-        snrTowards: '[8]', // 2 dB
-        timestamp: (recent + 1) * 1000,
-      },
-      {
-        ...tracerouteRecord,
-        id: 12,
-        sourceId: 'source-b',
-        snrTowards: '[-20]', // -5 dB
-        timestamp: (recent + 2) * 1000,
-      },
-    ];
-
-    const { container } = render(
-      <DashboardMap
-        {...defaultProps}
-        sourceId="__unified__"
-        nodes={[tracerouteNodeA, tracerouteNodeB]}
-        traceroutes={traces}
-      />,
-    );
-
-    const popups = Array.from(container.querySelectorAll<HTMLElement>('.route-popup'));
-    const sourceAPopup = popups.find((popup) => popup.textContent?.includes('Source Alpha'));
-    const sourceBPopup = popups.find((popup) => popup.textContent?.includes('Source Bravo'));
-    expect(sourceAPopup).toBeDefined();
-    expect(sourceBPopup).toBeDefined();
-
-    expect(sourceAPopup).toHaveTextContent('Used in 2 traceroutes');
-    expect(within(sourceAPopup!).getByText('2.0 dB')).toBeInTheDocument();
-    expect(within(sourceAPopup!).getByText('5.0 dB')).toBeInTheDocument();
-    expect(sourceBPopup).toHaveTextContent('Used in 1 traceroute');
-    expect(within(sourceBPopup!).getByText('-5.0 dB')).toBeInTheDocument();
-    expect(within(sourceBPopup!).queryByText('5.0 dB')).not.toBeInTheDocument();
-  });
-
-  it('falls back to the hexadecimal node id when a traceroute endpoint has no name', () => {
-    mocks.mapContext.showPaths = true;
-    const unnamedNode = {
-      ...tracerouteNodeB,
-      user: undefined,
-      shortName: undefined,
-      longName: undefined,
-    };
-
-    const { container } = render(
-      <DashboardMap
-        {...defaultProps}
-        sourceId="source-a"
-        nodes={[tracerouteNodeA, unnamedNode]}
-        traceroutes={[tracerouteRecord]}
-      />,
-    );
-
-    const popup = container.querySelector('.route-popup');
-    expect(popup).toHaveTextContent('!2');
-  });
-
-  it('keeps legacy Unified traceroutes readable without source or timestamp metadata', () => {
-    mocks.mapContext.showPaths = true;
-    const legacyTraceroute = {
-      ...tracerouteRecord,
-      sourceId: undefined,
-      timestamp: undefined,
-      createdAt: undefined,
-    };
-
-    const { container } = render(
-      <DashboardMap
-        {...defaultProps}
-        sourceId="__unified__"
-        nodes={[tracerouteNodeA, tracerouteNodeB]}
-        traceroutes={[legacyTraceroute]}
-      />,
-    );
-
-    const popup = container.querySelector<HTMLElement>('.route-popup');
-    expect(popup).not.toBeNull();
-    expect(popup).toHaveTextContent('Alpha');
-    expect(popup).toHaveTextContent('Bravo');
-    expect(within(popup!).queryByText('Source:')).not.toBeInTheDocument();
-    expect(within(popup!).queryByText('Last traced:')).not.toBeInTheDocument();
+    expect(screen.queryAllByTestId('map-marker')).toHaveLength(0);
   });
 
   // --- MeshCore neighbor links ------------------------------------------------
@@ -931,5 +814,147 @@ describe('DashboardMap', () => {
     const markers = screen.getAllByTestId('map-marker');
     expect(markers).toHaveLength(1);
     expect(markers[0].textContent).not.toContain('MC');
+  });
+
+  // --- Active Map Style passthrough (issue #4348 problem 4) --------------
+  // DashboardMap previously never applied a custom MapLibre style at all —
+  // it didn't consume activeStyleJson from SettingsContext or forward it to
+  // BaseMap. These tests guard the fix: the vector tile layer must receive
+  // whatever style is currently active, and must not blow up when none is.
+
+  const vectorCustomTileset = {
+    id: 'custom-vector-1',
+    name: 'Self-hosted vector',
+    url: 'http://tileserver.local/data/v3/{z}/{x}/{y}.pbf',
+    attribution: '',
+    isVector: true,
+    createdAt: 0,
+    updatedAt: 0,
+  };
+
+  it('forwards the active map style JSON into the vector tile layer', () => {
+    const styleJson = { version: 8, sources: {}, layers: [] };
+    mocks.settings.activeStyleJson = styleJson;
+    render(
+      <DashboardMap
+        {...defaultProps}
+        tilesetId={vectorCustomTileset.id}
+        customTilesets={[vectorCustomTileset]}
+      />,
+    );
+    expect(screen.getByTestId('vector-tile-layer').dataset.styleJson).toBe(JSON.stringify(styleJson));
+  });
+
+  it('renders the vector tile layer without a style when no map style is active', () => {
+    render(
+      <DashboardMap
+        {...defaultProps}
+        tilesetId={vectorCustomTileset.id}
+        customTilesets={[vectorCustomTileset]}
+      />,
+    );
+    expect(screen.getByTestId('vector-tile-layer').dataset.styleJson).toBe('');
+  });
+
+  // --- 2D/3D toggle (#4704) ---------------------------------------------------
+
+  it('renders the 2D BaseMap and hides the 3D toggle when terrain is unavailable', () => {
+    render(<DashboardMap {...defaultProps} nodes={[nodeWithPosition]} />);
+    expect(screen.getByTestId('map-container')).toBeInTheDocument();
+    expect(screen.queryByTestId('map-3d-view')).not.toBeInTheDocument();
+    expect(screen.queryByText('3D Terrain')).not.toBeInTheDocument();
+  });
+
+  it('offers the 3D toggle only when terrain tiles are available', () => {
+    mocks.terrainCaps = { enabled: true, terrainTiles: true, isLoading: false };
+    render(<DashboardMap {...defaultProps} nodes={[nodeWithPosition]} />);
+    expect(screen.getByText('3D Terrain')).toBeInTheDocument();
+    // Starts in 2D until toggled.
+    expect(screen.getByTestId('map-container')).toBeInTheDocument();
+    expect(screen.queryByTestId('map-3d-view')).not.toBeInTheDocument();
+  });
+
+  it('renders Map3DView (not BaseMap) after toggling 3D, for a single source', () => {
+    mocks.terrainCaps = { enabled: true, terrainTiles: true, isLoading: false };
+    render(<DashboardMap {...defaultProps} sourceId="src-a" nodes={[nodeWithPosition]} />);
+    const toggle = screen.getByText('3D Terrain').previousSibling as HTMLInputElement;
+    fireEvent.click(toggle);
+    const view = screen.getByTestId('map-3d-view');
+    expect(view).toBeInTheDocument();
+    expect(screen.queryByTestId('map-container')).not.toBeInTheDocument();
+    // Single-source map scopes the 3D lines to just that source.
+    expect(JSON.parse(view.dataset.sourceIds ?? 'null')).toEqual(['src-a']);
+    expect(view.dataset.nodeCount).toBe('1');
+  });
+
+  it('renders Map3DView on the Unified map after toggling 3D', () => {
+    mocks.terrainCaps = { enabled: true, terrainTiles: true, isLoading: false };
+    render(<DashboardMap {...defaultProps} sourceId="__unified__" nodes={[nodeWithPosition]} />);
+    const toggle = screen.getByText('3D Terrain').previousSibling as HTMLInputElement;
+    fireEvent.click(toggle);
+    expect(screen.getByTestId('map-3d-view')).toBeInTheDocument();
+    expect(screen.queryByTestId('map-container')).not.toBeInTheDocument();
+  });
+
+  it('disables 2D-only controls with a clear tooltip while 3D is active (#4794)', async () => {
+    mocks.terrainCaps = { enabled: true, terrainTiles: true, isLoading: false };
+    mocks.geoJsonLayers.push({
+      id: 'coverage',
+      name: 'Coverage overlay',
+      visible: true,
+      style: { color: '#ff0000' },
+    });
+    const secondNode = {
+      ...nodeWithPosition,
+      user: { id: 'node-2', shortName: 'N2', longName: 'Node Two' },
+      position: { latitude: 35.1, longitude: -80.1 },
+    };
+    render(<DashboardMap {...defaultProps} nodes={[nodeWithPosition, secondNode]} />);
+
+    const controlNames = [
+      'Measure Distance',
+      'Show Accuracy Regions',
+      'Show Waypoints',
+      'Show ATAK Contacts',
+      'Show Polar Grid',
+      'Show Legend',
+      'Coverage overlay',
+    ];
+    await screen.findByLabelText('Coverage overlay');
+    fireEvent.click(screen.getByLabelText('3D Terrain'));
+
+    for (const name of controlNames) {
+      const control = screen.getByLabelText(name) as HTMLInputElement;
+      expect(control.disabled).toBe(true);
+      expect(control.closest('label')?.getAttribute('title')).toBe('Not available in 3D');
+    }
+  });
+
+  it('keeps the 3D node input stable across unrelated parent rerenders (#4794)', () => {
+    mocks.terrainCaps = { enabled: true, terrainTiles: true, isLoading: false };
+    const stableNodes = [nodeWithPosition];
+    const { rerender } = render(<DashboardMap {...defaultProps} nodes={stableNodes} />);
+    fireEvent.click(screen.getByLabelText('3D Terrain'));
+    const first3DNodes = mocks.rendered3DNodes.at(-1);
+
+    rerender(<DashboardMap {...defaultProps} nodes={stableNodes} isLoading />);
+
+    expect(mocks.rendered3DNodes.at(-1)).toBe(first3DNodes);
+  });
+
+  it('forces 2D when terrain capabilities are lost after selecting 3D', () => {
+    mocks.terrainCaps = { enabled: true, terrainTiles: true, isLoading: false };
+    const { rerender } = render(
+      <DashboardMap {...defaultProps} sourceId="src-a" nodes={[nodeWithPosition]} />,
+    );
+    const toggle = screen.getByText('3D Terrain').previousSibling as HTMLInputElement;
+    fireEvent.click(toggle);
+    expect(screen.getByTestId('map-3d-view')).toBeInTheDocument();
+    // Capabilities resolve unavailable (e.g. elevation disabled) — the map must
+    // drop back to 2D on the spot rather than strand the user in 3D.
+    mocks.terrainCaps = { enabled: false, terrainTiles: false, isLoading: false };
+    rerender(<DashboardMap {...defaultProps} sourceId="src-a" nodes={[nodeWithPosition]} />);
+    expect(screen.queryByTestId('map-3d-view')).not.toBeInTheDocument();
+    expect(screen.getByTestId('map-container')).toBeInTheDocument();
   });
 });

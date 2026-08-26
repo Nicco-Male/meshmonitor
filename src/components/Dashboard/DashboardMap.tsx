@@ -18,7 +18,8 @@ import type { PathOptions } from 'leaflet';
 import L from 'leaflet';
 import { createNodeIcon } from '../../utils/mapIcons';
 import { markerAgeOpacity } from '../../utils/markerAgeOpacity';
-import { getNodeTypeCategory } from '../../utils/nodeTypeCategory';
+import { getNodeTypeCategory, categoryGlyphFamily } from '../../utils/nodeTypeCategory';
+import { getHopColor } from '../../utils/mapIcons';
 import { NodeMarkersLayer, type NodeMarkerDescriptor } from '../map/layers/NodeMarkersLayer';
 import type { CustomTileset } from '../../config/tilesets';
 import DashboardWaypoints from './DashboardWaypoints';
@@ -47,17 +48,24 @@ import { nodePassesTransportFilter } from '../../utils/nodeTransport';
 import { shouldDiscardPosition } from '../../utils/nullIsland';
 import { getDiscardInvalidPositions } from '../../utils/positionDisplayConfig';
 import { effectiveMapMaxAgeHours } from '../../utils/mapAge';
+import { isMeshCoreInfrastructureAdvType } from '../MeshCore/meshcoreRole';
+import { ageFilterStops, nearestAgeStopIndex, formatAgeStop } from '../../utils/mapAgeSteps';
 import { resolveMapEndpoint } from '../../utils/nodeHelpers';
 import api from '../../services/api';
 import { useCsrfFetch } from '../../hooks/useCsrfFetch';
 import { BaseMap } from '../map/BaseMap';
+import { MapSidebar } from '../map/MapSidebar';
+import { Map3DView } from '../map/Map3DView';
+import type { Node3DFeature } from '../map/Base3DMap';
+import { TilesetSelector } from '../TilesetSelector';
+import { resolve3DBasemap, buildTerrainTileUrl } from '../../config/basemap3d';
+import { useTerrainCapabilities } from '../../hooks/useTerrainCapabilities';
+import { appBasename } from '../../init';
 import { MapLoadingOverlay } from '../map/MapLoadingOverlay';
 import { TraceroutePathsLayer } from '../map/layers/TraceroutePathsLayer';
-import RouteSegmentPopup from '../map/popups/RouteSegmentPopup';
 import { NeighborLinksLayer, type NeighborLinkDescriptor } from '../map/layers/NeighborLinksLayer';
 import { AccuracyRegionsLayer, type AccuracyRegionDescriptor } from '../map/layers/AccuracyRegionsLayer';
 import { snrToNeighborOpacity, dedupByUnorderedPair } from '../../utils/neighborLinks';
-import { calculateDistance } from '../../utils/distance';
 import { UiIcon } from '../icons';
 import {
   parseSnapshotRoutePositions,
@@ -84,6 +92,9 @@ export interface DashboardMapProps {
   sourceId: string | null;
   /** Hours since lastHeard to count a node as "active". Favorites bypass this gate. */
   maxNodeAgeHours: number;
+  /** #4899: separate (usually longer) window for MeshCore infrastructure
+   *  (repeaters/room servers, advType 2/3). `0` = never expire. */
+  maxInfraNodeAgeHours: number;
   /**
    * On the Unified map, called when a node popup's source row is clicked so the
    * page can navigate to that source's Node Details view for the node.
@@ -97,30 +108,6 @@ export interface DashboardMapProps {
    * Defaults to false so existing callers/tests are unaffected.
    */
   isLoading?: boolean;
-}
-
-interface DashboardTraceroutePopupAggregate {
-  sourceId: string | null;
-  usageCount: number;
-  snrSamples: Array<{ snr: number; timestamp?: number }>;
-  hasMqtt: boolean;
-  latestTimestamp: number | null;
-}
-
-interface DashboardTracerouteRenderSegment extends TracerouteRenderSegment {
-  popupAggregate: DashboardTraceroutePopupAggregate;
-}
-
-interface PendingDashboardTracerouteSegment extends TracerouteRenderSegment {
-  popupAggregateKey: string;
-}
-
-interface DashboardTraceroutePopupAccumulator {
-  sourceId: string | null;
-  traceIds: Set<string>;
-  snrSamples: Array<{ snr: number; timestamp?: number }>;
-  hasMqtt: boolean;
-  latestTimestamp: number | null;
 }
 
 /** Extract lat/lng from a node — handles both flat (API) and nested (position) shapes. */
@@ -170,6 +157,31 @@ function MapBoundsUpdater({ positions, sourceId, skip }: MapBoundsUpdaterProps) 
   return null;
 }
 
+/**
+ * One-tap "Zoom to fit" for the Dashboard / Unified map (#4898), mirroring the
+ * classic /nodes map (#4496). `MapBoundsUpdater` only auto-fits once on load
+ * (and not at all when a Default Map Center is set), so this gives an explicit
+ * re-frame that always works. `request` is a monotonic counter so repeated
+ * clicks re-fit even when the node set is unchanged.
+ */
+function FitAllNodesController({ request, positions }: { request: number; positions: Array<[number, number]> }) {
+  const map = useMap();
+  const lastHandled = useRef(0);
+
+  useEffect(() => {
+    if (request === 0 || request === lastHandled.current) return;
+    lastHandled.current = request;
+    if (positions.length === 0) return;
+    if (positions.length === 1) {
+      map.setView(positions[0], Math.max(map.getZoom(), 14), { animate: true });
+      return;
+    }
+    map.fitBounds(positions, { padding: [50, 50], animate: true, duration: 0.5, maxZoom: 15 });
+  }, [request, positions, map]);
+
+  return null;
+}
+
 // ---------------------------------------------------------------------------
 // DashboardMap
 // ---------------------------------------------------------------------------
@@ -184,6 +196,7 @@ export default function DashboardMap({
   defaultCenter,
   sourceId,
   maxNodeAgeHours,
+  maxInfraNodeAgeHours,
   onNodeSourceSelect,
   isLoading = false,
 }: DashboardMapProps) {
@@ -194,7 +207,7 @@ export default function DashboardMap({
     defaultMapCenterLat,
     defaultMapCenterLon,
     defaultMapCenterZoom,
-    distanceUnit,
+    activeStyleJson,
   } = useSettings();
 
   // A Default Map Center is only "configured" when all three parts are set.
@@ -239,15 +252,29 @@ export default function DashboardMap({
   // Collapse the Features panel — shares the NodesTab map's localStorage key
   // so the preference is unified across every map surface (issue #3912: on
   // mobile the panel's full checkbox list has no way to be dismissed).
-  const [isMapControlsCollapsed, setIsMapControlsCollapsed] = useState(
-    () => localStorage.getItem('isMapControlsCollapsed') === 'true',
-  );
-  useEffect(() => {
-    localStorage.setItem('isMapControlsCollapsed', String(isMapControlsCollapsed));
-  }, [isMapControlsCollapsed]);
+  // Collapse state now lives in MapSidebar (its own persisted toggle, #4909).
+  // Monotonic counter driving the "Zoom to fit" button (#4898); each click
+  // increments it so a re-frame fires even when the node set is unchanged.
+  const [fitRequest, setFitRequest] = useState(0);
 
   // #3636: node-to-node LOS distance measurement tool.
   const [measureActive, setMeasureActive] = useState(false);
+
+  // #4704: 2D/3D toggle. `viewMode` is ephemeral (not persisted) — the toggle
+  // is only offered when the server can serve DEM terrain tiles, and any
+  // capability loss forces 2D on the spot (mirrors `useEffectiveViewMode`).
+  const terrainCaps = useTerrainCapabilities();
+  const canUse3D = !terrainCaps.isLoading && terrainCaps.enabled && terrainCaps.terrainTiles;
+  const [viewMode, setViewMode] = useState<'2d' | '3d'>('2d');
+  const effective3D = viewMode === '3d' && canUse3D;
+  const unavailableIn3DTitle = effective3D ? 'Not available in 3D' : undefined;
+  const basemap3D = useMemo(
+    () => resolve3DBasemap(tilesetId, customTilesets),
+    [tilesetId, customTilesets],
+  );
+  // `appBasename` is the base-path prefix `ApiService` was seeded with at
+  // startup — module-scope constant, never changes.
+  const terrainTileUrl = useMemo(() => buildTerrainTileUrl(appBasename), []);
 
   const {
     showPaths,
@@ -277,6 +304,14 @@ export default function DashboardMap({
   // Effective map age cap from the Map Features age slider (#3322), clamped to
   // [1, maxNodeAgeHours]. null = follow the setting, so default is unchanged.
   const effectiveMaxAge = effectiveMapMaxAgeHours(mapMaxAgeHours, maxNodeAgeHours);
+  // #4899: MeshCore infrastructure (repeaters/room servers, advType 2/3) uses a
+  // separate, usually longer window so it doesn't vanish from the Dashboard map
+  // between its infrequent adverts. `0` = never expire. The Map Features age
+  // slider still narrows it when the operator explicitly sets one (an explicit
+  // "show younger than X" is meant to narrow every marker), but at its default
+  // (null → follow the setting) infra nodes get the full infra window.
+  const infraNever = maxInfraNodeAgeHours <= 0;
+  const effectiveInfraMaxAge = effectiveMapMaxAgeHours(mapMaxAgeHours, maxInfraNodeAgeHours);
 
   // GeoJSON overlay layers (global, file-based). Fetched here so the dashboard
   // map can render and toggle them, mirroring the per-source NodesTab map.
@@ -308,44 +343,116 @@ export default function DashboardMap({
     }).catch(err => console.error('Failed to get base URL:', err));
   };
 
-  // Build array of nodes that have valid positions, with their resolved lat/lng.
-  // Mirrors NodesTab's processedNodes pipeline (App.tsx): ignored hidden, age cutoff
-  // bypassed by favorites, transport-class filter from the Map Features panel.
-  // Single "now" for this render so every marker's age fade (#3886) shares one
-  // reference instead of drifting per-node inside the marker map loop below.
-  const nowMs = Date.now();
-  const cutoffTime = nowMs / 1000 - effectiveMaxAge * 60 * 60;
-  const mapEligibleNodes = nodes
-    .filter((n) => !n.isIgnored)
-    .filter((n) => !n.hideFromMap) // #3549: per-node "Hide from Map" suppresses the marker only
-    .filter((n) => n.isFavorite || (n.lastHeard != null && n.lastHeard >= cutoffTime))
-    .filter((n) => nodePassesTransportFilter(n, { showRfNodes, showUdpNodes, showMqttNodes }, cutoffTime));
-  const mapEligibleNodeNumsKey = mapEligibleNodes
-    .map((node) => Number(node?.nodeNum))
-    .filter((nodeNum) => Number.isFinite(nodeNum))
-    .sort((a, b) => a - b)
-    .join(',');
-  const nodesWithTruePos = mapEligibleNodes
-    .map((n) => ({ node: n, truePos: getNodeLatLng(n) }))
-    .filter((e): e is { node: any; truePos: { lat: number; lng: number } } => e.truePos !== null);
+  // Build the positioned-node array only when one of its real inputs changes.
+  // Besides avoiding the filtering/precision-offset work on unrelated renders,
+  // this keeps every downstream 3D GeoJSON input referentially stable (#4794).
+  // The age reference advances whenever node polling or a filter setting changes,
+  // which is when the visible set can meaningfully change.
+  const { nodesWithPosition, nowMs, cutoffTime } = useMemo(() => {
+    const referenceNowMs = Date.now();
+    const ageCutoffTime = referenceNowMs / 1000 - effectiveMaxAge * 60 * 60;
+    const infraCutoffTime = referenceNowMs / 1000 - effectiveInfraMaxAge * 60 * 60;
+    // #4899: per-node age gate — MeshCore infrastructure (advType 2/3) uses the
+    // infra window (or never expires when it's 0); everything else uses the
+    // companion window. Favorites bypass both, as before.
+    const passesAgeGate = (n: typeof nodes[number]): boolean => {
+      if (n.isFavorite) return true;
+      if (n.lastHeard == null) return false;
+      if (n.isMeshCore && isMeshCoreInfrastructureAdvType(n.advType)) {
+        return infraNever || n.lastHeard >= infraCutoffTime;
+      }
+      return n.lastHeard >= ageCutoffTime;
+    };
+    const nodesWithTruePos = nodes
+      .filter((n) => !n.isIgnored)
+      .filter((n) => !n.hideFromMap) // #3549: per-node "Hide from Map" suppresses the marker only
+      .filter(passesAgeGate)
+      .filter((n) => nodePassesTransportFilter(n, { showRfNodes, showUdpNodes, showMqttNodes }, ageCutoffTime))
+      .map((n) => ({ node: n, truePos: getNodeLatLng(n) }))
+      .filter((e): e is { node: any; truePos: { lat: number; lng: number } } => e.truePos !== null);
 
-  // #4016/#4155: offset obscured low-precision markers within their accuracy cell
-  // via the shared occupancy-gated helper — lone nodes stay centered, 2+ same-cell
-  // nodes spread — identical to every other map surface. `pos` (used by the marker,
-  // neighbor/traceroute endpoints, and the measurement tool) thus declutters. The
-  // accuracy rectangle below recomputes the TRUE center from the node, so it stays put.
-  const nodesWithPosition = applyPrecisionCellOffsets(
-    nodesWithTruePos.map(({ node, truePos }) => ({
-      item: node,
-      id: unifiedNodeKey(node) ?? String(node.nodeNum),
-      latLng: [truePos.lat, truePos.lng] as [number, number],
-      bits: node.positionPrecisionBits,
-      isOverride: node.positionIsOverride,
-    })),
-  ).map(({ item: node, latLng }) => ({ node, pos: { lat: latLng[0], lng: latLng[1] } }));
+    // #4016/#4155: offset obscured low-precision markers within their accuracy cell
+    // via the shared occupancy-gated helper — lone nodes stay centered, 2+ same-cell
+    // nodes spread — identical to every other map surface. `pos` (used by the marker,
+    // neighbor/traceroute endpoints, and the measurement tool) thus declutters. The
+    // accuracy rectangle below recomputes the TRUE center from the node, so it stays put.
+    const positionedNodes = applyPrecisionCellOffsets(
+      nodesWithTruePos.map(({ node, truePos }) => ({
+        item: node,
+        id: unifiedNodeKey(node) ?? String(node.nodeNum),
+        latLng: [truePos.lat, truePos.lng] as [number, number],
+        bits: node.positionPrecisionBits,
+        isOverride: node.positionIsOverride,
+      })),
+    ).map(({ item: node, latLng }) => ({ node, pos: { lat: latLng[0], lng: latLng[1] } }));
+
+    return { nodesWithPosition: positionedNodes, nowMs: referenceNowMs, cutoffTime: ageCutoffTime };
+  }, [nodes, effectiveMaxAge, effectiveInfraMaxAge, infraNever, showRfNodes, showUdpNodes, showMqttNodes]);
 
   // Array form of node positions for MapBoundsUpdater (fit bounds).
   const nodePositions: [number, number][] = nodesWithPosition.map((e) => [e.pos.lat, e.pos.lng]);
+
+  // #4704: node markers for the 3D surface — same visible+positioned node list
+  // the 2D markers use, mapped to the shape `Base3DMap` expects. Computed
+  // unconditionally (cheap map, no hooks); only consumed when `effective3D`.
+  const node3DFeatures: Node3DFeature[] = useMemo(() => {
+    // Computed once per recompute (not per render) — age dimming is approximate,
+    // and pinning it to a dep-free `now` avoids re-setData churn (#4808).
+    const now = Date.now();
+    const cutoffMs = (now / 1000 - effectiveMaxAge * 60 * 60) * 1000;
+    const infraCutoffMs = (now / 1000 - effectiveInfraMaxAge * 60 * 60) * 1000;
+    return nodesWithPosition.map(({ node, pos }) => {
+      // #4899: dim infra survivors against the infra window (never fully faded
+      // when the window is "never"), so a shown-but-old repeater isn't rendered
+      // near-invisible on the globe.
+      const isInfra = node.isMeshCore && isMeshCoreInfrastructureAdvType(node.advType);
+      const lastHeardMs = node.lastHeard != null ? node.lastHeard * 1000 : null;
+      const opacity = node.isFavorite || (isInfra && infraNever)
+        ? 1
+        : markerAgeOpacity(now, isInfra ? infraCutoffMs : cutoffMs, lastHeardMs);
+      return {
+        key: unifiedNodeKey(node) ?? String(node.nodeNum ?? node.nodeId ?? node.user?.id),
+        lat: pos.lat,
+        lng: pos.lng,
+        label: node.shortName ?? node.user?.shortName ?? undefined,
+        // Match the 2D marker (#4808): hop color + glyph-family category + age dim.
+        color: getHopColor(node.hopsAway ?? 999),
+        category: categoryGlyphFamily(getNodeTypeCategory(node)),
+        opacity,
+      };
+    });
+  }, [nodesWithPosition, effectiveMaxAge, effectiveInfraMaxAge, infraNever]);
+
+  // Visible node numbers for gating the 3D neighbor/traceroute lines to the
+  // rendered markers, matching 2D — also keeps a null-sourceId dashboard from
+  // pulling every source's edges (#4808).
+  const visible3DNodeNums = useMemo(
+    () => new Set(nodesWithPosition.map(({ node }) => Number(node.nodeNum))),
+    [nodesWithPosition],
+  );
+
+  // MeshCore analogue of `visible3DNodeNums` (#4808 follow-up): MeshCore nodes
+  // have no nodeNum (the numeric set holds NaN for them), so their neighbor
+  // edges are gated by the set of visible MeshCore public keys instead.
+  const visible3DMeshCoreKeys = useMemo(
+    () =>
+      new Set(
+        nodesWithPosition
+          .filter(({ node }) => node.isMeshCore && typeof node.publicKey === 'string' && node.publicKey.length > 0)
+          .map(({ node }) => node.publicKey as string),
+      ),
+    [nodesWithPosition],
+  );
+
+  // key → { node, pos } for resolving a clicked 3D marker back to its node so
+  // the shared DashboardNodePopup can render on the 3D map too (#4808).
+  const node3DByKey = useMemo(() => {
+    const m = new Map<string, { node: (typeof nodesWithPosition)[number]['node']; pos: { lat: number; lng: number } }>();
+    for (const { node, pos } of nodesWithPosition) {
+      m.set(unifiedNodeKey(node) ?? String(node.nodeNum ?? node.nodeId ?? node.user?.id), { node, pos });
+    }
+    return m;
+  }, [nodesWithPosition]);
 
   // #3636: measurement endpoints — nearest-node snapping picks from these.
   const measurePoints: MeasurePoint[] = nodesWithPosition.map(({ node, pos }) => ({
@@ -462,39 +569,25 @@ export default function DashboardMap({
   // traceroute's own key is prefixed onto the util's per-hop key
   // (`"forward:123-456"`) since multiple traceroute records can repeat the
   // same node pair and the util itself only decomposes one record at a time.
-  const tracerouteRenderSegments = useMemo<DashboardTracerouteRenderSegment[]>(() => {
+  const tracerouteRenderSegments = useMemo<TracerouteRenderSegment[]>(() => {
     if (!showPaths && !showRoute) return [];
-    const mapEligibleNodeNums = new Set<number>(
-      mapEligibleNodeNumsKey
-        ? mapEligibleNodeNumsKey.split(',').map(Number)
-        : [],
-    );
     // Map Features age slider (#3322): hide traceroutes/route segments older
     // than the chosen age. Default (slider at max) keeps the prior behavior.
     const trCutoffMs = Date.now() - effectiveMaxAge * 60 * 60 * 1000;
-    const pendingSegments: PendingDashboardTracerouteSegment[] = [];
-    const popupAggregates = new Map<string, DashboardTraceroutePopupAccumulator>();
-
-    for (const [trIndex, tr] of (traceroutes ?? []).entries()) {
+    const segs: TracerouteRenderSegment[] = [];
+    for (const tr of (traceroutes ?? [])) {
       const trTimestamp = Number(tr?.timestamp ?? tr?.createdAt ?? 0);
       if (trTimestamp && trTimestamp < trCutoffMs) continue;
       const fromNum = Number(tr?.fromNodeNum);
       const toNum = Number(tr?.toNodeNum);
       if (!Number.isFinite(fromNum) || !Number.isFinite(toNum)) continue;
-      const traceSourceId =
-        typeof tr?.sourceId === 'string' && tr.sourceId.length > 0
-          ? tr.sourceId
-          : !isUnified && sourceId
-            ? sourceId
-            : null;
-      const traceIdentity = String(tr?.id ?? tr?.packetId ?? trIndex);
       const snapshot = parseSnapshotRoutePositions(tr?.routePositions);
       // #4162: gate on the rendered-marker map (`positionByNodeNum` is built
       // from `nodesWithPosition`, which excludes hidden/aged nodes) so route
       // segments never dangle to a node that has no marker.
       const resolvePosition = (nodeNum: number): [number, number] | null =>
         resolveSegmentPosition(nodeNum, snapshot, positionByNodeNum, true);
-      const keyPrefix = `tr-${traceSourceId ?? 'x'}-${traceIdentity}`;
+      const keyPrefix = `tr-${tr.sourceId ?? 'x'}-${tr.id}`;
       const decomposed = decomposeTraceroute(
         {
           fromNodeNum: fromNum,
@@ -506,132 +599,14 @@ export default function DashboardMap({
           timestamp: tr?.timestamp,
           createdAt: tr?.createdAt,
         },
-        {
-          resolvePosition,
-          estimateMissingHops: true,
-          canEstimateHop: (nodeNum) =>
-            nodeNum === 0xffffffff || mapEligibleNodeNums.has(nodeNum),
-          traceKey: keyPrefix,
-        },
+        { resolvePosition },
       );
       for (const seg of decomposed) {
-        const fromHopKey = seg.fromHopKey ?? `node:${seg.fromNodeNum}`;
-        const toHopKey = seg.toHopKey ?? `node:${seg.toNodeNum}`;
-        const lowHopKey = fromHopKey < toHopKey ? fromHopKey : toHopKey;
-        const highHopKey = fromHopKey < toHopKey ? toHopKey : fromHopKey;
-        // Source is part of the aggregate key: Unified popups must never mix
-        // observations from different radios for the same physical node pair.
-        const popupAggregateKey = `${traceSourceId ?? 'legacy'}:${lowHopKey}:${highHopKey}`;
-        let aggregate = popupAggregates.get(popupAggregateKey);
-        if (!aggregate) {
-          aggregate = {
-            sourceId: traceSourceId,
-            traceIds: new Set<string>(),
-            snrSamples: [],
-            hasMqtt: false,
-            latestTimestamp: null,
-          };
-          popupAggregates.set(popupAggregateKey, aggregate);
-        }
-
-        aggregate.traceIds.add(traceIdentity);
-        if (seg.avgSnr !== null && Number.isFinite(seg.avgSnr)) {
-          aggregate.snrSamples.push({
-            snr: seg.avgSnr,
-            timestamp: trTimestamp > 0 ? trTimestamp : undefined,
-          });
-        }
-        aggregate.hasMqtt ||= seg.isMqtt;
-        if (
-          trTimestamp > 0 &&
-          (aggregate.latestTimestamp == null || trTimestamp > aggregate.latestTimestamp)
-        ) {
-          aggregate.latestTimestamp = trTimestamp;
-        }
-
-        pendingSegments.push({
-          ...seg,
-          key: `${keyPrefix}-${seg.key}`,
-          popupAggregateKey,
-        });
+        segs.push({ ...seg, key: `${keyPrefix}-${seg.key}` });
       }
     }
-
-    return pendingSegments.map(({ popupAggregateKey, ...segment }) => {
-      const aggregate = popupAggregates.get(popupAggregateKey);
-      return {
-        ...segment,
-        popupAggregate: {
-          sourceId: aggregate?.sourceId ?? null,
-          usageCount: aggregate?.traceIds.size ?? 1,
-          snrSamples: aggregate?.snrSamples ?? [],
-          hasMqtt: aggregate?.hasMqtt ?? segment.isMqtt,
-          latestTimestamp: aggregate?.latestTimestamp ?? null,
-        },
-      };
-    });
-  }, [
-    traceroutes,
-    positionByNodeNum,
-    showPaths,
-    showRoute,
-    effectiveMaxAge,
-    isUnified,
-    sourceId,
-    mapEligibleNodeNumsKey,
-  ]);
-
-  const tracerouteNodeNameByNum = new Map<number, string>();
-  for (const node of nodes) {
-    if (typeof node?.nodeNum !== 'number') continue;
-    tracerouteNodeNameByNum.set(
-      node.nodeNum,
-      node.longName ??
-        node.user?.longName ??
-        node.shortName ??
-        node.user?.shortName ??
-        `!${node.nodeNum.toString(16)}`,
-    );
-  }
-
-  const renderDashboardTraceroutePopup = (segment: TracerouteRenderSegment) => {
-    const dashboardSegment = segment as DashboardTracerouteRenderSegment;
-    const { popupAggregate } = dashboardSegment;
-    const fromName =
-      tracerouteNodeNameByNum.get(segment.fromNodeNum) ??
-      (segment.fromNodeNum === 0xffffffff
-        ? 'Unknown hop'
-        : `!${segment.fromNodeNum.toString(16)}`);
-    const toName =
-      tracerouteNodeNameByNum.get(segment.toNodeNum) ??
-      (segment.toNodeNum === 0xffffffff
-        ? 'Unknown hop'
-        : `!${segment.toNodeNum.toString(16)}`);
-    const distanceKm = calculateDistance(
-      segment.from[0],
-      segment.from[1],
-      segment.to[0],
-      segment.to[1],
-    );
-    const popupSourceName = popupAggregate.sourceId
-      ? sourceNameById.get(popupAggregate.sourceId) ?? popupAggregate.sourceId
-      : null;
-
-    return (
-      <RouteSegmentPopup
-        segment={segment}
-        fromName={fromName}
-        toName={toName}
-        distanceKm={distanceKm}
-        distanceUnit={distanceUnit}
-        usageCount={popupAggregate.usageCount}
-        snrSamples={popupAggregate.snrSamples}
-        isMqtt={popupAggregate.hasMqtt}
-        sourceName={popupSourceName}
-        lastSeen={popupAggregate.latestTimestamp}
-      />
-    );
-  };
+    return segs;
+  }, [traceroutes, positionByNodeNum, showPaths, showRoute, effectiveMaxAge]);
 
   const hasNodes = nodesWithPosition.length > 0;
 
@@ -694,6 +669,7 @@ export default function DashboardMap({
           shortName,
           showLabel: true,
           pinStyle: mapPinStyle,
+          nodeNum: Number.isFinite(Number(node.nodeNum)) ? Number(node.nodeNum) : undefined,
         }),
       opacity: ageOpacity,
       children: (
@@ -787,14 +763,41 @@ export default function DashboardMap({
 
   return (
     <div className="dashboard-map-container" style={{ position: 'relative' }}>
+      {effective3D ? (
+        <>
+          {/* #4704: 3D terrain surface. Shows nodes + traceroute + neighbor
+              lines only (v1 non-goals: waypoints, ATAK, polar grid, accuracy
+              regions, GeoJSON, measure tool). The tileset selector is a sibling
+              because Base3DMap can't host it. */}
+          <Map3DView
+            center={[defaultCenter.lat, defaultCenter.lng]}
+            zoom={hasConfiguredDefaultCenter ? defaultMapCenterZoom : 10}
+            basemap={basemap3D}
+            terrainTileUrl={terrainTileUrl}
+            nodes={node3DFeatures}
+            sourceIds={polarSourceIds}
+            showNeighbors={showNeighborInfo}
+            showTraceroutes={showPaths || showRoute}
+            lookbackHours={effectiveMaxAge}
+            visibleNodeNums={visible3DNodeNums}
+            visibleMeshCoreKeys={visible3DMeshCoreKeys}
+            renderPopup={(key) => {
+              const entry = node3DByKey.get(key);
+              return entry ? (
+                <DashboardNodePopup node={entry.node} pos={entry.pos} onSourceSelect={onNodeSourceSelect} />
+              ) : null;
+            }}
+            onUnsupported={() => setViewMode('2d')}
+          />
+        </>
+      ) : (
       <BaseMap
         center={[defaultCenter.lat, defaultCenter.lng]}
         zoom={hasConfiguredDefaultCenter ? defaultMapCenterZoom : 10}
         tilesetId={tilesetId}
         customTilesets={customTilesets}
+        styleJson={activeStyleJson ?? undefined}
         zoomControl
-        showTilesetSelector={showTileSelector}
-        onTilesetChange={setMapTileset}
       >
         {measureActive && (
           <MeasureDistanceController
@@ -805,8 +808,7 @@ export default function DashboardMap({
         )}
 
         <MapBoundsUpdater positions={nodePositions} sourceId={sourceId} skip={hasConfiguredDefaultCenter} />
-
-        {showLegend && <MapLegend />}
+        <FitAllNodesController request={fitRequest} positions={nodePositions} />
 
         {geoJsonLayers.length > 0 && <GeoJsonOverlay layers={geoJsonLayers} />}
 
@@ -841,14 +843,6 @@ export default function DashboardMap({
             weight={2}
             opacity={0.85}
             dashMode="mqtt-unknown"
-            renderPopup={renderDashboardTraceroutePopup}
-            showEstimatedHopMarkers={!showRoute}
-            estimatedHopName={(nodeNum) =>
-              tracerouteNodeNameByNum.get(nodeNum) ??
-              (nodeNum === 0xffffffff
-                ? 'Unknown hop'
-                : `!${nodeNum.toString(16).padStart(8, '0')}`)
-            }
           />
         )}
 
@@ -863,14 +857,6 @@ export default function DashboardMap({
             weight={4}
             opacity={0.6}
             dashMode="never"
-            renderPopup={renderDashboardTraceroutePopup}
-            showEstimatedHopMarkers
-            estimatedHopName={(nodeNum) =>
-              tracerouteNodeNameByNum.get(nodeNum) ??
-              (nodeNum === 0xffffffff
-                ? 'Unknown hop'
-                : `!${nodeNum.toString(16).padStart(8, '0')}`)
-            }
           />
         )}
 
@@ -881,10 +867,12 @@ export default function DashboardMap({
             unidirectional dashed. */}
         <NeighborLinksLayer links={meshtasticNeighborLinks} />
       </BaseMap>
+      )}
 
       {/* Polar grid legend — names each source whose grid is drawn, with its
-          color swatch, so overlapping grids on the Unified map aren't confused. */}
-      {showPolarGrid && ownNodePositions.length > 0 && (
+          color swatch, so overlapping grids on the Unified map aren't confused.
+          2D only: the 3D surface doesn't draw the polar grid. */}
+      {!effective3D && showPolarGrid && ownNodePositions.length > 0 && (
         <div className="dashboard-polar-grid-legend" role="note" aria-label="Polar grid sources">
           <div className="dashboard-polar-grid-legend__title">Polar Grid</div>
           {ownNodePositions.map((op) => (
@@ -901,66 +889,88 @@ export default function DashboardMap({
         </div>
       )}
 
-      {/* Map Features control panel — mirrors NodesTab's "Features" panel but
-          trimmed to the toggles meaningful on a cross-source map. */}
-      <div className={`map-controls dashboard-map-controls ${isMapControlsCollapsed ? 'collapsed' : ''}`}>
+      {/* Unified map controls sidebar (#4909): Features toggles + Hops legend +
+          tileset picker in one collapsible right-edge panel (full-screen on
+          mobile) instead of independently-floating, overlapping panels. */}
+      <MapSidebar storageKey="mm-dashboard-map-sidebar" title="Map controls">
         <div className="map-controls-body">
           <div className="map-controls-header">
             <div className="map-controls-title">Features</div>
+            {/* Zoom to fit all nodes (#4898). In the header so it stays reachable
+                when the panel is collapsed — a one-tap re-frame. */}
             <button
-              className="map-controls-collapse-btn"
-              onClick={() => setIsMapControlsCollapsed(!isMapControlsCollapsed)}
-              title={isMapControlsCollapsed ? 'Expand controls' : 'Collapse controls'}
+              className="map-controls-fit-btn"
+              onClick={() => setFitRequest(n => n + 1)}
+              disabled={nodePositions.length === 0}
+              title={
+                nodePositions.length === 0
+                  ? 'No positioned nodes to zoom to'
+                  : `Zoom to fit all ${nodePositions.length} positioned nodes`
+              }
+              aria-label="Zoom to fit all nodes"
+              onMouseDown={(e) => e.stopPropagation()}
             >
-              <UiIcon name={isMapControlsCollapsed ? 'chevronDown' : 'chevronUp'} size={16} />
+              <UiIcon name="fitBounds" size={16} />
             </button>
           </div>
-          {!isMapControlsCollapsed && (
           <>
           {/* #3636: node-to-node LOS distance measurement toggle. Needs at least
               two positioned nodes to be meaningful. */}
-          <label className="map-control-item" title="Measure straight-line distance between two nodes">
+          <label className="map-control-item" title={unavailableIn3DTitle ?? 'Measure straight-line distance between two nodes'}>
             <input
               type="checkbox"
               checked={measureActive}
-              disabled={measurePoints.length < 2}
+              disabled={effective3D || measurePoints.length < 2}
               onChange={(e) => setMeasureActive(e.target.checked)}
             />
             <span>Measure Distance</span>
           </label>
+          {/* #4704: 2D/3D toggle — only offered when the server can serve DEM
+              terrain tiles (elevation enabled + terrarium tiles). */}
+          {canUse3D && (
+            <label className="map-control-item" title="Show terrain in a pitched 3D view">
+              <input
+                type="checkbox"
+                checked={viewMode === '3d'}
+                onChange={(e) => setViewMode(e.target.checked ? '3d' : '2d')}
+              />
+              <span>3D Terrain</span>
+            </label>
+          )}
           {/* Map Features age slider (#3322): hides node markers, traceroutes,
               and route segments older than the chosen age. Ranges 1h–maxNodeAge. */}
           {(() => {
+            // Non-linear discrete stops (1h..30d) via mapAgeSteps (#4770),
+            // bounded by the per-source maxNodeAgeHours setting.
             const maxHours = Math.max(1, Math.round(maxNodeAgeHours));
+            const stops = ageFilterStops(maxHours);
+            const topIndex = stops.length - 1;
             const currentHours = Math.min(Math.max(1, Math.round(effectiveMaxAge)), maxHours);
-            const formatDuration = (hours: number): string => {
-              if (hours >= maxHours) return 'All';
-              if (hours < 24) return `${hours}h`;
-              const days = Math.floor(hours / 24);
-              const remainingHours = hours % 24;
-              return remainingHours === 0 ? `${days}d` : `${days}d ${remainingHours}h`;
-            };
+            const currentIndex = nearestAgeStopIndex(stops, currentHours);
+            const label = (idx: number) => formatAgeStop(stops[idx], maxHours);
             return (
               <div className="map-control-item" style={{ flexDirection: 'column', alignItems: 'stretch', gap: '0.25rem' }}>
                 <span>Maximum age</span>
                 <div className="position-history-slider">
                   <input
                     type="range"
-                    min={1}
-                    max={maxHours}
-                    value={currentHours}
+                    min={0}
+                    max={topIndex}
+                    step={1}
+                    value={currentIndex}
                     aria-label="Maximum age"
-                    aria-valuemin={1}
-                    aria-valuemax={maxHours}
-                    aria-valuenow={currentHours}
-                    aria-valuetext={formatDuration(currentHours)}
-                    disabled={maxHours <= 1}
+                    aria-valuemin={0}
+                    aria-valuemax={topIndex}
+                    aria-valuenow={currentIndex}
+                    aria-valuetext={label(currentIndex)}
+                    disabled={topIndex < 1}
                     onChange={(e) => {
-                      const value = parseInt(e.target.value, 10);
-                      setMapMaxAgeHours(value >= maxHours ? null : value);
+                      const idx = parseInt(e.target.value, 10);
+                      // Top stop == the setting cap → store null so the map follows the setting.
+                      setMapMaxAgeHours(idx >= topIndex ? null : stops[idx]);
                     }}
                   />
-                  <span className="slider-value">{formatDuration(currentHours)}</span>
+                  <span className="slider-value">{label(currentIndex)}</span>
                 </div>
               </div>
             );
@@ -989,10 +999,11 @@ export default function DashboardMap({
             />
             <span>Show Neighbors</span>
           </label>
-          <label className="map-control-item">
+          <label className="map-control-item" title={unavailableIn3DTitle}>
             <input
               type="checkbox"
               checked={showAccuracyRegions}
+              disabled={effective3D}
               onChange={(e) => setShowAccuracyRegions(e.target.checked)}
             />
             <span>Show Accuracy Regions</span>
@@ -1021,30 +1032,32 @@ export default function DashboardMap({
             />
             <span>Show MQTT</span>
           </label>
-          <label className="map-control-item">
+          <label className="map-control-item" title={unavailableIn3DTitle}>
             <input
               type="checkbox"
               checked={showWaypoints}
+              disabled={effective3D}
               onChange={(e) => setShowWaypoints(e.target.checked)}
             />
             <span>Show Waypoints</span>
           </label>
-          <label className="map-control-item">
+          <label className="map-control-item" title={unavailableIn3DTitle}>
             <input
               type="checkbox"
               checked={showAtakContacts}
+              disabled={effective3D}
               onChange={(e) => setShowAtakContacts(e.target.checked)}
             />
             <span>Show ATAK Contacts</span>
           </label>
-          <label className="map-control-item">
+          <label className="map-control-item" title={unavailableIn3DTitle}>
             <input
               type="checkbox"
               checked={showPolarGrid && hasOwnNode}
-              disabled={!hasOwnNode}
+              disabled={effective3D || !hasOwnNode}
               onChange={(e) => setShowPolarGrid(e.target.checked)}
             />
-            <span title={!hasOwnNode ? 'No source has a known own-node position' : undefined}>
+            <span title={unavailableIn3DTitle ?? (!hasOwnNode ? 'No source has a known own-node position' : undefined)}>
               Show Polar Grid
             </span>
           </label>
@@ -1056,20 +1069,22 @@ export default function DashboardMap({
             />
             <span>Show Tile Selection</span>
           </label>
-          <label className="map-control-item">
+          <label className="map-control-item" title={unavailableIn3DTitle}>
             <input
               type="checkbox"
               checked={showLegend}
+              disabled={effective3D}
               onChange={(e) => setShowLegend(e.target.checked)}
             />
             <span>Show Legend</span>
           </label>
           {/* GeoJSON overlay layers — per-layer on/off, mirroring NodesTab. */}
           {geoJsonLayers.map(layer => (
-            <label key={layer.id} className="map-control-item">
+            <label key={layer.id} className="map-control-item" title={unavailableIn3DTitle}>
               <input
                 type="checkbox"
                 checked={layer.visible}
+                disabled={effective3D}
                 onChange={(e) => toggleGeoJsonLayer(layer.id, e.target.checked)}
               />
               <span style={{ display: 'inline-flex', alignItems: 'center', gap: '4px' }}>
@@ -1082,9 +1097,13 @@ export default function DashboardMap({
             </label>
           ))}
           </>
-          )}
         </div>
-      </div>
+        {/* Hops legend + tileset picker now live in the same sidebar (#4909). */}
+        {!effective3D && showLegend && <MapLegend embedded />}
+        {showTileSelector && (
+          <TilesetSelector selectedTilesetId={tilesetId} onTilesetChange={setMapTileset} embedded />
+        )}
+      </MapSidebar>
 
       {isLoading && <MapLoadingOverlay />}
 

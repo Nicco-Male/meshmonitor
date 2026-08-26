@@ -16,10 +16,13 @@ import { useWidgetMode } from '../hooks/useWidgetMode';
 import { useWidgetRange } from '../hooks/useWidgetRange';
 import { useSource } from '../contexts/SourceContext';
 import { getLatestValue } from '../utils/telemetry';
+import { telemetryDisplayScale } from '../utils/telemetryFormat';
 import TelemetryGauge from './TelemetryGauge';
 import TelemetryNumericLabel from './TelemetryNumericLabel';
 import { getTelemetryLabel } from './TelemetryChart';
 import { compareTelemetryGraphs } from '../utils/telemetryGraphOrder';
+import { buildTelemetryFilename, telemetrySeriesToCsv } from '../utils/telemetryChartCsv';
+import { downloadTextFile } from '../utils/nodeExport';
 import { UiIcon } from './icons';
 
 /** Telemetry types that represent discrete integer values where fractional display is meaningless */
@@ -51,12 +54,6 @@ interface TelemetryGraphsProps {
   temperatureUnit?: TemperatureUnit;
   telemetryHours?: number;
   baseUrl?: string;
-  /** Explicit source for global/report views that do not have SourceContext. */
-  sourceId?: string | null;
-  /** Consumer-provided display names keyed by exact telemetry type. */
-  labelOverrides?: Record<string, string>;
-  /** Hide mutation and display-mode controls in analytical reports. */
-  readOnly?: boolean;
   /**
    * When true, render a row of time-range buttons (15m … 7d) above the graphs
    * that let the user choose how much history to load. The chosen range is
@@ -161,14 +158,14 @@ interface TelemetryGraphWidgetProps {
   openMenu: string | null;
   menuPosition: { x: number; y: number } | null;
   handlePurgeData: (type: string) => void;
-  chartColors: { base: string; surface0: string; text: string };
+  chartColors: { bg: string; surface: string; text: string };
   getTelemetryLabel: (type: string) => string;
   getColor: (type: string) => string;
   prepareChartData: (data: TelemetryData[], isTemperature?: boolean, globalMinTime?: number) => ChartData[];
   timeFormat: TimeFormat;
+  hours: number;
   t: (key: string, opts?: Record<string, unknown>) => string;
   canEditSettings: boolean;
-  readOnly: boolean;
 }
 
 const TelemetryGraphWidget: React.FC<TelemetryGraphWidgetProps> = ({
@@ -196,17 +193,19 @@ const TelemetryGraphWidget: React.FC<TelemetryGraphWidgetProps> = ({
   getColor,
   prepareChartData,
   timeFormat,
+  hours,
   t,
   canEditSettings,
-  readOnly,
 }) => {
   const [mode, setMode] = useWidgetMode(nodeId, type, baseUrl);
   const [range, setRange] = useWidgetRange(nodeId, type, baseUrl);
-  const displayMode = readOnly ? 'chart' : mode;
 
   const isTemperature = isTemperatureType(type);
   const chartData = prepareChartData(data, isTemperature, globalMinTime);
-  const unit = isTemperature ? getTemperatureUnit(temperatureUnit) : data[0]?.unit || '';
+  // Humanize uptime and auto-scale current/power the same way the Dashboard
+  // widget does (#3261). Temperature keeps its own C/F handling below.
+  const display = telemetryDisplayScale(type, data.map(d => d.value), data[0]?.unit || '');
+  const unit = isTemperature ? getTemperatureUnit(temperatureUnit) : display.unit;
   const label = isPaxcounterCombined ? 'Paxcounter' : getTelemetryLabel(type);
   const color = getColor(type);
 
@@ -236,13 +235,48 @@ const TelemetryGraphWidget: React.FC<TelemetryGraphWidgetProps> = ({
 
   const latest = getLatestValue(data);
 
+  // Apply the display scale to the plotted series. The solar overlay lives on
+  // its own axis (watt-hours) and is left untouched.
+  const scaledChartData = !isTemperature && display.factor !== 1
+    ? chartData.map(d => ({ ...d, value: d.value == null ? d.value : d.value * display.factor }))
+    : chartData;
+
+  const canExportCsv = scaledChartData.length > 0;
+  const handleExportCsv = () => {
+    if (!canExportCsv) return;
+    const rows = scaledChartData.map((d) => {
+      // Paxcounter merge attaches paxWifi/paxBle on the chart point (same as plot).
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const p = d as any;
+      return {
+        timestamp: d.timestamp,
+        value: d.value,
+        solarEstimate: d.solarEstimate,
+        paxWifi: p.paxWifi as number | null | undefined,
+        paxBle: p.paxBle as number | null | undefined,
+      };
+    });
+    const csv = telemetrySeriesToCsv(rows, {
+      nodeId,
+      telemetryType: type,
+      unit,
+      hours,
+    });
+    downloadTextFile(
+      buildTelemetryFilename(nodeId, type, hours),
+      `\uFEFF${csv}`,
+      'text/csv;charset=utf-8',
+    );
+  };
+
   // Gauge/numeric modes display a single raw value, so convert it (and the
-  // gauge range) to the selected unit. Ranges persist in Celsius, so edits
-  // made while displaying Fahrenheit are converted back before saving.
+  // gauge range) to the selected unit. Ranges persist in base units (Celsius
+  // for temperature, the stored A/W for current/power), so edits made in the
+  // displayed unit are converted back before saving.
   const toDisplayTemp = (v: number) =>
-    isTemperature ? formatTemperature(v, 'C', temperatureUnit) : v;
+    isTemperature ? formatTemperature(v, 'C', temperatureUnit) : v * display.factor;
   const toStoredTemp = (v: number) =>
-    isTemperature ? formatTemperature(v, temperatureUnit, 'C') : v;
+    isTemperature ? formatTemperature(v, temperatureUnit, 'C') : v / display.factor;
   const handleRangeChange = (r: { min: number; max: number }) =>
     setRange({ min: toStoredTemp(r.min), max: toStoredTemp(r.max) });
 
@@ -253,7 +287,7 @@ const TelemetryGraphWidget: React.FC<TelemetryGraphWidgetProps> = ({
           {label} {unit && `(${unit})`}
         </h4>
         <div className="graph-actions">
-          {canEditSettings && !readOnly && (
+          {canEditSettings && (
             <div className="mode-toggle-group" role="group" aria-label="Display mode">
               <button
                 className={`mode-toggle-btn ${mode === 'chart' ? 'active' : ''}`}
@@ -291,43 +325,48 @@ const TelemetryGraphWidget: React.FC<TelemetryGraphWidgetProps> = ({
               <UiIcon name={getSolarVisibility(type) ? 'sun' : 'visibilityOff'} size={15} />
             </button>
           )}
-          {!readOnly && (
-            <>
-              <button
-                className={`favorite-btn ${favorites.has(type) ? 'favorited' : ''}`}
-                onClick={createToggleFavorite(type)}
-                aria-label={favorites.has(type) ? t('telemetry.remove_favorite') : t('telemetry.add_favorite')}
-              >
-                <UiIcon name={favorites.has(type) ? 'favorite' : 'favoriteOff'} size={15} />
+          <button
+            className="telemetry-export-btn"
+            onClick={handleExportCsv}
+            disabled={!canExportCsv}
+            aria-label={t('telemetry.export_csv')}
+            title={t('telemetry.export_csv')}
+          >
+            <UiIcon name="downloadData" size={15} />
+          </button>
+          <button
+            className={`favorite-btn ${favorites.has(type) ? 'favorited' : ''}`}
+            onClick={createToggleFavorite(type)}
+            aria-label={favorites.has(type) ? t('telemetry.remove_favorite') : t('telemetry.add_favorite')}
+          >
+            <UiIcon name={favorites.has(type) ? 'favorite' : 'favoriteOff'} size={15} />
+          </button>
+          <button
+            className="graph-menu-btn"
+            onClick={e => handleMenuClick(e, type)}
+            aria-label={t('telemetry.more_options')}
+          >
+            ⋯
+          </button>
+          {openMenu === type && menuPosition && (
+            <div
+              className="telemetry-context-menu"
+              style={{
+                position: 'fixed',
+                top: `${menuPosition.y}px`,
+                left: `${menuPosition.x}px`,
+              }}
+              onClick={e => e.stopPropagation()}
+            >
+              <button className="context-menu-item" onClick={() => handlePurgeData(type)}>
+                {t('telemetry.purge_data')}
               </button>
-              <button
-                className="graph-menu-btn"
-                onClick={e => handleMenuClick(e, type)}
-                aria-label={t('telemetry.more_options')}
-              >
-                ⋯
-              </button>
-              {openMenu === type && menuPosition && (
-                <div
-                  className="telemetry-context-menu"
-                  style={{
-                    position: 'fixed',
-                    top: `${menuPosition.y}px`,
-                    left: `${menuPosition.x}px`,
-                  }}
-                  onClick={e => e.stopPropagation()}
-                >
-                  <button className="context-menu-item" onClick={() => handlePurgeData(type)}>
-                    {t('telemetry.purge_data')}
-                  </button>
-                </div>
-              )}
-            </>
+            </div>
           )}
         </div>
       </div>
 
-      {displayMode === 'gauge' ? (
+      {mode === 'gauge' ? (
         latest ? (
           <TelemetryGauge
             value={toDisplayTemp(latest.value)}
@@ -338,25 +377,27 @@ const TelemetryGraphWidget: React.FC<TelemetryGraphWidgetProps> = ({
             timestamp={latest.timestamp}
             nodeId={nodeId}
             onRangeChange={handleRangeChange}
-            canEditRange={canEditSettings && !readOnly}
+            canEditRange={canEditSettings}
+            formatValue={display.formatValue}
           />
         ) : (
           <div className="telemetry-no-data">{t('telemetry.no_data')}</div>
         )
-      ) : displayMode === 'numeric' ? (
+      ) : mode === 'numeric' ? (
         latest ? (
           <TelemetryNumericLabel
             value={toDisplayTemp(latest.value)}
             unit={unit}
             color={color}
             timestamp={latest.timestamp}
+            formatValue={display.formatValue}
           />
         ) : (
           <div className="telemetry-no-data">{t('telemetry.no_data')}</div>
         )
       ) : (
         <ResponsiveContainer width="100%" height={200}>
-          <ComposedChart data={chartData} margin={{ top: 5, right: 20, bottom: 5, left: 0 }}>
+          <ComposedChart data={scaledChartData} margin={{ top: 5, right: 20, bottom: 5, left: 0 }}>
             <CartesianGrid strokeDasharray="3 3" stroke="#ccc" />
             <XAxis
               dataKey="timestamp"
@@ -370,7 +411,12 @@ const TelemetryGraphWidget: React.FC<TelemetryGraphWidgetProps> = ({
               tick={{ fontSize: 12 }}
               domain={['auto', 'auto']}
               allowDecimals={!INTEGER_TELEMETRY_TYPES.has(type)}
-              tickFormatter={INTEGER_TELEMETRY_TYPES.has(type) ? (v: number) => Math.round(v).toString() : undefined}
+              tickFormatter={
+                display.formatValue ??
+                (INTEGER_TELEMETRY_TYPES.has(type)
+                  ? (v: number) => Math.round(v).toString()
+                  : undefined)
+              }
             />
             <YAxis
               yAxisId="right"
@@ -381,12 +427,21 @@ const TelemetryGraphWidget: React.FC<TelemetryGraphWidgetProps> = ({
             />
             <Tooltip
               contentStyle={{
-                backgroundColor: chartColors.base,
-                border: `1px solid ${chartColors.surface0}`,
+                backgroundColor: chartColors.bg,
+                border: `1px solid ${chartColors.surface}`,
                 borderRadius: '4px',
                 color: chartColors.text,
               }}
               labelStyle={{ color: chartColors.text }}
+              formatter={
+                display.formatValue
+                  ? (value, name) =>
+                      // Leave the solar overlay (watt-hours) untouched.
+                      name === 'solarEstimate' || typeof value !== 'number'
+                        ? value
+                        : display.formatValue!(value)
+                  : undefined
+              }
               labelFormatter={value => {
                 const date = new Date(value);
                 return date.toLocaleString([], {
@@ -457,24 +512,18 @@ const TelemetryGraphWidget: React.FC<TelemetryGraphWidgetProps> = ({
 };
 
 const TelemetryGraphs: React.FC<TelemetryGraphsProps> = React.memo(
-  ({
-    nodeId,
-    temperatureUnit = 'C',
-    telemetryHours = 24,
-    baseUrl = '',
-    sourceId: sourceIdProp,
-    labelOverrides,
-    readOnly = false,
-    showTimeRangeSelector = false,
-  }) => {
+  ({ nodeId, temperatureUnit = 'C', telemetryHours = 24, baseUrl = '', showTimeRangeSelector = false }) => {
     const { t } = useTranslation();
     const csrfFetch = useCsrfFetch();
     const { showToast } = useToast();
     const { solarMonitoringEnabled, timeFormat } = useSettings();
     const { hasPermission } = useAuth();
-    const canEditSettings = hasPermission('settings', 'write');
-    const { sourceId: contextSourceId } = useSource();
-    const sourceId = sourceIdProp ?? contextSourceId;
+    // 'settings' is sourcey (Phase 6 #4416). This only toggles a local
+    // chart/gauge display mode — it never calls a settings API — so
+    // anySource is the closest mirror of "holds settings:write somewhere",
+    // matching the general unscoped gate used elsewhere in this component tree.
+    const canEditSettings = hasPermission('settings', 'write', { anySource: true });
+    const { sourceId } = useSource();
     const [openMenu, setOpenMenu] = useState<string | null>(null);
     const [menuPosition, setMenuPosition] = useState<{
       x: number;
@@ -502,17 +551,6 @@ const TelemetryGraphs: React.FC<TelemetryGraphsProps> = React.memo(
     });
 
     const effectiveHours = showTimeRangeSelector ? selectedHours : telemetryHours;
-    // Sub-hour windows (e.g. the 15-minute preset) read awkwardly as
-    // fractional hours, so render those with a minutes-based title instead.
-    // Compute this before handling loading/empty/error states so the header
-    // and range selector never disappear while a different window is loaded.
-    const titleText = effectiveHours < 1
-      ? t('telemetry.title_minutes', { count: Math.round(effectiveHours * 60) })
-      : t('telemetry.title', { count: effectiveHours });
-    const getDisplayLabel = useCallback(
-      (type: string) => labelOverrides?.[type]?.trim() || getTelemetryLabel(type),
-      [labelOverrides],
-    );
 
     const handleSelectRange = useCallback((hours: number) => {
       setSelectedHours(hours);
@@ -527,7 +565,6 @@ const TelemetryGraphs: React.FC<TelemetryGraphsProps> = React.memo(
     const {
       data: telemetryData = [],
       isLoading: loading,
-      isFetching: refreshing,
       error: telemetryError,
       refetch: refetchTelemetry,
     } = useTelemetry({
@@ -586,8 +623,8 @@ const TelemetryGraphs: React.FC<TelemetryGraphsProps> = React.memo(
 
     // Get computed CSS color values for chart styling (Recharts doesn't support CSS variables in inline styles)
     const [chartColors, setChartColors] = useState({
-      base: '#1e1e2e',
-      surface0: '#45475a',
+      bg: '#1e1e2e',
+      surface: '#45475a',
       text: '#cdd6f4',
     });
 
@@ -595,12 +632,12 @@ const TelemetryGraphs: React.FC<TelemetryGraphsProps> = React.memo(
     useEffect(() => {
       const updateColors = () => {
         const rootStyle = getComputedStyle(document.documentElement);
-        const base = rootStyle.getPropertyValue('--ctp-base').trim();
-        const surface0 = rootStyle.getPropertyValue('--ctp-surface0').trim();
-        const text = rootStyle.getPropertyValue('--ctp-text').trim();
+        const bg = rootStyle.getPropertyValue('--color-bg').trim();
+        const surface = rootStyle.getPropertyValue('--color-surface').trim();
+        const text = rootStyle.getPropertyValue('--color-text').trim();
 
-        if (base && surface0 && text) {
-          setChartColors({ base, surface0, text });
+        if (bg && surface && text) {
+          setChartColors({ bg, surface, text });
         }
       };
 
@@ -893,6 +930,22 @@ const TelemetryGraphs: React.FC<TelemetryGraphsProps> = React.memo(
       return colors[type] || '#8884d8';
     };
 
+    if (loading) {
+      return <div className="telemetry-loading">{t('telemetry.loading')}</div>;
+    }
+
+    if (error) {
+      return (
+        <div className="telemetry-empty" style={{ color: '#f38ba8' }}>
+          {t('common.error')}: {error}
+        </div>
+      );
+    }
+
+    if (telemetryData.length === 0) {
+      return <div className="telemetry-empty">{t('telemetry.no_data')}</div>;
+    }
+
     const groupedData = groupByType(telemetryData);
 
     // Calculate global time range across all telemetry data (excluding solar)
@@ -951,95 +1004,72 @@ const TelemetryGraphs: React.FC<TelemetryGraphsProps> = React.memo(
       // telemetry update — making it hard to track a specific graph. New
       // metrics now slot into their alphabetical position instead of jumping
       // around.
-      .sort(([typeA], [typeB]) => compareTelemetryGraphs(typeA, typeB, favorites, getDisplayLabel));
+      .sort(([typeA], [typeB]) => compareTelemetryGraphs(typeA, typeB, favorites, getTelemetryLabel));
+
+    // Sub-hour windows (e.g. the 15-minute preset) read awkwardly as
+    // fractional hours, so render those with a minutes-based title instead.
+    const titleText = effectiveHours < 1
+      ? t('telemetry.title_minutes', { count: Math.round(effectiveHours * 60) })
+      : t('telemetry.title', { count: effectiveHours });
 
     return (
       <div className="telemetry-graphs">
         <div className="telemetry-graphs-header">
           <h3 className="telemetry-title">{titleText}</h3>
           {showTimeRangeSelector && (
-            <div className="telemetry-graphs-controls">
-              <div
-                className="telemetry-range-selector"
-                role="group"
-                aria-label={t('telemetry.time_range')}
-              >
-                {TELEMETRY_RANGE_PRESETS.map(preset => (
-                  <button
-                    key={preset.label}
-                    type="button"
-                    className={`telemetry-range-btn ${effectiveHours === preset.hours ? 'active' : ''}`}
-                    onClick={() => handleSelectRange(preset.hours)}
-                    aria-pressed={effectiveHours === preset.hours}
-                  >
-                    {preset.label}
-                  </button>
-                ))}
-              </div>
-              <button
-                type="button"
-                className="telemetry-range-btn telemetry-refresh-btn"
-                onClick={() => void refetchTelemetry()}
-                disabled={refreshing}
-                aria-busy={refreshing}
-                title={t('common.refresh')}
-              >
-                <UiIcon
-                  name="refresh"
-                  size={14}
-                  className={refreshing ? 'telemetry-refresh-icon spinning' : 'telemetry-refresh-icon'}
-                />
-                {t('common.refresh')}
-              </button>
+            <div
+              className="telemetry-range-selector"
+              role="group"
+              aria-label={t('telemetry.time_range')}
+            >
+              {TELEMETRY_RANGE_PRESETS.map(preset => (
+                <button
+                  key={preset.label}
+                  type="button"
+                  className={`telemetry-range-btn ${effectiveHours === preset.hours ? 'active' : ''}`}
+                  onClick={() => handleSelectRange(preset.hours)}
+                  aria-pressed={effectiveHours === preset.hours}
+                >
+                  {preset.label}
+                </button>
+              ))}
             </div>
           )}
         </div>
-        {loading ? (
-          <div className="telemetry-loading" role="status">{t('telemetry.loading')}</div>
-        ) : error ? (
-          <div className="telemetry-empty" role="alert" style={{ color: '#f38ba8' }}>
-            {t('common.error')}: {error}
-          </div>
-        ) : telemetryData.length === 0 ? (
-          <div className="telemetry-empty" role="status">
-            {showTimeRangeSelector ? t('telemetry.no_data_in_range') : t('telemetry.no_data')}
-          </div>
-        ) : (
-          <div className="graphs-grid">
-            {filteredData.map(([type, data]) => (
-              <TelemetryGraphWidget
-                key={type}
-                nodeId={nodeId}
-                type={type}
-                baseUrl={baseUrl}
-                data={data}
-                isPaxcounterCombined={type === 'paxcounterWifi'}
-                bleData={groupedData.get('paxcounterBle')}
-                temperatureUnit={temperatureUnit}
-                globalTimeRange={globalTimeRange}
-                globalMinTime={globalMinTime}
-                solarEstimates={solarEstimates}
-                solarMonitoringEnabled={solarMonitoringEnabled}
-                getSolarVisibility={getSolarVisibility}
-                handleToggleSolar={handleToggleSolar}
-                favorites={favorites}
-                createToggleFavorite={createToggleFavorite}
-                handleMenuClick={handleMenuClick}
-                openMenu={openMenu}
-                menuPosition={menuPosition}
-                handlePurgeData={handlePurgeData}
-                chartColors={chartColors}
-                getTelemetryLabel={getDisplayLabel}
-                getColor={getColor}
-                prepareChartData={prepareChartData}
-                timeFormat={timeFormat}
-                t={t as (key: string, opts?: Record<string, unknown>) => string}
-                canEditSettings={canEditSettings}
-                readOnly={readOnly}
-              />
-            ))}
-          </div>
-        )}
+        <div className="graphs-grid">
+          {filteredData.map(([type, data]) => (
+            <TelemetryGraphWidget
+              key={type}
+              nodeId={nodeId}
+              type={type}
+              baseUrl={baseUrl}
+              data={data}
+              isPaxcounterCombined={type === 'paxcounterWifi'}
+              bleData={groupedData.get('paxcounterBle')}
+              temperatureUnit={temperatureUnit}
+              globalTimeRange={globalTimeRange}
+              globalMinTime={globalMinTime}
+              solarEstimates={solarEstimates}
+              solarMonitoringEnabled={solarMonitoringEnabled}
+              getSolarVisibility={getSolarVisibility}
+              handleToggleSolar={handleToggleSolar}
+              favorites={favorites}
+              createToggleFavorite={createToggleFavorite}
+              handleMenuClick={handleMenuClick}
+              openMenu={openMenu}
+              menuPosition={menuPosition}
+              handlePurgeData={handlePurgeData}
+              chartColors={chartColors}
+              getTelemetryLabel={getTelemetryLabel}
+              getColor={getColor}
+              prepareChartData={prepareChartData}
+              timeFormat={timeFormat}
+              hours={effectiveHours}
+              t={t as (key: string, opts?: Record<string, unknown>) => string}
+              canEditSettings={canEditSettings}
+            />
+          ))}
+        </div>
       </div>
     );
   }

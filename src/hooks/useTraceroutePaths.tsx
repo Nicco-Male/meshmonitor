@@ -10,8 +10,10 @@
  * selectedNodeTraceroute useMemo blocks in App.tsx.
  */
 
-import React, { useMemo } from 'react';
+import React, { useMemo, useState } from 'react';
+import { Popup } from 'react-leaflet';
 import { DraggablePopup } from '../components/DraggablePopup';
+import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
 import { calculateDistance, formatDistance } from '../utils/distance';
 import { getSegmentSnrOpacity, weightByUsage, tracerouteSegmentWeight, type SnrColorScale } from '../utils/mapHelpers';
 import {
@@ -25,12 +27,111 @@ import {
   averageNonSentinelSnr,
   type TracerouteRenderSegment,
 } from '../utils/tracerouteSegments';
-import type { DirectionalTracerouteRenderSegment } from '../utils/tracerouteDirections';
 import { TraceroutePathsLayer } from '../components/map/layers/TraceroutePathsLayer';
-import RouteSegmentPopup from '../components/map/popups/RouteSegmentPopup';
 import { darkOverlayColors } from '../config/overlayColors';
 import { logger } from '../utils/logger';
 import type { DistanceUnit } from '../contexts/SettingsContext';
+
+/** Small component for route segment SNR chart with time-of-day / chronological toggle */
+function SegmentSnrChart({ chartData }: {
+  chartData: Array<{ timeDecimal: number; timeLabel: string; snr: number; fullTimestamp: number }>;
+}) {
+  const [mode, setMode] = useState<'timeOfDay' | 'chronological'>('timeOfDay');
+
+  const chronoData = useMemo(() =>
+    [...chartData].sort((a, b) => a.fullTimestamp - b.fullTimestamp).map(d => {
+      const date = new Date(d.fullTimestamp);
+      const month = (date.getMonth() + 1).toString().padStart(2, '0');
+      const day = date.getDate().toString().padStart(2, '0');
+      const hours = date.getHours().toString().padStart(2, '0');
+      const minutes = date.getMinutes().toString().padStart(2, '0');
+      return { ...d, chronoLabel: `${month}/${day} ${hours}:${minutes}`, chronoTime: d.fullTimestamp };
+    }), [chartData]);
+
+  return (
+    <div className="snr-timeline-chart">
+      <div style={{ display: 'flex', gap: '4px', marginBottom: '6px' }}>
+        <button
+          className={`node-popup-tab ${mode === 'timeOfDay' ? 'active' : ''}`}
+          style={{ fontSize: '10px', padding: '2px 8px', border: '1px solid var(--color-surface-active)', borderRadius: '4px', cursor: 'pointer', background: mode === 'timeOfDay' ? 'var(--color-accent)' : 'var(--color-surface)', color: mode === 'timeOfDay' ? 'var(--color-bg)' : 'var(--color-text-muted)' }}
+          onClick={e => { e.stopPropagation(); setMode('timeOfDay'); }}
+        >
+          Time of Day
+        </button>
+        <button
+          className={`node-popup-tab ${mode === 'chronological' ? 'active' : ''}`}
+          style={{ fontSize: '10px', padding: '2px 8px', border: '1px solid var(--color-surface-active)', borderRadius: '4px', cursor: 'pointer', background: mode === 'chronological' ? 'var(--color-accent)' : 'var(--color-surface)', color: mode === 'chronological' ? 'var(--color-bg)' : 'var(--color-text-muted)' }}
+          onClick={e => { e.stopPropagation(); setMode('chronological'); }}
+        >
+          Over Time
+        </button>
+      </div>
+      <ResponsiveContainer width="100%" height={150}>
+        {mode === 'timeOfDay' ? (
+          <LineChart data={chartData} margin={{ top: 10, right: 10, left: -20, bottom: 5 }}>
+            <CartesianGrid strokeDasharray="3 3" stroke="var(--color-surface-active)" />
+            <XAxis
+              dataKey="timeDecimal"
+              type="number"
+              domain={[0, 24]}
+              ticks={[0, 6, 12, 18, 24]}
+              tickFormatter={value => {
+                const hours = Math.floor(value);
+                const minutes = Math.round((value - hours) * 60);
+                return `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}`;
+              }}
+              tick={{ fill: 'var(--color-text-muted)', fontSize: 10 }}
+              stroke="var(--color-surface-active)"
+            />
+            <YAxis
+              tick={{ fill: 'var(--color-text-muted)', fontSize: 10 }}
+              stroke="var(--color-surface-active)"
+              label={{ value: 'SNR (dB)', angle: -90, position: 'insideLeft', style: { fill: 'var(--color-text-muted)', fontSize: 10 } }}
+            />
+            <Tooltip
+              contentStyle={{ backgroundColor: 'var(--color-surface)', border: '1px solid var(--color-surface-active)', borderRadius: '4px', fontSize: '12px' }}
+              labelStyle={{ color: 'var(--color-text)' }}
+              labelFormatter={value => {
+                const item = chartData.find(d => d.timeDecimal === value);
+                return item ? item.timeLabel : String(value);
+              }}
+            />
+            <Line type="monotone" dataKey="snr" stroke="var(--color-accent-alt)" strokeWidth={2} dot={{ fill: 'var(--color-accent-alt)', r: 3 }} />
+          </LineChart>
+        ) : (
+          <LineChart data={chronoData} margin={{ top: 10, right: 10, left: -20, bottom: 5 }}>
+            <CartesianGrid strokeDasharray="3 3" stroke="var(--color-surface-active)" />
+            <XAxis
+              dataKey="chronoTime"
+              type="number"
+              domain={['dataMin', 'dataMax']}
+              tickFormatter={value => {
+                const date = new Date(value);
+                return `${(date.getMonth() + 1).toString().padStart(2, '0')}/${date.getDate().toString().padStart(2, '0')}`;
+              }}
+              tick={{ fill: 'var(--color-text-muted)', fontSize: 10 }}
+              stroke="var(--color-surface-active)"
+            />
+            <YAxis
+              tick={{ fill: 'var(--color-text-muted)', fontSize: 10 }}
+              stroke="var(--color-surface-active)"
+              label={{ value: 'SNR (dB)', angle: -90, position: 'insideLeft', style: { fill: 'var(--color-text-muted)', fontSize: 10 } }}
+            />
+            <Tooltip
+              contentStyle={{ backgroundColor: 'var(--color-surface)', border: '1px solid var(--color-surface-active)', borderRadius: '4px', fontSize: '12px' }}
+              labelStyle={{ color: 'var(--color-text)' }}
+              labelFormatter={value => {
+                const item = chronoData.find(d => d.chronoTime === value);
+                return item ? item.chronoLabel : String(value);
+              }}
+            />
+            <Line type="monotone" dataKey="snr" stroke="var(--color-accent-alt)" strokeWidth={2} dot={{ fill: 'var(--color-accent-alt)', r: 3 }} />
+          </LineChart>
+        )}
+      </ResponsiveContainer>
+    </div>
+  );
+}
 
 /**
  * Minimal node data needed for traceroute rendering
@@ -71,10 +172,10 @@ export interface TracerouteDigest {
  * Theme colors for path rendering
  */
 export interface ThemeColors {
-  mauve: string;
-  red: string;
-  blue: string;
-  overlay0: string;
+  accentAlt: string;
+  error: string;
+  accent: string;
+  faint: string;
   // Overlay scheme colors (override theme CSS colors when set)
   tracerouteForward?: string;
   tracerouteReturn?: string;
@@ -127,29 +228,6 @@ export interface UseTraceroutePathsResult {
 
 const BROADCAST_ADDR = 4294967295;
 
-/** Maximum age for traceroute lines shown on the normal map overlay. */
-export const TRACEROUTE_MAP_MAX_AGE_HOURS = 4;
-
-/** Stable unordered identity for one physical hop. Anonymous relay placeholders
- * carry trace-scoped hop keys from `decomposeTraceroute`, so they never merge
- * with an unrelated hidden relay from another trace. */
-function segmentPairKey(segment: TracerouteRenderSegment): string {
-  const fromKey = segment.fromHopKey ?? `node:${segment.fromNodeNum}`;
-  const toKey = segment.toHopKey ?? `node:${segment.toNodeNum}`;
-  return fromKey < toKey ? `${fromKey}~${toKey}` : `${toKey}~${fromKey}`;
-}
-
-const SELECTED_HOP_COLORS = [
-  '#3b82f6',
-  '#f97316',
-  '#22c55e',
-  '#a855f7',
-  '#ef4444',
-  '#06b6d4',
-  '#eab308',
-  '#ec4899',
-];
-
 /**
  * Fallback SNR color scale for the (structurally optional) `ThemeColors.snrColors`
  * field. In practice App.tsx always supplies a real scheme-derived scale
@@ -176,6 +254,7 @@ export function useTraceroutePaths({
   nodesPositionDigest,
   traceroutesDigest,
   distanceUnit,
+  maxNodeAgeHours,
   themeColors,
   callbacks,
   visibleNodeNums,
@@ -199,38 +278,36 @@ export function useTraceroutePaths({
   const traceroutePathsElements = useMemo(() => {
     if (!showPaths) return null;
 
-    // Calculate per-physical-hop traceroute usage and collect directional SNR
-    // observations. Anonymous hops use trace-scoped identities, never the
-    // shared 0xffffffff placeholder, so unrelated hidden relays cannot merge.
-    const segmentTraceIds = new Map<string, Set<number>>();
+    // Calculate segment usage counts and collect SNR values with timestamps
+    const segmentUsage = new Map<string, number>();
     const segmentSNRs = new Map<string, Array<{ snr: number; timestamp: number }>>();
+    // Track segments that have MQTT/unknown hops (SNR sentinel indicates MQTT gateway or unknown)
     const segmentHasMqtt = new Map<string, boolean>();
+    // Track most recent timestamp per segment for temporal fade
     const segmentLatestTimestamp = new Map<string, number>();
-    const segmentsList: DirectionalTracerouteRenderSegment[] = [];
+    const segmentsList: Array<{
+      key: string;
+      positions: [number, number][];
+      nodeNums: [number, number];
+    }> = [];
 
-    // The normal map overlay is intentionally short-lived: a traceroute may
-    // stay visible for at most 4 hours if its capture-time geometry is still
-    // valid. Movement invalidation is handled separately by
-    // resolveSegmentPosition/hasTracerouteSnapshotMoved. Historical traces
-    // remain available elsewhere; they just stop being presented as current
-    // map links after this TTL.
-    const cutoffTime = Date.now() - TRACEROUTE_MAP_MAX_AGE_HOURS * 60 * 60 * 1000;
+    // Filter traceroutes by age using the same maxNodeAgeHours setting
+    const cutoffTime = Date.now() - maxNodeAgeHours * 60 * 60 * 1000;
     const recentTraceroutes = traceroutesDigest.filter(tr => {
       const timestamp = tr.timestamp || tr.createdAt || 0;
       return timestamp >= cutoffTime;
     });
 
-    // Deduplicate only within the same request direction. A->B and B->A are
-    // independent evidence and both must survive so the map can determine
-    // whether a physical segment is actually bidirectional.
+    // Deduplicate: keep only the most recent traceroute per node pair
     const tracerouteMap = new Map<string, TracerouteDigest>();
     recentTraceroutes.forEach(tr => {
-      const key = `${tr.fromNodeNum}->${tr.toNodeNum}`;
+      // Create a bidirectional key (same for A→B and B→A)
+      const key = [tr.fromNodeNum, tr.toNodeNum].sort().join('-');
       const existing = tracerouteMap.get(key);
       const timestamp = tr.timestamp || tr.createdAt || 0;
       const existingTimestamp = existing?.timestamp || existing?.createdAt || 0;
 
-      // Keep the most recent traceroute for this request direction.
+      // Keep the most recent traceroute for this node pair
       if (!existing || timestamp > existingTimestamp) {
         tracerouteMap.set(key, tr);
       }
@@ -240,63 +317,139 @@ export function useTraceroutePaths({
     const deduplicatedTraceroutes = Array.from(tracerouteMap.values());
 
     deduplicatedTraceroutes.forEach((tr, idx) => {
-      const timestamp = tr.timestamp || tr.createdAt || Date.now();
-      const snapshotPositions = parseSnapshotRoutePositions(tr.routePositions);
-      const resolvePosition = (nodeNum: number): [number, number] | null =>
-        resolveSegmentPosition(nodeNum, snapshotPositions, liveNodePositions);
-      const canEstimateHop = (nodeNum: number): boolean =>
-        !isValidRouteNode(nodeNum) || !visibleNodeNums || visibleNodeNums.has(nodeNum);
-
-      const decomposed = decomposeTraceroute(
-        tr,
-        {
-          resolvePosition,
-          estimateMissingHops: true,
-          canEstimateHop,
-          traceKey: `nodes-${idx}-${timestamp}`,
-        },
-      );
-
-      for (const segment of decomposed) {
-        const aggregateKey = segmentPairKey(segment);
-        let traceIds = segmentTraceIds.get(aggregateKey);
-        if (!traceIds) {
-          traceIds = new Set<number>();
-          segmentTraceIds.set(aggregateKey, traceIds);
+      try {
+        // Skip traceroutes with null or invalid route data (failed traceroutes)
+        if (
+          !tr.route ||
+          tr.route === 'null' ||
+          tr.route === '' ||
+          !tr.routeBack ||
+          tr.routeBack === 'null' ||
+          tr.routeBack === ''
+        ) {
+          return; // Skip this traceroute - no valid route data to display
         }
-        traceIds.add(idx);
 
-        if (segment.avgSnr !== null && Number.isFinite(segment.avgSnr)) {
-          const samples = segmentSNRs.get(aggregateKey) ?? [];
-          samples.push({ snr: segment.avgSnr, timestamp });
-          segmentSNRs.set(aggregateKey, samples);
-        }
-        if (segment.isMqtt) segmentHasMqtt.set(aggregateKey, true);
-        const existingTimestamp = segmentLatestTimestamp.get(aggregateKey) ?? 0;
-        if (timestamp > existingTimestamp) segmentLatestTimestamp.set(aggregateKey, timestamp);
+        // Process forward path - filter out invalid node numbers
+        const rawRouteForward = JSON.parse(tr.route);
+        const rawRouteBack = JSON.parse(tr.routeBack);
+        const routeForward = rawRouteForward.filter(isValidRouteNode);
+        const routeBack = rawRouteBack.filter(isValidRouteNode);
 
-        segmentsList.push({
-          ...segment,
-          key: `tr-${idx}-${segment.key}`,
-          // Keep the occurrence-level values before pair aggregation below.
-          // The shared layer uses them to build separate A->B / B->A stats.
-          observedSnr: segment.avgSnr,
-          observedTimestamp: timestamp,
-          observedIsMqtt: segment.isMqtt,
+        // Note: Empty arrays are valid (direct path with no intermediate hops)
+
+        const snrForward =
+          tr.snrTowards && tr.snrTowards !== 'null' && tr.snrTowards !== '' ? JSON.parse(tr.snrTowards) : [];
+        const timestamp = tr.timestamp || tr.createdAt || Date.now();
+
+        // #1862 — snapshot positions via the shared util (fixes a
+        // lat/lng===0 truthy-check bug in the old per-consumer copy).
+        const snapshotPositions = parseSnapshotRoutePositions(tr.routePositions);
+        const resolvePosition = (nodeNum: number): [number, number] | null =>
+          resolveSegmentPosition(nodeNum, snapshotPositions, liveNodePositions);
+
+        // Build forward path: responder -> route -> requester (fromNodeNum -> toNodeNum)
+        const forwardSequence: number[] = [tr.fromNodeNum, ...routeForward, tr.toNodeNum];
+        const forwardPositions: Array<{ nodeNum: number; pos: [number, number] }> = [];
+
+        // Build forward sequence with positions (prefer snapshot positions)
+        forwardSequence.forEach(nodeNum => {
+          const pos = resolvePosition(nodeNum);
+          if (pos) {
+            forwardPositions.push({ nodeNum, pos });
+          }
         });
+
+        // Create forward segments and count usage
+        for (let i = 0; i < forwardPositions.length - 1; i++) {
+          const from = forwardPositions[i];
+          const to = forwardPositions[i + 1];
+          const segmentKey = [from.nodeNum, to.nodeNum].sort().join('-');
+
+          segmentUsage.set(segmentKey, (segmentUsage.get(segmentKey) || 0) + 1);
+
+          // Collect SNR value with timestamp for this segment
+          if (snrForward[i] !== undefined) {
+            const snrValue = snrForward[i] / 4; // Scale SNR value
+            if (!segmentSNRs.has(segmentKey)) {
+              segmentSNRs.set(segmentKey, []);
+            }
+            segmentSNRs.get(segmentKey)!.push({ snr: snrValue, timestamp });
+            if (isUnknownSnr(snrValue)) {
+              segmentHasMqtt.set(segmentKey, true);
+            }
+          }
+
+          // Track most recent timestamp for temporal fade
+          const existingTsFwd = segmentLatestTimestamp.get(segmentKey) || 0;
+          if (timestamp > existingTsFwd) {
+            segmentLatestTimestamp.set(segmentKey, timestamp);
+          }
+
+          segmentsList.push({
+            key: `tr-${idx}-fwd-seg-${i}`,
+            positions: [from.pos, to.pos],
+            nodeNums: [from.nodeNum, to.nodeNum],
+          });
+        }
+
+        // Process return path
+        const snrBack = tr.snrBack && tr.snrBack !== 'null' && tr.snrBack !== '' ? JSON.parse(tr.snrBack) : [];
+        // Build return path: requester -> routeBack -> responder (toNodeNum -> fromNodeNum)
+        const backSequence: number[] = [tr.toNodeNum, ...routeBack, tr.fromNodeNum];
+        const backPositions: Array<{ nodeNum: number; pos: [number, number] }> = [];
+
+        // Build back sequence with positions (prefer snapshot positions)
+        backSequence.forEach(nodeNum => {
+          const pos = resolvePosition(nodeNum);
+          if (pos) {
+            backPositions.push({ nodeNum, pos });
+          }
+        });
+
+        // Create back segments and count usage
+        for (let i = 0; i < backPositions.length - 1; i++) {
+          const from = backPositions[i];
+          const to = backPositions[i + 1];
+          const segmentKey = [from.nodeNum, to.nodeNum].sort().join('-');
+
+          segmentUsage.set(segmentKey, (segmentUsage.get(segmentKey) || 0) + 1);
+
+          // Collect SNR value with timestamp for this segment
+          if (snrBack[i] !== undefined) {
+            const snrValue = snrBack[i] / 4; // Scale SNR value
+            if (!segmentSNRs.has(segmentKey)) {
+              segmentSNRs.set(segmentKey, []);
+            }
+            segmentSNRs.get(segmentKey)!.push({ snr: snrValue, timestamp });
+            if (isUnknownSnr(snrValue)) {
+              segmentHasMqtt.set(segmentKey, true);
+            }
+          }
+
+          // Track most recent timestamp for temporal fade
+          const existingTsBack = segmentLatestTimestamp.get(segmentKey) || 0;
+          if (timestamp > existingTsBack) {
+            segmentLatestTimestamp.set(segmentKey, timestamp);
+          }
+
+          segmentsList.push({
+            key: `tr-${idx}-back-seg-${i}`,
+            positions: [from.pos, to.pos],
+            nodeNums: [from.nodeNum, to.nodeNum],
+          });
+        }
+      } catch (error) {
+        logger.error('Error parsing traceroute:', error);
       }
     });
 
-    // A real endpoint must pass the map filters. An anonymous placeholder has
-    // no ordinary node marker/filter row; its explicit estimated-hop marker is
-    // the endpoint, so it remains eligible.
+    // Filter segments to only include those where both endpoints are visible
+    // This ensures route segments are hidden when their connected nodes are filtered out
     let filteredSegments = visibleNodeNums
       ? segmentsList.filter(segment => {
-          const fromVisible =
-            !isValidRouteNode(segment.fromNodeNum) || visibleNodeNums.has(segment.fromNodeNum);
-          const toVisible =
-            !isValidRouteNode(segment.toNodeNum) || visibleNodeNums.has(segment.toNodeNum);
-          return fromVisible && toVisible;
+          const [nodeNum1, nodeNum2] = segment.nodeNums;
+          return visibleNodeNums.has(nodeNum1) && visibleNodeNums.has(nodeNum2);
         })
       : segmentsList;
 
@@ -304,7 +457,7 @@ export function useTraceroutePaths({
     if (mapZoom !== undefined && mapZoom < 8) {
       // Regional view: only show segments with good or medium SNR (filter out poor/unknown)
       filteredSegments = filteredSegments.filter(segment => {
-        const segKey = segmentPairKey(segment);
+        const segKey = segment.nodeNums.slice().sort().join('-');
         const snrData = segmentSNRs.get(segKey);
         if (!snrData || snrData.length === 0) return false; // Hide unknown segments at low zoom
         const rfSnrs = snrData.filter(d => !isUnknownSnr(d.snr)).map(d => d.snr);
@@ -318,9 +471,9 @@ export function useTraceroutePaths({
     // numbers directly on the segment (`fromNodeNum`/`toNodeNum`) so the
     // popup/className below can read them straight off `seg` instead of a
     // side-table lookup.
-    const renderSegments: DirectionalTracerouteRenderSegment[] = filteredSegments.map(segment => {
-      const segmentKey = segmentPairKey(segment);
-      const usage = segmentTraceIds.get(segmentKey)?.size ?? 1;
+    const renderSegments: TracerouteRenderSegment[] = filteredSegments.map(segment => {
+      const segmentKey = segment.nodeNums.slice().sort().join('-');
+      const usage = segmentUsage.get(segmentKey) || 1;
       // A segment is MQTT/IP only when the firmware reported the unknown-SNR
       // sentinel for that specific hop (issue #2931). Don't infer from
       // `node.viaMqtt` — that flag tracks how the node's own NodeInfo last
@@ -334,7 +487,11 @@ export function useTraceroutePaths({
       const latestTimestamp = segmentLatestTimestamp.get(segmentKey);
 
       return {
-        ...segment,
+        key: segment.key,
+        from: segment.positions[0],
+        to: segment.positions[1],
+        fromNodeNum: segment.nodeNums[0],
+        toNodeNum: segment.nodeNums[1],
         // Aggregated bidirectionally across (possibly many) traceroutes —
         // not a single forward/return leg, so 'neutral' (curvature 0 either
         // way for this layer, per the consumer table).
@@ -352,81 +509,202 @@ export function useTraceroutePaths({
     const nodeByNum = new Map<number, NodePositionDigest>();
     for (const n of nodesPositionDigest) nodeByNum.set(n.nodeNum, n);
 
-    // Shared popup content — this surface supplies the existing interactive
-    // node/route callbacks, while Dashboard uses the same component read-only.
+    // Popup content (recharts SegmentSnrChart moves in verbatim) — a single
+    // render-prop reading hop identity straight off the segment.
     const renderBasePopup = (seg: TracerouteRenderSegment): React.ReactNode => {
       const nodeNum1 = seg.fromNodeNum;
       const nodeNum2 = seg.toNodeNum;
-      const segmentKey = segmentPairKey(seg);
-      const usage = segmentTraceIds.get(segmentKey)?.size ?? 1;
+      const segmentKey = [nodeNum1, nodeNum2].sort().join('-');
+      const usage = segmentUsage.get(segmentKey) || 1;
       const node1 = nodeByNum.get(nodeNum1);
       const node2 = nodeByNum.get(nodeNum2);
       const isMqttSegment = seg.isMqtt;
       const node1Name =
         nodeNum1 === BROADCAST_ADDR
-          ? 'Unknown hop'
+          ? '(unknown)'
           : node1?.user?.longName || node1?.user?.shortName || `!${nodeNum1.toString(16)}`;
       const node2Name =
         nodeNum2 === BROADCAST_ADDR
-          ? 'Unknown hop'
+          ? '(unknown)'
           : node2?.user?.longName || node2?.user?.shortName || `!${nodeNum2.toString(16)}`;
 
-      const segmentDistanceKm = calculateDistance(
-        seg.from[0],
-        seg.from[1],
-        seg.to[0],
-        seg.to[1],
-      );
+      // Calculate distance if both nodes have position data
+      let segmentDistanceKm = 0;
+      if (
+        node1?.position?.latitude &&
+        node1?.position?.longitude &&
+        node2?.position?.latitude &&
+        node2?.position?.longitude
+      ) {
+        segmentDistanceKm = calculateDistance(
+          node1.position.latitude,
+          node1.position.longitude,
+          node2.position.latitude,
+          node2.position.longitude
+        );
+      }
+
+      // Calculate SNR statistics
+      const snrData = seg.snrSamples ?? [];
+      let snrStats: { min: string; max: string; avg: string; count: number } | null = null;
+      let chartData: Array<{
+        timeDecimal: number;
+        timeLabel: string;
+        snr: number;
+        fullTimestamp: number;
+      }> | null = null;
+
+      if (snrData.length > 0) {
+        const snrValues = snrData.map(d => d.snr);
+        const minSNR = Math.min(...snrValues);
+        const maxSNR = Math.max(...snrValues);
+        const avgSNR = snrValues.reduce((sum, val) => sum + val, 0) / snrValues.length;
+        snrStats = {
+          min: minSNR.toFixed(1),
+          max: maxSNR.toFixed(1),
+          avg: avgSNR.toFixed(1),
+          count: snrData.length,
+        };
+
+        // Prepare chart data for 3+ samples (sorted by time of day). Every
+        // base-layer sample is pushed with a timestamp (see the aggregation
+        // loop above) — the `?? 0` only satisfies `snrSamples`' structurally
+        // optional `timestamp` field (shared across all `TracerouteRenderSegment`
+        // consumers, some of which don't always have one).
+        if (snrData.length >= 3) {
+          chartData = snrData
+            .map(d => {
+              const ts = d.timestamp ?? 0;
+              const date = new Date(ts);
+              const hours = date.getHours();
+              const minutes = date.getMinutes();
+              // Convert to decimal hours (0-24) for continuous time axis
+              const timeDecimal = hours + minutes / 60;
+              return {
+                timeDecimal,
+                timeLabel: `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}`,
+                snr: parseFloat(d.snr.toFixed(1)),
+                fullTimestamp: ts,
+              };
+            })
+            .sort((a, b) => a.timeDecimal - b.timeDecimal);
+        }
+      }
 
       return (
-        <RouteSegmentPopup
-          segment={seg}
-          fromName={node1Name}
-          toName={node2Name}
-          distanceKm={segmentDistanceKm}
-          distanceUnit={distanceUnit}
-          usageCount={usage}
-          isMqtt={isMqttSegment}
-          onFromNodeClick={
-            node1?.user?.id
-              ? () => {
-                  const freshNode = nodesPositionDigest.find((node) => node.nodeNum === nodeNum1);
-                  if (
-                    freshNode?.user?.id &&
-                    freshNode?.position?.latitude &&
-                    freshNode?.position?.longitude
-                  ) {
+        <Popup>
+          <div className="route-popup">
+            <h4>Route Segment</h4>
+            {isMqttSegment && (
+              <div className="mqtt-badge">via IP</div>
+            )}
+            <div className="route-endpoints">
+              <strong
+                className={node1?.user?.id ? 'route-node-link' : undefined}
+                onClick={e => {
+                  e.stopPropagation();
+                  const freshNode = nodesPositionDigest.find(n => n.nodeNum === nodeNum1);
+                  if (freshNode?.user?.id && freshNode?.position?.latitude && freshNode?.position?.longitude) {
                     callbacks.onSelectNode(freshNode.user.id, [
                       freshNode.position.latitude,
                       freshNode.position.longitude,
                     ]);
                   }
-                }
-              : undefined
-          }
-          onToNodeClick={
-            node2?.user?.id
-              ? () => {
-                  const freshNode = nodesPositionDigest.find((node) => node.nodeNum === nodeNum2);
-                  if (
-                    freshNode?.user?.id &&
-                    freshNode?.position?.latitude &&
-                    freshNode?.position?.longitude
-                  ) {
+                }}
+                title={node1?.user?.id ? 'Click to select and center on this node' : ''}
+              >
+                {node1Name}
+              </strong>
+              {' ↔ '}
+              <strong
+                className={node2?.user?.id ? 'route-node-link' : undefined}
+                onClick={e => {
+                  e.stopPropagation();
+                  const freshNode = nodesPositionDigest.find(n => n.nodeNum === nodeNum2);
+                  if (freshNode?.user?.id && freshNode?.position?.latitude && freshNode?.position?.longitude) {
                     callbacks.onSelectNode(freshNode.user.id, [
                       freshNode.position.latitude,
                       freshNode.position.longitude,
                     ]);
                   }
-                }
-              : undefined
-          }
-          onUsageClick={
-            isValidRouteNode(nodeNum1) && isValidRouteNode(nodeNum2)
-              ? () => callbacks.onSelectRouteSegment(nodeNum1, nodeNum2)
-              : undefined
-          }
-        />
+                }}
+                title={node2?.user?.id ? 'Click to select and center on this node' : ''}
+              >
+                {node2Name}
+              </strong>
+            </div>
+            <div className="route-usage">
+              Used in{' '}
+              <strong
+                onClick={e => {
+                  e.stopPropagation();
+                  callbacks.onSelectRouteSegment(nodeNum1, nodeNum2);
+                }}
+                style={{ cursor: 'pointer', color: 'var(--color-accent)', textDecoration: 'underline' }}
+                title="Click to view all traceroutes using this segment"
+              >
+                {usage}
+              </strong>{' '}
+              traceroute{usage !== 1 ? 's' : ''}
+            </div>
+            {segmentDistanceKm > 0 && (
+              <div className="route-usage">
+                Distance: <strong>{formatDistance(segmentDistanceKm, distanceUnit)}</strong>
+              </div>
+            )}
+            {snrStats && (
+              <div className="route-snr-stats">
+                {snrStats.count === 1 ? (
+                  <>
+                    <h5>SNR:</h5>
+                    <div className="snr-stat-row">
+                      <span className="stat-value">{snrStats.min} dB</span>
+                    </div>
+                  </>
+                ) : snrStats.count === 2 ? (
+                  <>
+                    <h5>SNR Statistics:</h5>
+                    <div className="snr-stat-row">
+                      <span className="stat-label">Min:</span>
+                      <span className="stat-value">{snrStats.min} dB</span>
+                    </div>
+                    <div className="snr-stat-row">
+                      <span className="stat-label">Max:</span>
+                      <span className="stat-value">{snrStats.max} dB</span>
+                    </div>
+                    <div className="snr-stat-row">
+                      <span className="stat-label">Samples:</span>
+                      <span className="stat-value">{snrStats.count}</span>
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    <h5>SNR Statistics:</h5>
+                    <div className="snr-stat-row">
+                      <span className="stat-label">Min:</span>
+                      <span className="stat-value">{snrStats.min} dB</span>
+                    </div>
+                    <div className="snr-stat-row">
+                      <span className="stat-label">Max:</span>
+                      <span className="stat-value">{snrStats.max} dB</span>
+                    </div>
+                    <div className="snr-stat-row">
+                      <span className="stat-label">Average:</span>
+                      <span className="stat-value">{snrStats.avg} dB</span>
+                    </div>
+                    <div className="snr-stat-row">
+                      <span className="stat-label">Samples:</span>
+                      <span className="stat-value">{snrStats.count}</span>
+                    </div>
+                    {chartData && (
+                      <SegmentSnrChart chartData={chartData} />
+                    )}
+                  </>
+                )}
+              </div>
+            )}
+          </div>
+        </Popup>
       );
     };
 
@@ -439,7 +717,7 @@ export function useTraceroutePaths({
         segments={renderSegments}
         snrColors={themeColors.snrColors ?? FALLBACK_SNR_COLORS}
         colorMode="snr"
-        mqttColor={themeColors.mqttSegment ?? themeColors.overlay0}
+        mqttColor={themeColors.mqttSegment ?? themeColors.faint}
         curvature={0}
         weight={seg => weightByUsage(seg.usageCount ?? 1)}
         opacity={seg => getSegmentSnrOpacity(seg.snrSamples, seg.isMqtt)}
@@ -447,21 +725,12 @@ export function useTraceroutePaths({
         temporalFade
         renderPopup={renderBasePopup}
         segmentClassName={baseSegmentClassName}
-        showEstimatedHopMarkers
-        estimatedHopName={(nodeNum) => {
-          const node = nodeByNum.get(nodeNum);
-          return node?.user?.longName || node?.user?.shortName || (
-            isValidRouteNode(nodeNum)
-              ? `!${nodeNum.toString(16).padStart(8, '0')}`
-              : 'Unknown hop'
-          );
-        }}
       />,
     ];
-  }, [showPaths, traceroutesDigest, nodesPositionDigest, distanceUnit, themeColors.snrColors, themeColors.mqttSegment, themeColors.overlay0, callbacks, visibleNodeNums, mapZoom, liveNodePositions]);
+  }, [showPaths, traceroutesDigest, nodesPositionDigest, distanceUnit, maxNodeAgeHours, themeColors.snrColors, themeColors.mqttSegment, themeColors.faint, callbacks, visibleNodeNums, mapZoom, liveNodePositions]);
 
   // Separate memoization for selected node traceroute (showRoute)
-  // This can change independently without re-rendering base map markers
+  // This can change independently without re-rendering the base map markers
   const selectedNodeTraceroute = useMemo(() => {
     // Skip rendering traceroute if the selected node is the current/local node
     if (!showRoute || !selectedNodeId || selectedNodeId === currentNodeId) return null;
@@ -498,13 +767,7 @@ export function useTraceroutePaths({
           timestamp: selectedTrace.timestamp,
           createdAt: selectedTrace.createdAt,
         },
-        {
-          resolvePosition,
-          estimateMissingHops: true,
-          canEstimateHop: (nodeNum) =>
-            !isValidRouteNode(nodeNum) || !visibleNodeNums || visibleNodeNums.has(nodeNum),
-          traceKey: `selected-${selectedTrace.timestamp ?? selectedTrace.createdAt ?? 'latest'}`,
-        }
+        { resolvePosition }
       );
 
       if (segments.length === 0) return null;
@@ -515,24 +778,9 @@ export function useTraceroutePaths({
       const toName = toNode?.user?.longName || toNode?.user?.shortName || selectedTrace.toNodeId;
 
       const nameForNode = (num: number): string => {
-        if (!isValidRouteNode(num)) return 'Unknown hop';
         const n = nodesPositionDigest.find(nd => nd.nodeNum === num);
         return n?.user?.longName || n?.user?.shortName || `!${num.toString(16)}`;
       };
-
-      // Assign one deterministic color to each physical hop in this selected
-      // trace. The same A↔B link keeps its color on the return leg, while a
-      // different return route receives its own colors.
-      const hopColorByKey = new Map<string, string>();
-      for (const segment of segments) {
-        const key = segmentPairKey(segment);
-        if (!hopColorByKey.has(key)) {
-          hopColorByKey.set(
-            key,
-            SELECTED_HOP_COLORS[hopColorByKey.size % SELECTED_HOP_COLORS.length],
-          );
-        }
-      }
 
       // Leg-level popup metadata (distance, path listing) — computed once per
       // leg and reused across all of that leg's per-hop popups, matching the
@@ -578,18 +826,13 @@ export function useTraceroutePaths({
               <div className="route-usage">
                 Path:{' '}{isForward ? forwardPathLabel : backPathLabel}
               </div>
-              {typeof seg.hopIndex === 'number' && typeof seg.hopCount === 'number' && (
-                <div className="route-usage">
-                  Hop: <strong>{seg.hopIndex + 1} of {seg.hopCount}</strong>
-                </div>
-              )}
               {legDistance > 0 && (
                 <div className="route-usage">
                   Distance: <strong>{formatDistance(legDistance, distanceUnit)}</strong>
                 </div>
               )}
               {(seg.avgSnr !== null || seg.isMqtt) && (
-                <div className="route-usage" style={{ marginTop: '8px', borderTop: '1px solid var(--ctp-surface0)', paddingTop: '4px' }}>
+                <div className="route-usage" style={{ marginTop: '8px', borderTop: '1px solid var(--color-surface)', paddingTop: '4px' }}>
                   Segment SNR: <strong>{seg.avgSnr !== null ? `${seg.avgSnr.toFixed(1)} dB` : 'Unknown'}</strong>
                   {seg.isMqtt && ' (IP)'}
                 </div>
@@ -604,25 +847,24 @@ export function useTraceroutePaths({
           key="selected-traceroute-layer"
           segments={segments}
           snrColors={themeColors.snrColors ?? FALLBACK_SNR_COLORS}
-          colorMode="custom"
-          segmentColor={(segment) =>
-            hopColorByKey.get(segmentPairKey(segment)) ?? themeColors.overlay0
-          }
+          colorMode="fixed-leg"
+          legColors={{
+            forward: themeColors.tracerouteForward ?? themeColors.accent,
+            return: themeColors.tracerouteReturn ?? themeColors.error,
+          }}
           curvature={0.2}
           weight={tracerouteSegmentWeight}
           opacity={0.9}
           dashMode="mqtt-unknown"
           showArrows
           renderPopup={renderSelectedPopup}
-          showEstimatedHopMarkers
-          estimatedHopName={nameForNode}
         />,
       ];
     } catch (error) {
       logger.error('Error rendering selected node traceroute:', error);
       return null;
     }
-  }, [showRoute, selectedNodeId, traceroutesDigest, nodesPositionDigest, currentNodeId, distanceUnit, themeColors.overlay0, themeColors.snrColors, liveNodePositions, visibleNodeNums]);
+  }, [showRoute, selectedNodeId, traceroutesDigest, nodesPositionDigest, currentNodeId, distanceUnit, themeColors.error, themeColors.accent, themeColors.tracerouteForward, themeColors.tracerouteReturn, themeColors.snrColors, liveNodePositions]);
 
   // Compute the set of node numbers involved in the selected traceroute.
   // Used for filtering map markers to only show nodes in the active
