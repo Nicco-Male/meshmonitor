@@ -1,0 +1,250 @@
+name: Promote integrated MeshMonitor to main
+
+on:
+  push:
+    branches:
+      - test/integrate-upstream-2026-08-26
+
+permissions:
+  contents: write
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout integration base
+        uses: actions/checkout@v4
+        with:
+          ref: test/integrate-upstream-2026-08-26
+          fetch-depth: 0
+
+      - name: Merge custom branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "Nicco-Male"
+          git config user.email "11727826+Nicco-Male@users.noreply.github.com"
+          git config merge.conflictStyle diff3
+          git fetch origin fix/directional-traceroute-segments
+          set +e
+          git merge --no-commit --no-ff origin/fix/directional-traceroute-segments
+          rc=$?
+          set -e
+          if [ "$rc" -ne 0 ] && [ "$rc" -ne 1 ]; then
+            exit "$rc"
+          fi
+          printf 'Unmerged files before resolution:\n'
+          git diff --name-only --diff-filter=U
+
+      - name: Resolve known conflicts exactly as validated
+        shell: bash
+        run: |
+          set -euo pipefail
+          git checkout --ours -- src/components/Dashboard/DashboardMap.test.tsx
+
+          python3 <<'PY'
+          from pathlib import Path
+          import re
+
+          ROOT = Path('.')
+          BLOCK = re.compile(
+              r'(?ms)^<<<<<<<[^\n]*\n'
+              r'(.*?)'
+              r'^\|\|\|\|\|\|\|[^\n]*\n'
+              r'(.*?)'
+              r'^=======\n'
+              r'(.*?)'
+              r'^>>>>>>>[^\n]*\n?'
+          )
+
+          def split_resolve(path, expected, resolver):
+              p = ROOT / path
+              text = p.read_text()
+              count = 0
+              def repl(m):
+                  nonlocal count
+                  count += 1
+                  return resolver(count, m.group(1), m.group(2), m.group(3))
+              out = BLOCK.sub(repl, text)
+              if count != expected:
+                  raise RuntimeError(f'{path}: expected {expected} conflicts, found {count}')
+              for marker in ('<<<<<<<', '|||||||', '=======', '>>>>>>>'):
+                  if marker in out:
+                      raise RuntimeError(f'{path}: residual marker {marker}')
+              return out
+
+          def dashboard_resolver(n, ours, base, theirs):
+              if n == 1:
+                  if 'activeStyleJson' not in ours or 'distanceUnit' not in theirs:
+                      raise RuntimeError('DashboardMap conflict 1 unexpected')
+                  return '    activeStyleJson,\n    distanceUnit,\n'
+              if n == 2:
+                  if 'Build the positioned-node array' not in ours:
+                      raise RuntimeError('DashboardMap conflict 2 unexpected')
+                  return ours
+              raise RuntimeError('DashboardMap unexpected conflict')
+
+          dashboard = split_resolve('src/components/Dashboard/DashboardMap.tsx', 2, dashboard_resolver)
+          old = 'const { nodesWithPosition, nowMs, cutoffTime } = useMemo(() => {'
+          new = 'const { nodesWithPosition, nowMs, cutoffTime, mapEligibleNodeNumsKey } = useMemo(() => {'
+          if dashboard.count(old) != 1:
+              raise RuntimeError('DashboardMap upstream destructuring not found exactly once')
+          dashboard = dashboard.replace(old, new, 1)
+
+          needle = '''    const nodesWithTruePos = nodes
+              .filter((n) => !n.isIgnored)
+              .filter((n) => !n.hideFromMap) // #3549: per-node "Hide from Map" suppresses the marker only
+              .filter(passesAgeGate)
+              .filter((n) => nodePassesTransportFilter(n, { showRfNodes, showUdpNodes, showMqttNodes }, ageCutoffTime))
+          '''
+          # Preserve exact source indentation from the checked-out file.
+          needle = needle.replace('        .filter', '      .filter')
+          if dashboard.count(needle) != 1:
+              raise RuntimeError('DashboardMap upstream node pipeline not found exactly once')
+          replacement = '''    // Node numbers that pass the map filters even when they have no GPS
+              // position. Traceroute uses this set to decide whether a known,
+              // unpositioned relay may receive an estimated position.
+              const mapEligibleNodeNumsKey = nodes
+                .filter((n) => !n.isIgnored)
+                .filter((n) => !n.hideFromMap)
+                .filter(passesAgeGate)
+                .filter((n) => nodePassesTransportFilter(n, { showRfNodes, showUdpNodes, showMqttNodes }, ageCutoffTime))
+                .map((node) => Number(node?.nodeNum))
+                .filter((nodeNum) => Number.isFinite(nodeNum))
+                .sort((a, b) => a - b)
+                .join(',');
+
+          '''.replace('          ', '') + needle
+          dashboard = dashboard.replace(needle, replacement, 1)
+          old_return = '    return { nodesWithPosition: positionedNodes, nowMs: referenceNowMs, cutoffTime: ageCutoffTime };'
+          new_return = '''    return {
+              nodesWithPosition: positionedNodes,
+              nowMs: referenceNowMs,
+              cutoffTime: ageCutoffTime,
+              mapEligibleNodeNumsKey,
+            };'''.replace('          ', '')
+          if dashboard.count(old_return) != 1:
+              raise RuntimeError('DashboardMap upstream memo return not found')
+          dashboard = dashboard.replace(old_return, new_return, 1)
+
+          def telemetry_resolver(n, ours, base, theirs):
+              if n == 1:
+                  m = re.search(r'(?ms)(\s*<button\n\s*className="telemetry-export-btn".*?</button>)', ours)
+                  if not m or '!readOnly' not in theirs:
+                      raise RuntimeError('Telemetry conflict 1 unexpected')
+                  return m.group(1) + '\n' + theirs
+              if n == 2:
+                  if 'formatValue' not in ours or '!readOnly' not in theirs:
+                      raise RuntimeError('Telemetry conflict 2 unexpected')
+                  return '            canEditRange={canEditSettings && !readOnly}\n            formatValue={display.formatValue}\n'
+              if n == 3:
+                  if 'anySource: true' not in ours or 'contextSourceId' not in theirs:
+                      raise RuntimeError('Telemetry conflict 3 unexpected')
+                  return '''    const canEditSettings = hasPermission(
+                'settings',
+                'write',
+                { anySource: true },
+              );
+              const { sourceId: contextSourceId } = useSource();
+              const sourceId = sourceIdProp ?? contextSourceId;
+          '''.replace('          ', '')
+              if n == 4:
+                  if 'telemetryData.length === 0' not in theirs:
+                      raise RuntimeError('Telemetry conflict 4 unexpected')
+                  out = theirs
+                  if 'hours={effectiveHours}' not in out:
+                      target = '                timeFormat={timeFormat}\n'
+                      if target not in out:
+                          raise RuntimeError('Telemetry hours insertion point missing')
+                      out = out.replace(target, target + '                hours={effectiveHours}\n', 1)
+                  return out
+              raise RuntimeError('Telemetry unexpected conflict')
+
+          telemetry = split_resolve('src/components/TelemetryGraphs.tsx', 4, telemetry_resolver)
+
+          def traceroute_resolver(n, ours, base, theirs):
+              if n == 1:
+                  if 'SegmentSnrChart' not in ours:
+                      raise RuntimeError('Traceroute conflict 1 unexpected')
+                  return theirs
+              if n == 2:
+                  if 'onUsageClick' not in theirs:
+                      raise RuntimeError('Traceroute conflict 2 unexpected')
+                  return theirs
+              if n == 3:
+                  if '[showPaths' not in theirs:
+                      raise RuntimeError('Traceroute conflict 3 unexpected')
+                  return theirs.replace('themeColors.overlay0', 'themeColors.faint')
+              if n == 4:
+                  if 'colorMode="custom"' not in theirs:
+                      raise RuntimeError('Traceroute conflict 4 unexpected')
+                  return theirs.replace('themeColors.overlay0', 'themeColors.faint')
+              if n == 5:
+                  if '[showRoute' not in theirs:
+                      raise RuntimeError('Traceroute conflict 5 unexpected')
+                  return theirs.replace('themeColors.overlay0', 'themeColors.faint')
+              raise RuntimeError('Traceroute unexpected conflict')
+
+          traceroute = split_resolve('src/hooks/useTraceroutePaths.tsx', 5, traceroute_resolver)
+
+          outputs = {
+              'src/components/Dashboard/DashboardMap.tsx': dashboard,
+              'src/components/TelemetryGraphs.tsx': telemetry,
+              'src/hooks/useTraceroutePaths.tsx': traceroute,
+          }
+          for path, text in outputs.items():
+              for marker in ('<<<<<<<', '|||||||', '=======', '>>>>>>>'):
+                  if marker in text:
+                      raise RuntimeError(f'{path}: residual marker {marker}')
+          for path, text in outputs.items():
+              (ROOT / path).write_text(text)
+              print(f'[OK] {path}')
+          PY
+
+          git add \
+            src/components/Dashboard/DashboardMap.test.tsx \
+            src/components/Dashboard/DashboardMap.tsx \
+            src/components/TelemetryGraphs.tsx \
+            src/hooks/useTraceroutePaths.tsx
+
+          if [ -n "$(git diff --name-only --diff-filter=U)" ]; then
+            echo 'Residual merge conflicts:'
+            git diff --name-only --diff-filter=U
+            false
+          fi
+          git diff --check
+
+      - name: Install dependencies
+        run: npm install --legacy-peer-deps
+
+      - name: Run validated targeted tests
+        run: |
+          npx vitest run \
+            src/components/Dashboard/DashboardMap.test.tsx \
+            src/components/TelemetryGraphs.test.tsx \
+            src/hooks/useTraceroutePaths.test.tsx \
+            src/hooks/useTraceroutePaths.mapTtl.test.tsx \
+            src/components/map/layers/TraceroutePathsLayer.test.tsx \
+            src/components/map/layers/TraceroutePathsLayer.directional.test.tsx \
+            src/components/map/layers/TraceroutePathsLayer.mapTtl.test.tsx \
+            src/components/map/popups/RouteSegmentPopup.test.tsx \
+            src/components/map/popups/RouteSegmentPopup.directional.test.tsx \
+            src/utils/tracerouteSegments.test.ts \
+            src/utils/tracerouteSegments.movement.test.ts \
+            src/utils/tracerouteSegments.snapshotStrict.test.ts \
+            src/utils/tracerouteDirections.test.ts
+
+      - name: Build frontend
+        run: npm run build
+
+      - name: Build server
+        run: npm run build:server
+
+      - name: Commit merge and push main
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f .github/workflows/promote-integrated-main.yml
+          git add -A
+          git commit -m "Merge custom MeshMonitor fixes onto upstream 2026-08-26"
+          git push origin HEAD:main
