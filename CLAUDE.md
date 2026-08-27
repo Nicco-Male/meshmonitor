@@ -1,7 +1,7 @@
 # MeshMonitor — Claude Agent Brief
 
 **Version:** 4.13.x (multi-source architecture)
-**Stack:** React 19 + TS + Vite frontend / Node.js 20+ (Docker image ships Node 24; CI matrix covers 20/22/24/25) + Express 5 + TS backend / SQLite (default), PostgreSQL, MySQL via Drizzle ORM / Meshtastic protobuf-over-TCP and MeshCore (native `meshcore.js` for companion, serial CLI for repeater) through a per-source manager registry.
+**Stack:** React 19 + TS + Vite frontend / Node.js 22+ (Docker image ships Node 24; armv7 image ships Node 22 — the lowest supported runtime, since Node 24 has no ARMv7 build; CI matrix covers 22/24/25) + Express 5 + TS backend / SQLite (default), PostgreSQL, MySQL via Drizzle ORM / Meshtastic protobuf-over-TCP and MeshCore (native `meshcore.js` for companion, serial CLI for repeater) through a per-source manager registry.
 
 ## Read order for new agents
 
@@ -154,7 +154,7 @@ Three lint commands:
 ```bash
 npm run lint:ci 2>&1 | grep '^FAIL' | grep -v '.claude/worktrees'
 ```
-Empty output = the CI gate passes. The same applies to Vitest, which scans those worktrees and inflates the suite count.
+Empty output = the CI gate passes. Vitest **no longer** has this problem — `vitest.config.ts` excludes `**/.claude/worktrees/**`. (It used to: two leftover worktrees tripled the local suite, adding ~11 min and ~22k phantom tests, and reported failures from the worktrees' own stale dependencies.) ESLint still walks them, so the `grep -v` above is still required for `lint:ci`.
 
 **`npx eslint <file>` exiting 0 does not mean the ratchet passes.** The ratchet compares *per-file, per-rule counts* against the baseline, so adding one `react-hooks/exhaustive-deps` violation to an already-baselined file fails CI while plain ESLint reports nothing new. Always confirm with `lint:ci` before pushing.
 

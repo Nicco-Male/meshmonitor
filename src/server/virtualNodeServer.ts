@@ -8,6 +8,7 @@ import { MeshtasticManager } from './meshtasticManager.js';
 import databaseService from '../services/database.js';
 import { getEffectiveDbNodePosition } from './utils/nodeEnhancer.js';
 import { MODEM_PRESET_CHANNEL_NAMES } from '../utils/loraFrequency.js';
+import { getMaxNodeAgeHours } from './services/nodeDisplaySettings.js';
 
 const require = createRequire(import.meta.url);
 const packageJson = require('../../package.json');
@@ -755,7 +756,25 @@ export class VirtualNodeServer extends EventEmitter {
     // channel entries (otherwise uplink_enabled defaults to false and every
     // packet is dropped).
     const deviceConfig = this.config.meshtasticManager.getActualDeviceConfig?.();
-    const presetFallback = getPrimaryChannelNameFallback(deviceConfig?.lora?.modemPreset);
+    let presetFallback = getPrimaryChannelNameFallback(deviceConfig?.lora?.modemPreset);
+
+    // getActualDeviceConfig() is in-memory only: handleDisconnected() nulls it
+    // on every physical-node disconnect until the device re-sends LoRa config
+    // on reconnect. A client requesting config during that window would
+    // otherwise get slot 0 with no name at all, which the Meshtastic app
+    // renders as the placeholder "Channel 0" (#4037). Fall back to the durable
+    // per-source `lora.preset.<sourceId>` setting written by
+    // persistModemPreset() (same fallback channelRoutes.ts, unifiedRoutes.ts,
+    // and sourceDashboardData.ts already use).
+    if (!presetFallback) {
+      try {
+        const raw = await databaseService.settings.getSetting(`lora.preset.${sourceId}`);
+        const n = raw != null ? Number(raw) : NaN;
+        if (Number.isFinite(n)) presetFallback = getPrimaryChannelNameFallback(n);
+      } catch (err) {
+        logger.debug(`Virtual node: Failed to load persisted modem preset for source ${sourceId}:`, err);
+      }
+    }
 
     let sent = 0;
     for (const ch of dbChannels) {
@@ -803,7 +822,7 @@ export class VirtualNodeServer extends EventEmitter {
    */
   private async sendNodeInfosFromDb(clientId: string): Promise<{ sent: number; disconnected: boolean }> {
     const sourceId = this.config.meshtasticManager.sourceId;
-    const maxNodeAgeHours = parseInt(await databaseService.getSettingAsync('maxNodeAgeHours') || '24');
+    const maxNodeAgeHours = await getMaxNodeAgeHours(databaseService.settings, sourceId);
     const maxNodeAgeDays = maxNodeAgeHours / 24;
     const allNodes = await databaseService.nodes.getActiveNodes(maxNodeAgeDays, sourceId);
     let sent = 0;
@@ -1111,6 +1130,46 @@ export class VirtualNodeServer extends EventEmitter {
     await Promise.all(promises);
     if (this.clients.size > 0) {
       logger.debug(`Virtual node: Broadcasted message to ${promises.length}/${this.clients.size} clients`);
+    }
+  }
+
+  /**
+   * Send a message to a single "proxy delegate" client instead of all clients.
+   *
+   * Used for FromRadio.mqttClientProxyMessage frames (#4037 follow-up): the
+   * device asks its client to publish the payload to the MQTT broker. A
+   * physical node only ever has one BLE client, so firmware assumes exactly
+   * one proxy. Broadcasting the frame to every connected app would make each
+   * of them publish the same envelope — duplicate publishes on the broker.
+   * Mirror the physical-node behavior by delegating to the most recently
+   * connected client with a live, writable socket (newest wins).
+   */
+  public async broadcastToProxyDelegate(data: Uint8Array): Promise<void> {
+    let delegateId: string | null = null;
+    let delegateConnectedAt = 0;
+    for (const [clientId, client] of this.clients.entries()) {
+      if (client.socket.destroyed || !client.socket.writable) {
+        continue;
+      }
+      if (!delegateId || client.connectedAt.getTime() > delegateConnectedAt) {
+        delegateId = clientId;
+        delegateConnectedAt = client.connectedAt.getTime();
+      }
+    }
+
+    if (!delegateId) {
+      logger.debug('Virtual node: No writable client available as MQTT proxy delegate, dropping frame');
+      return;
+    }
+
+    logger.debug(`Virtual node: Sending MQTT proxy frame to delegate ${delegateId} (newest of ${this.clients.size} clients)`);
+    try {
+      await this.sendToClient(delegateId, data);
+    } catch (error) {
+      // sendToClient rejects on write error; swallow it so this method stays
+      // self-contained like broadcastToClients — a failed delegate write must
+      // never throw into the packet-processing path.
+      logger.error(`Virtual node: Failed to send proxy frame to ${delegateId}:`, (error as Error).message);
     }
   }
 

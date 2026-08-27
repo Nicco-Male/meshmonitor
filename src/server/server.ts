@@ -384,43 +384,14 @@ setTimeout(async () => {
       parseNoIndexEnabled(await databaseService.settings.getSetting('noIndexEnabled')),
     );
 
-    // Start inactive node notification service with validation
-    const inactiveThresholdHoursRaw = parseInt(await databaseService.settings.getSetting('inactiveNodeThresholdHours') || '24', 10);
-    const inactiveCheckIntervalMinutesRaw = parseInt(
-      await databaseService.settings.getSetting('inactiveNodeCheckIntervalMinutes') || '60',
-      10
-    );
-    const inactiveCooldownHoursRaw = parseInt(await databaseService.settings.getSetting('inactiveNodeCooldownHours') || '24', 10);
-
-    // Validate and use defaults if invalid values are found in database
-    const inactiveThresholdHours =
-      !isNaN(inactiveThresholdHoursRaw) && inactiveThresholdHoursRaw >= 1 && inactiveThresholdHoursRaw <= 720
-        ? inactiveThresholdHoursRaw
-        : 24;
-    const inactiveCheckIntervalMinutes =
-      !isNaN(inactiveCheckIntervalMinutesRaw) &&
-      inactiveCheckIntervalMinutesRaw >= 1 &&
-      inactiveCheckIntervalMinutesRaw <= 1440
-        ? inactiveCheckIntervalMinutesRaw
-        : 60;
-    const inactiveCooldownHours =
-      !isNaN(inactiveCooldownHoursRaw) && inactiveCooldownHoursRaw >= 1 && inactiveCooldownHoursRaw <= 720
-        ? inactiveCooldownHoursRaw
-        : 24;
-
-    // Log warning if invalid values were found and corrected
-    if (
-      inactiveThresholdHours !== inactiveThresholdHoursRaw ||
-      inactiveCheckIntervalMinutes !== inactiveCheckIntervalMinutesRaw ||
-      inactiveCooldownHours !== inactiveCooldownHoursRaw
-    ) {
-      logger.warn(
-        `⚠️  Invalid inactive node notification settings found in database, using defaults (threshold: ${inactiveThresholdHours}h, check: ${inactiveCheckIntervalMinutes}min, cooldown: ${inactiveCooldownHours}h)`
-      );
-    }
-
-    inactiveNodeNotificationService.start(inactiveThresholdHours, inactiveCheckIntervalMinutes, inactiveCooldownHours);
-    logger.info('✅ Inactive node notification service started');
+    // Start the inactive node notification service. #4412 Phase 2: threshold/
+    // check-interval/cooldown are per-source settings now, so there is
+    // nothing global to read or validate here — the single scheduler tick
+    // resolves each source's own config (via getInactiveNodeConfig(), which
+    // performs the same 1..720 / 1..1440 / 1..720 clamping this block used
+    // to do inline) on every pass.
+    inactiveNodeNotificationService.start();
+    logger.info('✅ Inactive node notification service started (per-source config, resolved per tick)');
 
     // Start low battery notification service with validation.
     // Per-user threshold is read from notification preferences at check time;
@@ -602,13 +573,13 @@ const apiRouter = express.Router();
 // Import route handlers
 import authRoutes from './routes/authRoutes.js';
 import automationRoutes from './routes/automationRoutes.js';
+import autoAckConverterRoutes from './routes/autoAckConverterRoutes.js';
 import { startAutomationEngine } from './services/automation/automationEngineSingleton.js';
 import userRoutes from './routes/userRoutes.js';
 import auditRoutes from './routes/auditRoutes.js';
 import securityRoutes from './routes/securityRoutes.js';
 import packetRoutes from './routes/packetRoutes.js';
 import solarRoutes from './routes/solarRoutes.js';
-import upgradeRoutes from './routes/upgradeRoutes.js';
 import messageRoutes from './routes/messageRoutes.js';
 import linkPreviewRoutes from './routes/linkPreviewRoutes.js';
 import scriptContentRoutes from './routes/scriptContentRoutes.js';
@@ -729,9 +700,6 @@ apiRouter.use('/solar', optionalAuth(), solarRoutes);
 // News routes (public feed, authenticated status endpoints)
 apiRouter.use('/news', newsRoutes);
 
-// Upgrade routes (requires authentication)
-apiRouter.use('/upgrade', upgradeRoutes);
-
 // Message routes (requires appropriate write permissions)
 apiRouter.use('/messages', optionalAuth(), messageRoutes);
 
@@ -821,6 +789,9 @@ apiRouter.use('/system/backup', systemBackupRouter);
 apiRouter.use('/push', pushRouter);
 apiRouter.use('/apprise', appriseRouter);
 apiRouter.use('/connection', connectionRoutes);
+// Mounted immediately before '/automations' so its '/:id' route cannot swallow
+// '/automations/convert/*' (#4340 Phase 4 WP3).
+apiRouter.use('/automations/convert', autoAckConverterRoutes);
 apiRouter.use('/automations', automationRoutes);
 // Mounted at '/' because these routers contain mixed top-level paths
 // (e.g. /traceroute, /telemetry/:nodeId, /device/tx-status, /virtual-node/status).
@@ -860,12 +831,16 @@ setSettingsCallbacks({
     const mgr = resolveSourceManager(sourceId);
     mgr.setRemoteAdminScannerInterval(interval);
   },
-  setLocalStatsInterval: (interval) =>
-    (getPrimaryMeshtasticManager(sourceManagerRegistry) ?? fallbackManager).setLocalStatsInterval(interval),
+  setLocalStatsInterval: (interval, sourceId) => {
+    const mgr = sourceId
+      ? sourceManagerRegistry.getManager(sourceId)
+      : (getPrimaryMeshtasticManager(sourceManagerRegistry) ?? fallbackManager);
+    if (mgr && isMeshtasticManager(mgr)) mgr.setLocalStatsInterval(interval);
+  },
   setKeyRepairSettings: (settings) =>
     (getPrimaryMeshtasticManager(sourceManagerRegistry) ?? fallbackManager).setKeyRepairSettings(settings),
-  restartInactiveNodeService: (threshold, check, cooldown) =>
-    inactiveNodeNotificationService.start(threshold, check, cooldown),
+  rescheduleInactiveNodeService: (sourceId) =>
+    inactiveNodeNotificationService.reschedule(sourceId),
   stopInactiveNodeService: () => inactiveNodeNotificationService.stop(),
   restartLowBatteryService: (check, cooldown) =>
     lowBatteryNotificationService.start(check, cooldown),

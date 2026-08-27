@@ -47,6 +47,7 @@ export const PortNum = {
   RETICULUM_TUNNEL_APP: 76,
   CAYENNE_APP: 77,
   ATAK_PLUGIN_V2: 78,
+  LORA_OTA_APP: 79, // Signed firmware updates over LoRa (firmware 2.8+)
   GROUPALARM_APP: 112,
   PRIVATE_APP: 256,
   ATAK_FORWARDER: 257,
@@ -106,6 +107,36 @@ export const TransportMechanism = {
 } as const;
 
 export type TransportMechanismType = typeof TransportMechanism[keyof typeof TransportMechanism];
+
+/**
+ * Flags for `Config.NetworkConfig.enabled_protocols` (a bit field).
+ * From meshtastic.Config.NetworkConfig.ProtocolFlags in config.proto.
+ */
+export const NetworkProtocolFlags = {
+  /** Do not broadcast packets over any auxiliary network protocol */
+  NO_BROADCAST: 0x0000,
+  /** Broadcast packets via UDP over the local network */
+  UDP_BROADCAST: 0x0001,
+} as const;
+
+export type NetworkProtocolFlagsType = typeof NetworkProtocolFlags[keyof typeof NetworkProtocolFlags];
+
+/**
+ * True when a device's `network.enabledProtocols` bit field has UDP_BROADCAST set.
+ *
+ * Firmware `Router::send()` calls `udpHandler->onSend(p)` gated ONLY on this
+ * flag — there is no `tx_enabled` check on that path — so a TX-disabled node
+ * still emits every outgoing packet onto the local LAN, where a peer with a
+ * working radio (e.g. a CLIENT_BASE) relays it onto the mesh (#4394).
+ *
+ * Tolerant of the proto3 shapes we see on the wire: absent/null/undefined
+ * (field omitted, meaning 0) and non-numeric junk both read as "off".
+ */
+export function isUdpBroadcastEnabled(enabledProtocols: unknown): boolean {
+  const flags = Number(enabledProtocols ?? 0);
+  if (!Number.isFinite(flags)) return false;
+  return (flags & NetworkProtocolFlags.UDP_BROADCAST) !== 0;
+}
 
 /**
  * Get the name of a transport mechanism
@@ -334,6 +365,44 @@ export const MIN_TRACEROUTE_INTERVAL_MS = 30 * 1000;
  * Messages longer than this will be truncated or need to be split.
  */
 export const MAX_MESSAGE_BYTES = 200;
+
+/**
+ * Protocol max for `hop_limit` — it is a 3-bit field (`HOP_MAX` in firmware).
+ */
+export const MAX_HOP_LIMIT = 7;
+
+/**
+ * Fallback hop limit for packets we build before the device's LoRa config has
+ * arrived. Matches the firmware default (`config.lora.hop_limit` = 3).
+ *
+ * Prefer the node's own configured value when it is known — see
+ * {@link resolveHopLimit} and `MeshtasticManager.getConfiguredHopLimit()`.
+ */
+export const DEFAULT_HOP_LIMIT = 3;
+
+/**
+ * Normalize a hop limit read from device config into a value safe to put on the
+ * wire, falling back to {@link DEFAULT_HOP_LIMIT} when it is unknown or invalid.
+ *
+ * An explicit `0` is passed through — firmware honors a configured 0 for its own
+ * packets (`Router::send` → `Default::getConfiguredOrDefaultHopLimit`, which
+ * returns `config.lora.hop_limit` as-is below `HOP_MAX`).
+ *
+ * Caveat: a device that IS configured to 0 does not reach us as `0`. Proto3
+ * omits zero scalars, so protobuf.js decodes the field to `null` and it is
+ * indistinguishable from "config hasn't arrived" — both take the default of 3
+ * here. That ambiguity is unavoidable on the wire and self-correcting in
+ * practice: firmware rewrites an inbound `hop_limit == 0` on a `want_ack`
+ * packet from the phone API back to the node's own configured value
+ * (`Router.cpp`), so nothing we send at 0 escapes at the wrong depth.
+ */
+export function resolveHopLimit(configured: number | undefined | null): number {
+  if (typeof configured !== 'number' || !Number.isInteger(configured)) {
+    return DEFAULT_HOP_LIMIT;
+  }
+  if (configured < 0) return DEFAULT_HOP_LIMIT;
+  return Math.min(configured, MAX_HOP_LIMIT);
+}
 
 /**
  * Maximum valid Meshtastic node number.

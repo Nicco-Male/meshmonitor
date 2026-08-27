@@ -93,6 +93,8 @@ export interface CreateLocalInput {
   expireAt?: number | null;
   /** nodeNum that's allowed to edit, or 0/null for open. */
   lockedTo?: number | null;
+  /** Device channel slot to broadcast on. null/undefined = slot 0 (#4341). */
+  channel?: number | null;
   rebroadcastIntervalS?: number | null;
 }
 
@@ -104,7 +106,22 @@ export interface UpdateInput {
   icon?: number | string | null;
   expireAt?: number | null;
   lockedTo?: number | null;
+  channel?: number | null;
   rebroadcastIntervalS?: number | null;
+}
+
+/**
+ * Normalise a channel slot to something the radio will accept. Meshtastic
+ * devices expose 8 channel slots (0-7); anything else — including `null` /
+ * `undefined` — collapses to 0, which is the channel waypoints were broadcast
+ * on before #4341. Keeping this in one place means the default is identical in
+ * the route, the scheduler, and the manager.
+ */
+export function normalizeWaypointChannel(channel: number | null | undefined): number {
+  if (channel === null || channel === undefined) return 0;
+  const n = Number(channel);
+  if (!Number.isInteger(n) || n < 0 || n > 7) return 0;
+  return n;
 }
 
 class WaypointService {
@@ -117,6 +134,8 @@ class WaypointService {
     sourceId: string,
     fromNum: number | bigint,
     decoded: DecodedWaypointMessage,
+    /** Channel slot the packet arrived on, so an edit/rebroadcast stays on it. */
+    channel?: number | null,
   ): Promise<Waypoint | null> {
     const waypointId = pickNumber(decoded.id);
     if (waypointId === undefined) {
@@ -169,6 +188,10 @@ class WaypointService {
       iconCodepoint: iconCodepoint ?? null,
       iconEmoji,
       isVirtual: false,
+      // Only record a channel when the caller actually knew one — passing
+      // `undefined` leaves an existing row's stored channel untouched.
+      channel:
+        channel === undefined || channel === null ? undefined : normalizeWaypointChannel(channel),
     });
 
     dataEventEmitter.emitWaypointUpserted(persisted, sourceId);
@@ -231,6 +254,7 @@ class WaypointService {
       iconCodepoint: iconCodepoint ?? null,
       iconEmoji,
       isVirtual: Boolean(options.virtual),
+      channel: normalizeWaypointChannel(fields.channel),
       rebroadcastIntervalS: fields.rebroadcastIntervalS ?? null,
     });
 
@@ -274,6 +298,10 @@ class WaypointService {
       iconCodepoint,
       iconEmoji,
       isVirtual: existing.isVirtual,
+      channel:
+        fields.channel === undefined
+          ? existing.channel
+          : normalizeWaypointChannel(fields.channel),
       rebroadcastIntervalS:
         fields.rebroadcastIntervalS === undefined
           ? existing.rebroadcastIntervalS
@@ -333,8 +361,10 @@ class WaypointService {
 
     // TX-disabled Meshtastic radios cannot send the waypoint OTA; skip quietly
     // and leave lastBroadcastAt untouched so it retries once TX re-enables (#4294).
-    // MeshCore/other manager types don't expose isTxEnabled and are never gated.
-    if (typeof manager.isTxEnabled === 'function' && !manager.isTxEnabled()) {
+    // `canTransmit()` also clears the send when UDP Broadcast is on, since a LAN
+    // peer relays the packet onto the mesh for us (#4394).
+    // MeshCore/other manager types don't expose canTransmit and are never gated.
+    if (typeof manager.canTransmit === 'function' && !manager.canTransmit()) {
       logger.debug(
         `[waypointService] rebroadcastTick: TX disabled on source ${candidate.sourceId}, skipping`,
       );
@@ -342,16 +372,21 @@ class WaypointService {
     }
 
     try {
-      const packetId = await manager.broadcastWaypoint({
-        id: candidate.waypointId,
-        latitude: candidate.latitude,
-        longitude: candidate.longitude,
-        expire: candidate.expireAt ?? 0,
-        lockedTo: candidate.lockedTo ?? 0,
-        name: candidate.name,
-        description: candidate.description,
-        icon: candidate.iconCodepoint ?? 0,
-      });
+      const packetId = await manager.broadcastWaypoint(
+        {
+          id: candidate.waypointId,
+          latitude: candidate.latitude,
+          longitude: candidate.longitude,
+          expire: candidate.expireAt ?? 0,
+          lockedTo: candidate.lockedTo ?? 0,
+          name: candidate.name,
+          description: candidate.description,
+          icon: candidate.iconCodepoint ?? 0,
+        },
+        // Rebroadcast on the channel the waypoint was created with (#4341);
+        // rows predating the column have `channel === null` and stay on 0.
+        { channel: normalizeWaypointChannel(candidate.channel) },
+      );
 
       if (!packetId) {
         // Manager refused (e.g. not connected). Same rationale as above —

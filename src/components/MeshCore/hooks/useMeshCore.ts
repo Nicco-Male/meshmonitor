@@ -30,10 +30,44 @@ import { MeshCoreContact, mapContactsToNodes } from '../../../utils/meshcoreHelp
 
 export type TelemetryMode = 'always' | 'device' | 'never';
 
+/**
+ * One node that answered a discovery sweep (#4516). Mirrors the server's
+ * `MeshCoreDiscoveredNode`. `snr` is what we measured on their response;
+ * `snrToNode` is what they measured on our request — the same "there and
+ * back" pair the zero-hop ping reports.
+ */
+export interface DiscoveredNode {
+  publicKey: string;
+  name: string | null;
+  advType: number | null;
+  snr: number | null;
+  snrToNode: number | null;
+  rssi: number | null;
+  isNew: boolean;
+}
+
 export interface TracePathResult {
   hops: { index: number; snr: number }[];
   lastSnr: number;
 }
+
+/**
+ * Outcome of a zero-hop ping (#4393). On success the SNR pair tells you how
+ * each end heard the other; on failure `error` is the server's actionable
+ * reason (out of range, not a Companion, disconnected, unknown contact).
+ */
+export type ZeroHopPingResult =
+  | {
+      ok: true;
+      /** Path hash byte used — the first byte of the target public key, hex. */
+      hopHash: string;
+      rttMs: number;
+      /** SNR the target measured on our frame; null if the node omitted it. */
+      snrToTarget: number | null;
+      /** SNR our radio measured on the returning frame. */
+      snrFromTarget: number;
+    }
+  | { ok: false; error: string };
 
 export interface MeshCoreNode {
   publicKey: string;
@@ -85,6 +119,25 @@ export interface MeshCoreMessage {
    *  self-echo correlation (#3700). Best-effort; `name` is null when the relay
    *  hash couldn't be resolved to a known contact. */
   heardBy?: Array<{ hash: string; name?: string | null; snr?: number | null }>;
+  /**
+   * Signal-to-noise ratio (dB) of the received packet, as reported by the
+   * companion. The server has always sent this; the client type just never
+   * declared it, so the UI could not read it (#4504).
+   *
+   * On a RELAYED message this describes the hop from the last repeater, not
+   * from the sender — which is why the stream only surfaces it for direct
+   * messages, where it unambiguously describes the sender's link.
+   */
+  snr?: number;
+  /**
+   * Received signal strength (dBm).
+   *
+   * Not populated by MeshCore's message push, which carries SNR only — RSSI
+   * lives on the separate LogRxData OTA feed. Declared so the UI renders it
+   * automatically if a message ever does carry it, rather than silently
+   * dropping the field.
+   */
+  rssi?: number;
   /** Hop count for a received message; null/undefined = direct or unknown (#3742). */
   hopCount?: number | null;
   /** Relay-hash chain the message traveled, comma-separated (e.g. "a3,7f,02") (#3742). */
@@ -93,6 +146,26 @@ export interface MeshCoreMessage {
   scopeCode?: number | null;
   /** Region name resolved from the scope code; null = unscoped or unknown scope (#3742 Ph2). */
   scopeName?: string | null;
+  /**
+   * MeshMonitor's own wall clock (ms) at the moment this message was created or
+   * observed — NOT the sender's clock.
+   *
+   * `timestamp` cannot order messages reliably: a received message takes its
+   * time from the wire's `sender_timestamp`, which MeshCore carries in whole
+   * SECONDS, while a locally-sent message is stamped `Date.now()` to the
+   * millisecond. An auto-responder replying inside the same second therefore
+   * sorted BEFORE the message that triggered it — observed in the field: the
+   * trigger stamped …213050, the reply stamped …213000 despite arriving 1.4s
+   * later.
+   *
+   * Ordering therefore compares `timestamp` at second granularity — all the
+   * wire actually gives us — and breaks ties on this field, a single monotonic
+   * clock across both directions. Display still uses `timestamp`.
+   *
+   * Optional: rows persisted before this field existed carry no value, and
+   * `compareMeshCoreMessages` falls back to `timestamp` for those.
+   */
+  receivedAt?: number;
 }
 
 export interface ConnectionStatus {
@@ -138,6 +211,10 @@ export interface MeshCoreActions {
   /** Send a trace-path diagnostic along the contact's cached forwarding
    *  route and return per-hop SNR data. Resolves `null` on failure. */
   traceContactPath: (publicKey: string) => Promise<TracePathResult | null>;
+  /** Zero-hop ping (#4393) — trace along a synthetic one-hop path built from
+   *  the target's own key hash, bypassing any cached route. A reply proves the
+   *  node is in direct RF range. Requires nodes:write. */
+  pingContactZeroHop: (publicKey: string) => Promise<ZeroHopPingResult>;
   /** Flood a path-discovery request to the contact. The device sends a
    *  lightweight telemetry request via flood; when the contact replies,
    *  the PATH return mechanism establishes the forwarding route. The path
@@ -145,7 +222,7 @@ export interface MeshCoreActions {
    *  was accepted. */
   discoverContactPath: (publicKey: string) => Promise<boolean>;
   /** Active node discovery; resolves with responder counts, or null on error. */
-  discoverNodes: (mode: 'nearby' | 'repeaters' | 'sensors') => Promise<{ returned: number; newCount: number } | null>;
+  discoverNodes: (mode: 'nearby' | 'repeaters' | 'sensors') => Promise<{ returned: number; newCount: number; nodes: DiscoveredNode[] } | null>;
   /** Whether this node answers inbound discovery requests (is discoverable). */
   getDiscoverable: () => Promise<boolean>;
   /** Enable/disable answering inbound discovery requests. */
@@ -383,6 +460,25 @@ export function useMeshCore(options: UseMeshCoreOptions): UseMeshCoreState {
   const localNodeRef = useRef<MeshCoreNode | null>(null);
   const contactsRef = useRef<Map<string, MeshCoreContact>>(new Map());
 
+  /**
+   * Belt-and-braces re-stamp of `isLocal` (#4438). The server already sets
+   * `isLocal` on the synthetic local-node row, but a live
+   * `meshcore:contact:updated` push for the local node's OWN public key
+   * would overwrite that row in `contactsRef` and silently drop the flag —
+   * the local node would then vanish from the age-exempt / map-centering
+   * logic minutes after page load, with no user action (this failure mode
+   * pre-dates #4438; it existed with the `(local)` string convention too,
+   * and was unpinned by any test — see T-C3 in useMeshCore.isLocal.test.ts).
+   * Re-deriving the flag here from `localNodeRef` on every write into
+   * `contactsRef` makes the client's own view independent of the server
+   * flag surviving a merge; the server flag remains the wire source of
+   * truth for every other API consumer.
+   */
+  const stampLocal = useCallback((c: MeshCoreContact): MeshCoreContact => ({
+    ...c,
+    isLocal: c.publicKey === localNodeRef.current?.publicKey || c.isLocal === true,
+  }), []);
+
   const contactToNode = useCallback((c: MeshCoreContact): MeshCoreNode => ({
     publicKey: c.publicKey,
     name: c.advName || c.name || 'Unknown',
@@ -463,20 +559,19 @@ export function useMeshCore(options: UseMeshCoreOptions): UseMeshCoreState {
       const snap = data.data;
       setStatus(snap.status ?? null);
       localNodeRef.current = snap.status?.localNode ?? null;
-      contactsRef.current = new Map(
-        (snap.contacts ?? []).map((c: MeshCoreContact) => [c.publicKey, c]),
-      );
-      setContacts(snap.contacts ?? []);
+      const stampedContacts = ((snap.contacts ?? []) as MeshCoreContact[]).map(stampLocal);
+      contactsRef.current = new Map(stampedContacts.map((c) => [c.publicKey, c]));
+      setContacts(stampedContacts);
       setNodes(snap.nodes ?? []);
       setMessages(snap.messages ?? []);
       seqCursorRef.current = snap.seqCursor ?? 0;
-      setMeshCoreNodes(mapContactsToNodes(snap.contacts ?? []));
+      setMeshCoreNodes(mapContactsToNodes(stampedContacts));
       return snap.status?.connected ?? false;
     } catch (_err) {
       console.error('Failed to load meshcore snapshot:', _err);
       return false;
     }
-  }, [enabled, mcPrefix, csrfFetch, setMeshCoreNodes]);
+  }, [enabled, mcPrefix, csrfFetch, setMeshCoreNodes, stampLocal]);
 
   useEffect(() => {
     connectedRef.current = status?.connected ?? false;
@@ -544,7 +639,7 @@ export function useMeshCore(options: UseMeshCoreOptions): UseMeshCoreState {
 
     const onContactUpdated = (evt: MeshCoreContactUpdateEvent) => {
       if (evt.sourceId !== sourceId) return;
-      const c = evt.contact as MeshCoreContact;
+      const c = stampLocal(evt.contact as MeshCoreContact);
       contactsRef.current.set(c.publicKey, c);
       const next = Array.from(contactsRef.current.values());
       setContacts(next);
@@ -736,7 +831,7 @@ export function useMeshCore(options: UseMeshCoreOptions): UseMeshCoreState {
       socket.off('meshcore:channel-heard', onChannelHeard);
       socket.io.off('reconnect', onReconnect);
     };
-  }, [enabled, sourceId, socket, mcPrefix, csrfFetch, setMeshCoreNodes, recomputeNodes]);
+  }, [enabled, sourceId, socket, mcPrefix, csrfFetch, setMeshCoreNodes, recomputeNodes, stampLocal]);
 
   const connect = useCallback(async (): Promise<boolean> => {
     setLoading(true);
@@ -793,7 +888,10 @@ export function useMeshCore(options: UseMeshCoreOptions): UseMeshCoreState {
       const response = await csrfFetch(`${mcPrefix}/contacts/refresh`, { method: 'POST' });
       const data = await response.json();
       if (data.success) {
-        const fresh = (data.data ?? []) as MeshCoreContact[];
+        // The server now returns the same shape as GET /contacts, including
+        // the synthetic local row (#4449) — stampLocal is belt-and-braces
+        // on top of that, not a substitute for it.
+        const fresh = ((data.data ?? []) as MeshCoreContact[]).map(stampLocal);
         setContacts(fresh);
         setMeshCoreNodes(mapContactsToNodes(fresh));
         // Keep the push-event ref view in sync with the manual refresh so
@@ -808,7 +906,7 @@ export function useMeshCore(options: UseMeshCoreOptions): UseMeshCoreState {
     } finally {
       setLoading(false);
     }
-  }, [mcPrefix, csrfFetch, setMeshCoreNodes, recomputeNodes]);
+  }, [mcPrefix, csrfFetch, setMeshCoreNodes, recomputeNodes, stampLocal]);
 
   const resetContactPath = useCallback(async (publicKey: string): Promise<boolean> => {
     try {
@@ -859,7 +957,7 @@ export function useMeshCore(options: UseMeshCoreOptions): UseMeshCoreState {
 
   const discoverNodes = useCallback(async (
     mode: 'nearby' | 'repeaters' | 'sensors',
-  ): Promise<{ returned: number; newCount: number } | null> => {
+  ): Promise<{ returned: number; newCount: number; nodes: DiscoveredNode[] } | null> => {
     try {
       const response = await csrfFetch(`${mcPrefix}/discover`, {
         method: 'POST',
@@ -876,7 +974,13 @@ export function useMeshCore(options: UseMeshCoreOptions): UseMeshCoreState {
       if (data.returned > 0) {
         await refreshContacts();
       }
-      return { returned: data.returned ?? 0, newCount: data.new ?? 0 };
+      return {
+        returned: data.returned ?? 0,
+        newCount: data.new ?? 0,
+        // Older servers (or the region-discovery path) omit `nodes` entirely;
+        // an absent list must read as "no detail", not crash the view.
+        nodes: Array.isArray(data.nodes) ? (data.nodes as DiscoveredNode[]) : [],
+      };
     } catch (_err) {
       setError('Failed to discover nodes');
       return null;
@@ -960,17 +1064,23 @@ export function useMeshCore(options: UseMeshCoreOptions): UseMeshCoreState {
     }
   }, [mcPrefix, csrfFetch]);
 
+  /**
+   * Saved-regions catalog for the scope-override datalist.
+   *
+   * Deliberately does NOT surface a global error, matching `getDefaultScope`
+   * above: this only feeds optional autocomplete suggestions, and its route is
+   * `requireAuth()` + `configuration: read`. Reporting the failure meant an
+   * anonymous read-only viewer opening a MeshCore channel got the raw 401 body
+   * — "Authentication required" — as a banner across a page that was otherwise
+   * working, which reads as "you can't view this channel".
+   */
   const fetchSavedRegions = useCallback(async (): Promise<SavedRegion[] | null> => {
     try {
       const response = await csrfFetch(`${mcPrefix}/saved-regions`);
       const data = await response.json();
-      if (!data.success) {
-        setError(data.error || 'Failed to load saved regions');
-        return null;
-      }
+      if (!data.success) return null;
       return Array.isArray(data.regions) ? (data.regions as SavedRegion[]) : [];
     } catch (_err) {
-      setError('Failed to load saved regions');
       return null;
     }
   }, [mcPrefix, csrfFetch]);
@@ -1211,6 +1321,28 @@ export function useMeshCore(options: UseMeshCoreOptions): UseMeshCoreState {
     } catch (_err) {
       setError('Trace path failed');
       return null;
+    }
+  }, [mcPrefix, csrfFetch]);
+
+  const pingContactZeroHop = useCallback(async (publicKey: string): Promise<ZeroHopPingResult> => {
+    try {
+      const response = await csrfFetch(
+        `${mcPrefix}/contacts/${encodeURIComponent(publicKey)}/ping`,
+        { method: 'POST' },
+      );
+      const data = await response.json();
+      if (!data.success) {
+        return { ok: false, error: data.error || 'Ping failed' };
+      }
+      return {
+        ok: true,
+        hopHash: data.data.hopHash,
+        rttMs: data.data.rttMs,
+        snrToTarget: data.data.snrToTarget ?? null,
+        snrFromTarget: data.data.snrFromTarget,
+      };
+    } catch (_err) {
+      return { ok: false, error: 'Ping failed' };
     }
   }, [mcPrefix, csrfFetch]);
 
@@ -1761,6 +1893,7 @@ export function useMeshCore(options: UseMeshCoreOptions): UseMeshCoreState {
       shareContact,
       setContactOutPath,
       traceContactPath,
+      pingContactZeroHop,
       removeContact,
       setNodeFavorite,
       exportContact,

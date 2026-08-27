@@ -18,11 +18,14 @@ import { parseDiscardInvalidPositions } from '../../utils/positionIngestConfig.j
 import { parseNoIndexEnabled } from '../../utils/robotsConfig.js';
 import { securityDigestService } from '../services/securityDigestService.js';
 import { invalidatePkiDmGlobalCache } from '../services/sourcePkiKeyStore.js';
-import { VALID_SETTINGS_KEYS, stripSecretSettings } from '../constants/settings.js';
+import { VALID_SETTINGS_KEYS, GLOBAL_ONLY_SETTINGS_KEYS, stripSecretSettings } from '../constants/settings.js';
+import { ok, fail } from '../utils/apiResponse.js';
 import { resolveSourceManager } from '../utils/resolveSourceManager.js';
 import { validateFilterNameRegexOnSave } from '../utils/filterNameRegex.js';
 import { positionEstimationScheduler } from '../services/positionEstimationScheduler.js';
 import { autoDeleteByDistanceService } from '../services/autoDeleteByDistanceService.js';
+import { NODE_DISPLAY_RANGES, NODE_DISPLAY_SETTING_KEYS } from '../../constants/nodeDisplayDefaults.js';
+import { resolveAppriseServerUrl } from '../services/appriseNotificationService.js';
 
 // ─── Tile URL validation ─────────────────────────────────────────────────
 
@@ -118,7 +121,7 @@ export interface SettingsCallbacks {
   refreshTileHostnameCache?: () => void | Promise<void>;
   setTracerouteInterval?: (interval: number) => void;
   setRemoteAdminScannerInterval?: (interval: number, sourceId?: string | null) => void;
-  setLocalStatsInterval?: (interval: number) => void;
+  setLocalStatsInterval?: (interval: number, sourceId?: string | null) => void;
   setKeyRepairSettings?: (settings: {
     enabled: boolean;
     intervalMinutes: number;
@@ -126,7 +129,10 @@ export interface SettingsCallbacks {
     autoPurge: boolean;
     immediatePurge: boolean;
   }) => void;
-  restartInactiveNodeService?: (threshold: number, check: number, cooldown: number) => void;
+  // Per-source (#4412 Phase 2): the service resolves threshold/interval/cooldown
+  // per source on each tick, so a save only needs to invalidate that source's
+  // next-run timestamp. A null/omitted sourceId invalidates every source.
+  rescheduleInactiveNodeService?: (sourceId?: string | null) => void;
   stopInactiveNodeService?: () => void;
   restartLowBatteryService?: (check: number, cooldown: number) => void;
   stopLowBatteryService?: () => void;
@@ -159,6 +165,78 @@ export function setSettingsCallbacks(cb: SettingsCallbacks): void {
   callbacks = cb;
 }
 
+// #4412 Phase 2: the three inactiveNodeNotificationService config keys.
+// Hoisted to module scope so both the per-source and global save paths reuse
+// the same list instead of each declaring their own copy.
+const INACTIVE_NODE_KEYS = [
+  'inactiveNodeThresholdHours',
+  'inactiveNodeCheckIntervalMinutes',
+  'inactiveNodeCooldownHours',
+] as const;
+
+/**
+ * The `settings` row key that holds the current value of `key` for this write's scope:
+ * `source:{id}:{key}` for a scoped POST, the bare key for a global one.
+ *
+ * `currentSettings` is one `getAllSettings()` snapshot containing BOTH namespaces, so
+ * scoped change-detection costs no extra query — that is the whole point (#4419).
+ * Any pre-write comparison inside `POST /` that can run with a non-null `sourceId` MUST
+ * go through this; reading `currentSettings.<bareKey>` directly compares a per-source
+ * save against the global row.
+ */
+function scopedSettingKey(key: string, sourceId: string | null): string {
+  return sourceId ? `source:${sourceId}:${key}` : key;
+}
+
+/**
+ * Audit-log a settings write. Called from BOTH the per-source branch and the
+ * global branch, so per-source changes stop being invisible (epic #4412 bug #6).
+ *
+ * `currentSettings` is the pre-write snapshot from getAllSettings(), which
+ * includes `source:{id}:{key}` rows — so the per-source before-value needs no
+ * extra query.
+ *
+ * The explicit allowlist check is retained so static analyzers can see that
+ * `key` cannot be an attacker-controlled property name like `__proto__`.
+ */
+async function auditSettingsWrite(
+  req: Request,
+  currentSettings: Record<string, string>,
+  filteredSettings: Record<string, string>,
+  sourceId: string | null,
+): Promise<void> {
+  const validKeySet = new Set<string>(VALID_SETTINGS_KEYS as readonly string[]);
+  const changed: Record<string, { before: string | undefined; after: string }> = {};
+  for (const key of Object.keys(filteredSettings)) {
+    if (!validKeySet.has(key)) continue;
+    const before = currentSettings[scopedSettingKey(key, sourceId)];
+    if (before !== filteredSettings[key]) {
+      // `Object.defineProperty` (not `changed[key] = ...`) is deliberate, not
+      // stylistic: it's how the code proved to static analysis / CodeQL that
+      // `key` — checked against `validKeySet` above, but still a
+      // request-derived string — can't trigger prototype pollution via a
+      // plain-assignment sink. Preserved verbatim from the pre-extraction
+      // code (Phase 1); swapping it for `changed[key] = ...` risks reopening
+      // that finding even though `key` is allowlisted here.
+      Object.defineProperty(changed, key, {
+        value: { before, after: filteredSettings[key] },
+        enumerable: true, writable: true, configurable: true,
+      });
+    }
+  }
+  if (Object.keys(changed).length === 0) return;
+
+  void databaseService.auditLogAsync(
+    req.user!.id,
+    'settings_updated',
+    'settings',
+    JSON.stringify({ sourceId, keys: Object.keys(changed) }),
+    req.ip || null,
+    JSON.stringify(Object.fromEntries(Object.entries(changed).map(([k, v]) => [k, v.before]))),
+    JSON.stringify(Object.fromEntries(Object.entries(changed).map(([k, v]) => [k, v.after]))),
+  );
+}
+
 // ─── Router ──────────────────────────────────────────────────────────────
 
 const router = Router();
@@ -177,10 +255,20 @@ router.get('/', optionalAuth(), async (req: Request, res: Response) => {
     const globalSettings = await databaseService.settings.getAllSettings();
 
     if (sourceId) {
-      // Strip source: prefixed keys from global (they are internal implementation detail)
+      // Strip source: prefixed keys from global (they are internal implementation detail).
+      //
+      // #4412 Phase 3 (D5): the ten Node Display keys have no runtime global
+      // fallback on the read path (getSettingForSource lost it in #2839/#2840), so
+      // back-filling them here would show a value the backend will never use — a
+      // source created after migration 131 has no seeded per-source row, and would
+      // otherwise display the legacy global value while behaving as the hardcoded
+      // default. Exclude them from the global back-fill; they end up present only
+      // when the per-source row exists.
       const cleaned: Record<string, string> = {};
       for (const [k, v] of Object.entries(globalSettings)) {
-        if (!k.startsWith('source:')) cleaned[k] = v;
+        if (k.startsWith('source:')) continue;
+        if ((NODE_DISPLAY_SETTING_KEYS as readonly string[]).includes(k)) continue;
+        cleaned[k] = v;
       }
       const sourceSettings = await databaseService.settings.getSourceSettings(sourceId);
       const merged = { ...cleaned, ...sourceSettings };
@@ -195,13 +283,13 @@ router.get('/', optionalAuth(), async (req: Request, res: Response) => {
     }
   } catch (error) {
     logger.error('Error fetching settings:', error);
-    res.status(500).json({ error: 'Failed to fetch settings' });
+    fail(res, 500, 'SETTINGS_FETCH_FAILED', 'Failed to fetch settings');
   }
 });
 
 // POST /settings — save settings
 // ?sourceId=<id>  → save as per-source settings (skips global side-effects)
-router.post('/', requirePermission('settings', 'write'), async (req: Request, res: Response) => {
+router.post('/', requirePermission('settings', 'write', { sourceIdFrom: 'query' }), async (req: Request, res: Response) => {
   try {
     const settings = req.body;
     const sourceId = typeof req.query.sourceId === 'string' ? req.query.sourceId : null;
@@ -210,12 +298,27 @@ router.post('/', requirePermission('settings', 'write'), async (req: Request, re
     const currentSettings = await databaseService.settings.getAllSettings();
 
     // Validate settings
+    //
+    // Deny-list, not allow-list (see PER_SOURCE_NODE_DISPLAY_PHASE1_SPEC.md §2.2).
+    // A global-only key we failed to enumerate writes one junk row nobody reads;
+    // a per-source key wrongly excluded from an allow-list would silently stop
+    // persisting. The global path is byte-identical to today (sourceId is null,
+    // so the deny branch is unreachable and ignoredKeys stays empty).
     const filteredSettings: Record<string, string> = {};
-
+    const ignoredKeys: string[] = [];
     for (const key of VALID_SETTINGS_KEYS) {
-      if (key in settings) {
-        filteredSettings[key] = String(settings[key]);
+      if (!(key in settings)) continue;
+      if (sourceId && GLOBAL_ONLY_SETTINGS_KEYS.has(key)) {
+        ignoredKeys.push(key);
+        continue;
       }
+      filteredSettings[key] = String(settings[key]);
+    }
+    if (ignoredKeys.length > 0) {
+      logger.warn(
+        `POST /api/settings?sourceId=${sourceId}: dropped ${ignoredKeys.length} global-only ` +
+        `key(s), meaningless in a source namespace: ${ignoredKeys.join(', ')}`
+      );
     }
 
     // Validate autoAckRegex pattern.
@@ -237,8 +340,8 @@ router.post('/', requirePermission('settings', 'write'), async (req: Request, re
       const willBeEnabled =
         'autoAckEnabled' in filteredSettings
           ? filteredSettings.autoAckEnabled === 'true'
-          : currentSettings.autoAckEnabled === 'true';
-      const regexChanged = pattern !== (currentSettings.autoAckRegex ?? '');
+          : currentSettings[scopedSettingKey('autoAckEnabled', sourceId)] === 'true';
+      const regexChanged = pattern !== (currentSettings[scopedSettingKey('autoAckRegex', sourceId)] ?? '');
 
       if (willBeEnabled || regexChanged) {
         if (pattern.length > 100) {
@@ -279,27 +382,53 @@ router.post('/', requirePermission('settings', 'write'), async (req: Request, re
       }
     }
 
-    // Validate inactive node notification settings
+    // Range-validate the node-age window (client input is min=1 max=168 —
+    // SettingsTab.tsx:1882-1884). Prior to this there was no server-side check
+    // at all, so an API client could store 0 or a negative value and every
+    // consumer's `Date.now() - h*3600e3` window silently inverted.
+    if ('maxNodeAgeHours' in filteredSettings) {
+      const hours = parseInt(filteredSettings.maxNodeAgeHours, 10);
+      const R = NODE_DISPLAY_RANGES.maxNodeAgeHours!;
+      if (isNaN(hours) || hours < R.min || hours > R.max) {
+        return fail(res, 400, 'INVALID_MAX_NODE_AGE_HOURS',
+          `maxNodeAgeHours must be between ${R.min} and ${R.max} hours`);
+      }
+    }
+
+    // Validate inactive node notification settings. Bounds are sourced from
+    // NODE_DISPLAY_RANGES so this validation can never disagree with the
+    // clamp inside getInactiveNodeConfig() (#4412 Phase 2). Status codes and
+    // message strings are kept in their pre-existing bare-`{error}` form —
+    // tests pin them, and converting to fail() is a separate opportunistic
+    // change.
+    //
+    // #4412 Phase 2: inactiveNodeNotificationService now resolves
+    // threshold/interval/cooldown per source on every tick, so BOTH the
+    // per-source and global save paths fire a reschedule side-effect — see
+    // the per-source branch below and the global branch further down.
     if ('inactiveNodeThresholdHours' in filteredSettings) {
       const threshold = parseInt(filteredSettings.inactiveNodeThresholdHours, 10);
-      if (isNaN(threshold) || threshold < 1 || threshold > 720) {
-        return res.status(400).json({ error: 'inactiveNodeThresholdHours must be between 1 and 720 hours' });
+      const R = NODE_DISPLAY_RANGES.inactiveNodeThresholdHours!;
+      if (isNaN(threshold) || threshold < R.min || threshold > R.max) {
+        return res.status(400).json({ error: `inactiveNodeThresholdHours must be between ${R.min} and ${R.max} hours` });
       }
     }
 
     if ('inactiveNodeCheckIntervalMinutes' in filteredSettings) {
       const interval = parseInt(filteredSettings.inactiveNodeCheckIntervalMinutes, 10);
-      if (isNaN(interval) || interval < 1 || interval > 1440) {
+      const R = NODE_DISPLAY_RANGES.inactiveNodeCheckIntervalMinutes!;
+      if (isNaN(interval) || interval < R.min || interval > R.max) {
         return res
           .status(400)
-          .json({ error: 'inactiveNodeCheckIntervalMinutes must be between 1 and 1440 minutes' });
+          .json({ error: `inactiveNodeCheckIntervalMinutes must be between ${R.min} and ${R.max} minutes` });
       }
     }
 
     if ('inactiveNodeCooldownHours' in filteredSettings) {
       const cooldown = parseInt(filteredSettings.inactiveNodeCooldownHours, 10);
-      if (isNaN(cooldown) || cooldown < 1 || cooldown > 720) {
-        return res.status(400).json({ error: 'inactiveNodeCooldownHours must be between 1 and 720 hours' });
+      const R = NODE_DISPLAY_RANGES.inactiveNodeCooldownHours!;
+      if (isNaN(cooldown) || cooldown < R.min || cooldown > R.max) {
+        return res.status(400).json({ error: `inactiveNodeCooldownHours must be between ${R.min} and ${R.max} hours` });
       }
     }
 
@@ -646,6 +775,33 @@ router.post('/', requirePermission('settings', 'write'), async (req: Request, re
       filteredSettings.appriseApiServerUrl = raw;
     }
 
+    // External URL (#4437). The absolute origin this MeshMonitor install is
+    // reachable at, used to build the "View details" link in security digests
+    // (securityDigestService.ts detailsLink()). Empty string clears it, which
+    // keeps detailsLink() returning null exactly as it does today when unset.
+    if ('externalUrl' in filteredSettings) {
+      let raw = filteredSettings.externalUrl.trim();
+      if (raw.length > 0) {
+        let parsed: URL;
+        try {
+          parsed = new URL(raw);
+        } catch {
+          return res.status(400).json({ error: 'externalUrl must be a valid http(s) URL' });
+        }
+        if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+          return res.status(400).json({ error: 'externalUrl must use http:// or https://' });
+        }
+        // Strip ALL trailing slashes — detailsLink() emits `${baseUrl}/security`
+        // verbatim, so a trailing slash here would double up to `//security`.
+        let end = raw.length;
+        while (end > 0 && raw.charCodeAt(end - 1) === 47 /* '/' */) {
+          end--;
+        }
+        raw = raw.slice(0, end);
+      }
+      filteredSettings.externalUrl = raw;
+    }
+
     // Save to database
     if (sourceId) {
       // Per-source: store with source: prefix
@@ -679,6 +835,16 @@ router.post('/', requirePermission('settings', 'write'), async (req: Request, re
         callbacks.setAutomationAirtimeCutoffSource?.(filteredSettings.automationAirtimeCutoffSource, sourceId);
       }
 
+      // #4412: localStatsIntervalMinutes is read per-source by
+      // applyManagerSettings.ts:42, but this branch never told the source's own
+      // manager about a change — so a scoped save only took effect on reconnect.
+      if ('localStatsIntervalMinutes' in filteredSettings) {
+        const interval = parseInt(filteredSettings.localStatsIntervalMinutes, 10);
+        if (!isNaN(interval) && interval >= 0 && interval <= 60) {
+          callbacks.setLocalStatsInterval?.(interval, sourceId);
+        }
+      }
+
       // Auto-delete-by-distance is per-source (#3901): restart this source's
       // own scheduler so a settings change takes effect without waiting for the
       // source to reconnect. The scheduler reads enabled/interval itself.
@@ -691,6 +857,10 @@ router.post('/', requirePermission('settings', 'write'), async (req: Request, re
         'autoDeleteByDistanceAction',
       ];
       if (distanceDeleteKeys.some((key) => key in filteredSettings)) {
+        // Deliberately a post-write read, not a pre-write check: setSourceSettings()
+        // above has already persisted this payload, so this reflects the value the
+        // caller just saved — and falls back to the stored one when the payload
+        // changed a sibling key without touching the enabled flag.
         const enabled = await databaseService.settings.getSettingForSource(sourceId, 'autoDeleteByDistanceEnabled');
         if (enabled === 'true') {
           callbacks.restartAutoDeleteByDistanceService?.(sourceId);
@@ -701,7 +871,16 @@ router.post('/', requirePermission('settings', 'write'), async (req: Request, re
         }
       }
 
-      return res.json({ success: true });
+      // #4412 Phase 2: the inactive-node service reads threshold/interval/cooldown
+      // per source on each tick, so a scoped save only needs to invalidate THIS
+      // source's next-run timestamp. No global restart, no other source affected.
+      if (INACTIVE_NODE_KEYS.some((key) => key in filteredSettings)) {
+        callbacks.rescheduleInactiveNodeService?.(sourceId);
+        logger.debug(`✅ Inactive node check rescheduled (source: ${sourceId})`);
+      }
+
+      await auditSettingsWrite(req, currentSettings, filteredSettings, sourceId);
+      return ok(res, { ignoredKeys });
     }
 
     await databaseService.settings.setSettings(filteredSettings);
@@ -745,6 +924,8 @@ router.post('/', requirePermission('settings', 'write'), async (req: Request, re
     }
 
     if ('autoWelcomeEnabled' in filteredSettings) {
+      // Global-branch only: the `if (sourceId)` branch above returns at :842, so
+      // `currentSettings[...]` here is always the un-prefixed global row by construction (#4419).
       const wasEnabled = currentSettings['autoWelcomeEnabled'] === 'true';
       const nowEnabled = filteredSettings['autoWelcomeEnabled'] === 'true';
       if (!wasEnabled && nowEnabled) {
@@ -829,42 +1010,11 @@ router.post('/', requirePermission('settings', 'write'), async (req: Request, re
       logger.debug('✅ Auto key repair settings updated');
     }
 
-    const inactiveNodeSettings = [
-      'inactiveNodeThresholdHours',
-      'inactiveNodeCheckIntervalMinutes',
-      'inactiveNodeCooldownHours',
-    ];
-    const inactiveNodeSettingsChanged = inactiveNodeSettings.some((key) => key in filteredSettings);
-    if (inactiveNodeSettingsChanged) {
-      const dbThreshold = await databaseService.settings.getSetting('inactiveNodeThresholdHours');
-      const dbCheckInterval = await databaseService.settings.getSetting('inactiveNodeCheckIntervalMinutes');
-      const dbCooldown = await databaseService.settings.getSetting('inactiveNodeCooldownHours');
-      const threshold = parseInt(
-        filteredSettings.inactiveNodeThresholdHours ||
-          dbThreshold ||
-          '24',
-        10
-      );
-      const checkInterval = parseInt(
-        filteredSettings.inactiveNodeCheckIntervalMinutes ||
-          dbCheckInterval ||
-          '60',
-        10
-      );
-      const cooldown = parseInt(
-        filteredSettings.inactiveNodeCooldownHours ||
-          dbCooldown ||
-          '24',
-        10
-      );
-
-      if (!isNaN(threshold) && threshold > 0 && !isNaN(checkInterval) && checkInterval > 0 && !isNaN(cooldown) && cooldown > 0) {
-        callbacks.stopInactiveNodeService?.();
-        callbacks.restartInactiveNodeService?.(threshold, checkInterval, cooldown);
-        logger.debug(
-          `✅ Inactive node notification service restarted (threshold: ${threshold}h, check: ${checkInterval}min, cooldown: ${cooldown}h)`
-        );
-      }
+    if (INACTIVE_NODE_KEYS.some((key) => key in filteredSettings)) {
+      // These keys are per-source now; a global write still has to invalidate
+      // every source's cached next-run so the change is picked up.
+      callbacks.rescheduleInactiveNodeService?.(null);
+      logger.debug('✅ Inactive node check rescheduled for all sources');
     }
 
     const lowBatterySettings = [
@@ -934,33 +1084,7 @@ router.post('/', requirePermission('settings', 'write'), async (req: Request, re
     // via its manager lifecycle + the per-source branch above.
 
     // Audit log with before/after values.
-    // Allowlist check is explicit here so static analyzers can see that
-    // `key` cannot be an attacker-controlled property name like `__proto__`.
-    const validKeySet = new Set<string>(VALID_SETTINGS_KEYS as readonly string[]);
-    const changedSettings: Record<string, { before: string | undefined; after: string }> = {};
-    Object.keys(filteredSettings).forEach((key) => {
-      if (!validKeySet.has(key)) return;
-      if (currentSettings[key] !== filteredSettings[key]) {
-        Object.defineProperty(changedSettings, key, {
-          value: { before: currentSettings[key], after: filteredSettings[key] },
-          enumerable: true,
-          writable: true,
-          configurable: true,
-        });
-      }
-    });
-
-    if (Object.keys(changedSettings).length > 0) {
-      void databaseService.auditLogAsync(
-        req.user!.id,
-        'settings_updated',
-        'settings',
-        JSON.stringify({ keys: Object.keys(changedSettings) }),
-        req.ip || null,
-        JSON.stringify(Object.fromEntries(Object.entries(changedSettings).map(([k, v]) => [k, v.before]))),
-        JSON.stringify(Object.fromEntries(Object.entries(changedSettings).map(([k, v]) => [k, v.after])))
-      );
-    }
+    await auditSettingsWrite(req, currentSettings, filteredSettings, null);
 
     // Reschedule security digest if any digest setting changed
     if (Object.keys(filteredSettings).some(k => k.startsWith('securityDigest'))) {
@@ -1031,15 +1155,9 @@ router.post('/test-apprise', requirePermission('settings', 'write'), async (req:
   try {
     const requestUrl = typeof req.body?.url === 'string' ? req.body.url.trim() : '';
 
-    let target: string;
-    if (requestUrl.length > 0) {
-      target = requestUrl;
-    } else {
-      const saved = await databaseService.settings.getSetting('appriseApiServerUrl');
-      target = (saved && saved.trim().length > 0)
-        ? saved.trim()
-        : (process.env.APPRISE_URL || 'http://localhost:8000');
-    }
+    const target = requestUrl.length > 0
+      ? requestUrl
+      : await resolveAppriseServerUrl(databaseService.settings, null);
 
     const validation = validateAppriseProbeUrl(target);
     if (!validation.ok || !validation.probeUrl) {

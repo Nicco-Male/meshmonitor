@@ -1,0 +1,380 @@
+/*
+ * Shared per-source navigation (issue #4473).
+ *
+ * Widths are driven by custom properties so each consumer can keep its own
+ * geometry without forking the rules: Meshtastic's sidebar is 60/240, MeshCore's
+ * sub-toolbar 56/220.
+ */
+.nav {
+  --source-nav-collapsed-width: 60px;
+  --source-nav-expanded-width: 240px;
+  /*
+   * Themeable bits go through custom properties rather than plain declarations
+   * so a consumer (e.g. `.sidebar`) can retheme the nav by *inheritance*, which
+   * is immune to stylesheet order. Overriding `background` from another
+   * equal-specificity rule instead would make the result depend on CSS import
+   * order — the exact failure mode that hid the send button in #4478.
+   */
+  --source-nav-bg: var(--ctp-mantle);
+  --source-nav-border: 1px solid var(--ctp-surface1);
+
+  display: flex;
+  flex-direction: column;
+  flex-shrink: 0;
+  background: var(--source-nav-bg);
+  border-right: var(--source-nav-border);
+  transition: width 0.18s ease;
+  box-sizing: border-box;
+}
+
+.collapsed {
+  width: var(--source-nav-collapsed-width);
+}
+
+.expanded {
+  width: var(--source-nav-expanded-width);
+}
+
+.list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 8px;
+  flex: 1;
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
+/* Carried over from Sidebar.css with the nav list (#4473). */
+.list::-webkit-scrollbar {
+  width: 6px;
+}
+
+.list::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.list::-webkit-scrollbar-thumb {
+  background: var(--ctp-surface2);
+  border-radius: var(--radius-xs);
+}
+
+.list::-webkit-scrollbar-thumb:hover {
+  background: var(--ctp-overlay0);
+}
+
+.sectionHeader {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--ctp-subtext0);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  padding: 12px 12px 4px 12px;
+  margin-top: 8px;
+}
+
+.section {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 12px;
+  background: transparent;
+  border: none;
+  border-radius: var(--radius-md);
+  color: var(--ctp-text);
+  cursor: pointer;
+  transition: background-color 0.2s;
+  text-align: left;
+  font-size: 14px;
+  position: relative;
+  white-space: nowrap;
+  width: 100%;
+}
+
+.item:hover {
+  background: var(--ctp-surface0);
+}
+
+.active {
+  background: var(--ctp-blue);
+  color: var(--ctp-crust);
+}
+
+.icon {
+  width: 20px;
+  height: 20px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  position: relative;
+}
+
+.label {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Anchored to the icon's top-right so it holds position collapsed or expanded. */
+.unreadDot {
+  position: absolute;
+  top: -2px;
+  right: -2px;
+  width: 8px;
+  height: 8px;
+  background: var(--ctp-red);
+  border-radius: var(--radius-full);
+  border: 1px solid var(--ctp-mantle);
+  pointer-events: none;
+}
+
+.collapsed .item {
+  justify-content: center;
+  padding: 10px;
+}
+
+.collapsed .label {
+  display: none;
+}
+
+.controls {
+  display: flex;
+  flex-direction: row;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 0 8px 8px 8px;
+  flex-shrink: 0;
+}
+
+.collapsed .controls {
+  justify-content: center;
+}
+
+.toggle {
+  background: transparent;
+  border: 1px solid var(--ctp-surface2);
+  color: var(--ctp-subtext0);
+  border-radius: var(--radius-md);
+  padding: 0.35rem;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.toggle:hover {
+  color: var(--ctp-text);
+  background: var(--ctp-surface1);
+}
+
+/* ============================================================
+ * Mobile
+ *
+ * Both conditions, not just the width one. A landscape phone (e.g. 800x400) is
+ * WIDER than 768px but is still the mobile layout — App.css's two `:root`
+ * mobile blocks and Sidebar's updateSidebarWidth() both treat it that way. If
+ * this query covered only max-width, such a viewport would zero
+ * `--sidebar-width` while the nav still rendered as a vertical rail, and page
+ * content would slide underneath it.
+ * ============================================================ */
+
+@media (max-width: 768px), (max-height: 500px) and (orientation: landscape) {
+  /*
+   * Bottom bar. The bug this fixes (#4473): items used to be `flex: 1 1 0` with
+   * `min-width: 0`, so 11 entries split a ~390px phone into ~35px each and every
+   * label ellipsised to two or three characters.
+   *
+   * Items now size to their content with a floor, and the bar scrolls sideways
+   * instead. A label is either fully readable or scrolled to — never shredded.
+   */
+  .mobileBottomBar {
+    width: 100%;
+    flex-direction: row;
+    align-items: stretch;
+    border-right: none;
+    border-top: var(--source-nav-border);
+    padding: 0;
+    overflow-x: auto;
+    overflow-y: hidden;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+    /*
+     * Keep a horizontal drag on the bar as a scroll of THIS element (#4497).
+     * `pan-x` declares horizontal panning as the only gesture we want here, and
+     * `contain` stops scroll chaining once an end is reached — chaining is what
+     * let a swipe on the bar fall through to Safari's back-swipe / app-switcher
+     * edge gesture and kick the user out of the PWA.
+     *
+     * Partial mitigation, to be honest about it: the iOS home-indicator and
+     * app-switcher gestures are OS-level and CSS cannot fully suppress them.
+     * The safe-area padding above is what actually lifts the tap targets clear
+     * of the home-indicator zone; these two only stop the scroll chaining.
+     */
+    touch-action: pan-x;
+    overscroll-behavior-x: contain;
+  }
+
+  .mobileBottomBar::-webkit-scrollbar {
+    display: none;
+  }
+
+  /*
+   * Scroll affordance (#4497): there are more tabs than fit on a phone, with
+   * nothing to suggest the row scrolls, so tabs get missed entirely. Fade
+   * whichever edge still has content beyond it.
+   *
+   * `mask-image` rather than an ::after overlay, because a pseudo-element
+   * inside a scroll container scrolls away with the content; a mask applies to
+   * the element's own box and stays put. The data attributes come from
+   * SourceNav's scroll position, so a bar whose tabs all fit shows no fade.
+   */
+  .mobileBottomBar[data-overflow-end='true'] {
+    -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 28px), transparent 100%);
+    mask-image: linear-gradient(to right, #000 calc(100% - 28px), transparent 100%);
+  }
+
+  .mobileBottomBar[data-overflow-start='true'] {
+    -webkit-mask-image: linear-gradient(to right, transparent 0, #000 28px);
+    mask-image: linear-gradient(to right, transparent 0, #000 28px);
+  }
+
+  .mobileBottomBar[data-overflow-start='true'][data-overflow-end='true'] {
+    -webkit-mask-image: linear-gradient(
+      to right, transparent 0, #000 28px, #000 calc(100% - 28px), transparent 100%
+    );
+    mask-image: linear-gradient(
+      to right, transparent 0, #000 28px, #000 calc(100% - 28px), transparent 100%
+    );
+  }
+
+  /* Width is a row-layout concept here; the collapsed/expanded rail widths
+     must not leak into the bar. */
+  .mobileBottomBar.collapsed,
+  .mobileBottomBar.expanded {
+    width: 100%;
+  }
+
+  .mobileBottomBar .list {
+    flex-direction: row;
+    flex: 1;
+    padding: 0;
+    gap: 0;
+    overflow: visible;
+  }
+
+  .mobileBottomBar .section {
+    flex-direction: row;
+    gap: 0;
+  }
+
+  /* Section headers are a vertical-rail affordance; they'd break the row. */
+  .mobileBottomBar .sectionHeader {
+    display: none;
+  }
+
+  .mobileBottomBar .item {
+    flex: 0 0 auto;
+    min-width: 64px;
+    max-width: 120px;
+    width: auto;
+    flex-direction: column;
+    justify-content: center;
+    gap: 0.2rem;
+    padding: 0.5rem 0.6rem;
+    margin: 0;
+    border-radius: 0;
+    text-align: center;
+    font-size: 0.7rem;
+  }
+
+  /*
+   * Labels stay visible on the bar even when the desktop rail is collapsed —
+   * an icon-only bottom bar is exactly the affordance gap #4473 reported.
+   *
+   * Deliberately ONE class deep (`.mobileBottomBar .label`, not
+   * `.mobileBottomBar.collapsed .label`). It beats the `.collapsed .label`
+   * rule above on source order at equal specificity, and staying at that depth
+   * leaves the landscape block below — same specificity, later in the file —
+   * able to override it. A compound `.mobileBottomBar.collapsed` version would
+   * outrank the landscape rule no matter where it sat, which is precisely the
+   * bug that made the landscape bar 63px tall while the shell reserved 44px.
+   *
+   * Ordering within one authored file is fine; #4478's hazard was two files
+   * racing, which is why theme/width still cross the boundary as properties.
+   */
+  .mobileBottomBar .label {
+    display: block;
+    flex: none;
+    font-size: 0.65rem;
+    line-height: 1.2;
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .mobileBottomBar .active {
+    /* A filled pill is too heavy at bar size; underline the active entry. */
+    background: transparent;
+    color: var(--ctp-blue);
+    box-shadow: inset 0 -2px 0 0 var(--ctp-blue);
+  }
+
+  /*
+   * A logo block, a pin/collapse cluster and a footer are vertical-rail
+   * affordances — laid out in a horizontal bar they'd eat the row and push the
+   * nav items off-screen. MeshCore passes none of these; Meshtastic passes all
+   * three, which is why the bar only needed this once Meshtastic joined it.
+   */
+  .mobileBottomBar .controls,
+  .mobileBottomBar .controlsSlot,
+  .mobileBottomBar .headerSlot,
+  .mobileBottomBar .footerSlot {
+    display: none;
+  }
+
+  /*
+   * Dock the bar. A consumer may position itself as a full-height fixed rail
+   * (`.sidebar` is `top:0; bottom:0; height:100dvh`), so the bar has to undo
+   * that rather than assume static flow.
+   */
+  .mobileBottomBar {
+    top: auto;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    height: auto;
+    max-height: none;
+    /* Published so the app shell can reserve room for the bar. */
+    --source-nav-bar-height: 56px;
+  }
+
+  /* Vertical rail on mobile — narrower, but structurally unchanged. */
+  .mobileRail.collapsed {
+    width: 48px;
+  }
+}
+
+/* Landscape phones: vertical space is the scarce axis, so shrink the bar.
+   Must stay in step with `--app-nav-bar-height: 44px` in App.css's matching
+   landscape block, which is what reserves room for it. */
+@media (max-height: 500px) and (orientation: landscape) {
+  .mobileBottomBar {
+    --source-nav-bar-height: 44px;
+  }
+
+  .mobileBottomBar .item {
+    padding: 0.25rem 0.6rem;
+  }
+
+  .mobileBottomBar .label {
+    font-size: 0.6rem;
+  }
+}

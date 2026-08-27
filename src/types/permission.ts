@@ -62,15 +62,29 @@ export type PermissionSet = Partial<{
 }>;
 
 /**
- * Resources whose permissions are scoped per-source. Matches the SOURCEY_RESOURCES
- * set used by migration 033. Grants on these resources always carry a sourceId.
+ * Resources whose permissions are scoped per-source. This is the single
+ * canonical definition of that classification — see
+ * `docs/internal/dev-notes/PER_SOURCE_NODE_DISPLAY_PHASE6_SPEC.md` §2.2 for the
+ * repo-scanning drift guard (`src/types/permission.sourcey.test.ts`) that keeps
+ * a second competing list from being reintroduced (issue #4416). Grants on
+ * these resources always carry a sourceId.
+ *
+ * Adding an entry here is a BREAKING CHANGE: it flips a resource from globally
+ * authorized to per-source authorized, which silently drops every existing
+ * global grant for that resource unless a fan-out migration first copies each
+ * grant onto every source (see spec §3; migration 132 fanned out `settings`
+ * when it was added here). Do not add an entry without a matching migration.
+ *
+ * `dashboard`, `info`, `audit`, and `security` are deliberately NOT included —
+ * see spec §1.3 (they are cross-source nav gates, or their underlying data has
+ * no `sourceId` column). This is a decision, not an oversight.
  */
 export const SOURCEY_RESOURCES: readonly ResourceType[] = [
   'channel_0', 'channel_1', 'channel_2', 'channel_3',
   'channel_4', 'channel_5', 'channel_6', 'channel_7',
   'messages', 'nodes', 'nodes_private', 'traceroute',
   'packetmonitor', 'configuration', 'connection', 'automation',
-  'waypoints', 'remote_admin',
+  'waypoints', 'remote_admin', 'settings',
 ] as const;
 
 const SOURCEY_RESOURCE_SET = new Set<ResourceType>(SOURCEY_RESOURCES);
@@ -78,6 +92,33 @@ const SOURCEY_RESOURCE_SET = new Set<ResourceType>(SOURCEY_RESOURCES);
 export function isSourceyResource(resource: ResourceType): boolean {
   return SOURCEY_RESOURCE_SET.has(resource);
 }
+
+/**
+ * Resources granted to a newly provisioned non-admin user, written at GLOBAL
+ * scope (`sourceId = NULL`) by the local, JIT and OIDC provisioning paths.
+ *
+ * **Every entry here must be absent from `SOURCEY_RESOURCES`.** The sourcey
+ * branch of `checkPermissionAsync` reads only `bySource` and ignores
+ * `sourceId = NULL` rows, so a per-source resource seeded here produces a row
+ * that is written, visible in the admin UI, and authorizes nothing.
+ *
+ * That is exactly what this list used to do (issue #4448). It previously read
+ * `['dashboard','nodes','messages','settings','info','traceroute']`, of which
+ * four — `nodes`, `messages`, `traceroute`, and (after #4416) `settings` — are
+ * per-source. New users got a working dashboard and info and nothing else,
+ * while the admin UI displayed all six as granted, which is why it went
+ * unnoticed. Dropping them changes **no** effective access; it stops writing
+ * misleading rows.
+ *
+ * Per-source access is granted explicitly by an admin, matching the decision
+ * that a newly created *source* also starts with no grants.
+ *
+ * `permission.sourcey.test.ts` asserts the disjointness above, so adding a
+ * sourcey resource here fails the build rather than silently doing nothing.
+ */
+export const DEFAULT_NEW_USER_RESOURCES: readonly ResourceType[] = [
+  'dashboard', 'info',
+] as const;
 
 /**
  * Response shape for the split permission model: non-sourcey grants live in
@@ -96,6 +137,16 @@ export interface ResourceDefinition {
 }
 
 export const RESOURCES: readonly ResourceDefinition[] = [
+  // Listed first on purpose: MeshCoreSourcePage gates its ENTIRE surface on
+  // `connection: read`, so without it every other grant on a MeshCore source is
+  // inert and the user just sees "You do not have permission to view this
+  // MeshCore source". Granting it is the first thing you need, so it reads
+  // first.
+  {
+    id: 'connection',
+    name: 'Connection',
+    description: 'Required to open a source. Also controls connect/disconnect.',
+  },
   { id: 'dashboard', name: 'Dashboard', description: 'View statistics and system info' },
   { id: 'nodes', name: 'Node List', description: 'View and manage mesh nodes' },
   { id: 'channel_0', name: 'Channel 0 (Primary)', description: 'View and send messages to channel 0' },
@@ -112,7 +163,6 @@ export const RESOURCES: readonly ResourceDefinition[] = [
   { id: 'info', name: 'Info', description: 'Telemetry and network information' },
   { id: 'automation', name: 'Automation', description: 'Automated tasks and announcements' },
   { id: 'automations', name: 'Automation Engine', description: 'Create and manage global automations and variables (Advanced Mode)' },
-  { id: 'connection', name: 'Connection', description: 'Control node connection (disconnect/reconnect)' },
   { id: 'traceroute', name: 'Traceroute', description: 'Initiate traceroute requests to nodes' },
   { id: 'audit', name: 'Audit Log', description: 'View and manage audit logs (admin only)' },
   { id: 'security', name: 'Security', description: 'View security scan results and key management' },

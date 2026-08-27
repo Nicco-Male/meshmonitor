@@ -1,6 +1,7 @@
 import { logger } from '../../utils/logger.js';
 import { scheduleCron } from '../utils/cronScheduler.js';
 import { sourceManagerRegistry } from '../sourceManagerRegistry.js';
+import { resolveAppriseServerUrl, appriseNotifyEndpoint } from './appriseNotificationService.js';
 import type { Cron as CronJob } from 'croner';
 
 interface SecurityIssuesData {
@@ -54,6 +55,18 @@ function nodeId(nodeNum: number): string {
   return `!${nodeNum.toString(16).padStart(8, '0')}`;
 }
 
+/**
+ * The digest's "View details" line. Omitted entirely when no absolute external URL is
+ * configured, because `${''}/security` renders as a dead relative path in an Apprise
+ * message. `externalUrl` is a global, admin-configurable setting (#4437) that defaults
+ * to unset — an install that has never set it keeps getting no link, unchanged from
+ * before #4437.
+ */
+function detailsLink(baseUrl: string, markdown: boolean): string | null {
+  if (!baseUrl) return null;
+  return markdown ? `[View details](${baseUrl}/security)` : `View details: ${baseUrl}/security`;
+}
+
 export function formatDigestSummary(
   issues: SecurityIssuesData,
   baseUrl: string,
@@ -77,16 +90,16 @@ export function formatDigestSummary(
         '',
         '> No security issues detected.',
         '',
-        `[View details](${baseUrl}/security)`,
-      ].join('\n');
+        detailsLink(baseUrl, true),
+      ].filter((l): l is string => l !== null).join('\n');
     }
     return [
       `MeshMonitor Security Digest — ${date}`,
       '',
       'No security issues detected.',
       '',
-      `View details: ${baseUrl}/security`,
-    ].join('\n');
+      detailsLink(baseUrl, false),
+    ].filter((l): l is string => l !== null).join('\n');
   }
 
   if (md) {
@@ -102,8 +115,8 @@ export function formatDigestSummary(
       `| Excessive Packets | ${issues.excessivePacketsCount} |`,
       `| Time Offset | ${issues.timeOffsetCount} |`,
       '',
-      `[View details](${baseUrl}/security)`,
-    ].join('\n');
+      detailsLink(baseUrl, true),
+    ].filter((l): l is string => l !== null).join('\n');
   }
 
   return [
@@ -116,8 +129,8 @@ export function formatDigestSummary(
     `  Excessive Packets: ${issues.excessivePacketsCount} node${issues.excessivePacketsCount !== 1 ? 's' : ''}`,
     `  Time Offset:      ${issues.timeOffsetCount} node${issues.timeOffsetCount !== 1 ? 's' : ''}`,
     '',
-    `View details: ${baseUrl}/security`,
-  ].join('\n');
+    detailsLink(baseUrl, false),
+  ].filter((l): l is string => l !== null).join('\n');
 }
 
 export function formatDigestDetailed(
@@ -143,16 +156,16 @@ export function formatDigestDetailed(
         '',
         '> No security issues detected.',
         '',
-        `[View details](${baseUrl}/security)`,
-      ].join('\n');
+        detailsLink(baseUrl, true),
+      ].filter((l): l is string => l !== null).join('\n');
     }
     return [
       `MeshMonitor Security Digest — ${date}`,
       '',
       'No security issues detected.',
       '',
-      `View details: ${baseUrl}/security`,
-    ].join('\n');
+      detailsLink(baseUrl, false),
+    ].filter((l): l is string => l !== null).join('\n');
   }
 
   const lines: string[] = [];
@@ -252,7 +265,8 @@ export function formatDigestDetailed(
     }
   }
 
-  lines.push('', md ? `[View details](${baseUrl}/security)` : `View details: ${baseUrl}/security`);
+  const link = detailsLink(baseUrl, md);
+  if (link !== null) lines.push('', link);
   return lines.join('\n');
 }
 
@@ -329,7 +343,16 @@ class SecurityDigestService {
     const suppressEmptyRaw = await this.databaseService.settings.getSettingForSource(sourceId, 'securityDigestSuppressEmpty');
     const suppressEmpty = suppressEmptyRaw !== 'false';
     const format = ((await this.databaseService.settings.getSettingForSource(sourceId, 'securityDigestFormat')) || 'text') as DigestFormat;
-    const baseUrl = (await this.databaseService.settings.getSettingForSource(sourceId, 'externalUrl')) || '';
+    // externalUrl is a GLOBAL-only setting (#4437) — one origin per install, not
+    // one per source (see settingsRoutes.ts's validation comment). Deliberately
+    // `getSetting`, NOT `getSettingForSource`: the latter, when passed a truthy
+    // sourceId, reads ONLY the `source:<id>:externalUrl` row and does NOT fall
+    // back to the global key (that per-source-miss fallback was removed from
+    // getSettingForSource for #2839/#2840 — see settings.ts's own docstring).
+    // Since externalUrl has no per-source writer, getSettingForSource(sourceId, …)
+    // here would always read null and silently break the "View details" link
+    // for every source. `getSetting` reads the global row directly.
+    const baseUrl = (await this.databaseService.settings.getSetting('externalUrl')) || '';
 
     // Resolve source name for the title/body prefix
     let sourceName = sourceId;
@@ -398,7 +421,11 @@ class SecurityDigestService {
       // which mesh it came from when they run several.
       const body = `[${sourceName}]\n${rawBody}`;
 
-      const response = await fetch('http://localhost:8000/notify', {
+      // Reuse the same Apprise API server resolution chain as every other
+      // dispatch path (setting → appriseApiServerUrl → APPRISE_URL → bundled
+      // localhost default) instead of hardcoding the endpoint — #4442.
+      const appriseServerUrl = await resolveAppriseServerUrl(this.databaseService.settings, sourceId);
+      const response = await fetch(appriseNotifyEndpoint(appriseServerUrl), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({

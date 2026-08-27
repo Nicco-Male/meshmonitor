@@ -22,11 +22,18 @@ import {
   verticalListSortingStrategy,
 } from '@dnd-kit/sortable';
 import { CSS } from '@dnd-kit/utilities';
-import { version } from '../../../package.json';
 import type { DashboardSource, SourceStatus, UnifiedStatus } from '../../hooks/useDashboardData';
 import { UNIFIED_SOURCE_ID } from '../../hooks/useDashboardData';
 import { useAuth } from '../../contexts/AuthContext';
-import { BrandIcon, UiIcon } from '../icons';
+import { UiIcon } from '../icons';
+import SidebarFooter from '../SidebarFooter';
+import styles from './DashboardSidebar.module.css';
+
+// Every sidebar navigation link renders an icon before its label (issue #4395).
+// The global `.dashboard-sidebar-link` rule carries the colour and typography;
+// the CSS-module class adds the flex layout that aligns the glyph with the text.
+const SIDEBAR_LINK_CLASS =
+  `dashboard-sidebar-link dashboard-sidebar-link--active ${styles.linkWithIcon}`;
 
 // Persisted, user-resizable sidebar width (issue #3356). The width is stored
 // in localStorage so it survives reloads; min/max bounds keep the layout from
@@ -787,38 +794,43 @@ const DashboardSidebar: React.FC<DashboardSidebarProps> = ({
 
       <div className="dashboard-sidebar-links">
         <button
-          className="dashboard-sidebar-link dashboard-sidebar-link--active"
+          className={SIDEBAR_LINK_CLASS}
           onClick={() => navigate('/unified/messages')}
         >
+          <UiIcon name="messages" size={18} />
           {t('source.sidebar.unified_messages')}
         </button>
         <button
-          className="dashboard-sidebar-link dashboard-sidebar-link--active"
+          className={SIDEBAR_LINK_CLASS}
           onClick={() => navigate('/unified/telemetry')}
         >
+          <UiIcon name="telemetry" size={18} />
           {t('source.sidebar.unified_telemetry')}
         </button>
         <button
-          className="dashboard-sidebar-link dashboard-sidebar-link--active"
+          className={SIDEBAR_LINK_CLASS}
           onClick={() => navigate('/unified/packets')}
         >
+          <UiIcon name="package" size={18} />
           {t('source.sidebar.unified_packets', 'Unified Packets')}
         </button>
         <button
-          className="dashboard-sidebar-link dashboard-sidebar-link--active"
+          className={SIDEBAR_LINK_CLASS}
           onClick={() => navigate('/analysis')}
         >
+          <UiIcon name="map" size={18} />
           {t('source.sidebar.map_analysis')}
         </button>
         <button
-          className="dashboard-sidebar-link dashboard-sidebar-link--active"
+          className={SIDEBAR_LINK_CLASS}
           onClick={() => navigate('/reports')}
         >
+          <UiIcon name="reports" size={18} />
           {t('source.sidebar.reports', 'Analysis & Reports')}
         </button>
         {hasPermission('automations', 'read') && (
           <button
-            className="dashboard-sidebar-link dashboard-sidebar-link--active"
+            className={SIDEBAR_LINK_CLASS}
             onClick={() => navigate('/automations')}
           >
             <UiIcon name="bot" size={18} />
@@ -827,55 +839,19 @@ const DashboardSidebar: React.FC<DashboardSidebarProps> = ({
         )}
       </div>
 
-      <div className="dashboard-sidebar-footer">
-        <span className="dashboard-sidebar-version">v{version}</span>
-        <div className="dashboard-sidebar-footer-icons">
-          {isAdmin && (
-            <>
-              <button
-                className="dashboard-sidebar-footer-btn"
-                title={t('source.sidebar.users')}
-                onClick={() => navigate('/users')}
-              >
-                <UiIcon name="users" size={18} />
-              </button>
-              <button
-                className="dashboard-sidebar-footer-btn"
-                title={t('source.sidebar.settings')}
-                onClick={() => navigate('/settings')}
-              >
-                <UiIcon name="settings" size={18} />
-              </button>
-            </>
-          )}
-          <button
-            className="dashboard-sidebar-footer-btn"
-            title={t('source.sidebar.news')}
-            onClick={onNewsClick}
-            disabled={!onNewsClick}
-          >
-            <UiIcon name="news" size={18} />
-          </button>
-          <a
-            className="dashboard-sidebar-footer-btn"
-            href="https://github.com/Yeraze/meshmonitor"
-            target="_blank"
-            rel="noopener noreferrer"
-            title={t('source.sidebar.github')}
-          >
-            <BrandIcon brand="github" size={18} />
-          </a>
-          <a
-            className="dashboard-sidebar-footer-btn"
-            href="https://meshmonitor.org"
-            target="_blank"
-            rel="noopener noreferrer"
-            title={t('source.sidebar.website')}
-          >
-            <UiIcon name="link" size={18} />
-          </a>
-        </div>
-      </div>
+      {/* Shared footer (issue #4436) — same link set as the per-source
+          sidebar. Settings is gated by settings:read (admin short-circuit
+          lives inside hasPermission), no longer by the legacy isAdmin prop.
+          'settings' is sourcey (Phase 6 #4416); this is the cross-source
+          Dashboard, which has no single source in context, so anySource is
+          the mirror of the server's union check for the unscoped routes. */}
+      <SidebarFooter
+        isAdmin={isAdmin}
+        canReadSettings={hasPermission('settings', 'read', { anySource: true })}
+        onUsersClick={() => navigate('/users')}
+        onSettingsClick={() => navigate('/settings')}
+        onNewsClick={onNewsClick}
+      />
     </aside>
     {/* Resize handle — a flex sibling between the sidebar and the map so it's
         unaffected by the sidebar's own vertical scroll. Hidden on mobile (the

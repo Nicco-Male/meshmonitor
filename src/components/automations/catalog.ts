@@ -5,6 +5,7 @@
  * metadata only; the engine validates the resulting graph server-side. Field
  * `kind` maps to an input renderer in AutomationBuilder.
  */
+import { HOP_COUNT_EMOJIS, HOP_EMOJI_MAX } from '../../utils/hopEmoji';
 
 export type FieldKind = 'text' | 'number' | 'textarea' | 'select' | 'checkbox' | 'variable' | 'emoji' | 'fieldselect' | 'sourceMulti' | 'sendSourceMulti' | 'channelMulti' | 'geofence' | 'scriptselect' | 'regionSelect';
 
@@ -23,6 +24,31 @@ export interface FieldDef {
   advanced?: boolean;
   /** This `text`/`textarea` field accepts `{{ }}` tokens → highlight + typo-check. */
   tokens?: boolean;
+  /**
+   * Render this field only when a sibling param matches. Omitted = always shown.
+   * Declarative (not a predicate function) so the catalog stays serialisable data.
+   */
+  showIf?: {
+    field: string;
+    equals?: unknown;
+    notEquals?: unknown;
+    /** Visible only when the sibling param is truthy (`true`) / falsy (`false`).
+     *  Covers "a number field that is unset, blank, or 0" in one operator (#4340 Phase 2). */
+    truthy?: boolean;
+  };
+}
+
+/** Should this field render, given the block's current params? Pure — unit-tested without React. */
+export function fieldVisible(field: FieldDef, params: Record<string, unknown>): boolean {
+  const c = field.showIf;
+  if (!c) return true;
+  const v = params[c.field];
+  if ('equals' in c && v !== c.equals) return false;
+  if ('notEquals' in c && v === c.notEquals) return false;
+  // Boolean(v) covers undefined / '' / 0 / false uniformly. Known, harmless
+  // wart: the string '0' is truthy — it only shows an extra select.
+  if (c.truthy !== undefined && Boolean(v) !== c.truthy) return false;
+  return true;
 }
 
 export interface BlockDef {
@@ -37,6 +63,23 @@ const COOLDOWN: FieldDef = {
   placeholder: '0', help: 'Minimum seconds between firings — an anti-spam throttle. 0 = no limit.',
 };
 
+const COOLDOWN_SCOPE: FieldDef = {
+  name: 'cooldownScope', label: 'Cooldown applies to', kind: 'select', advanced: true,
+  // Values mirror CooldownScope in src/types/automation.ts. Kept as literals so
+  // this frontend catalog keeps its zero dependency on the server-side types
+  // module (the same call Phase 1 made for action.tapback's emojiMode).
+  // 'automation' MUST be first: defaultParams() seeds a select's first option,
+  // so a newly added trigger block gets the pre-4.14 behaviour.
+  options: [
+    { value: 'automation', label: 'The whole automation (one shared timer)' },
+    { value: 'node', label: 'Each node separately' },
+    { value: 'sourceNode', label: 'Each node, per source' },
+  ],
+  // Only meaningful once a cooldown is actually set.
+  showIf: { field: 'cooldownSeconds', truthy: true },
+  help: 'The whole automation: one timer for the rule — on a busy channel, answering one node suppresses the answer to the next. Each node separately: every sending/subject node gets its own timer, which is what you want for a range-test responder. Each node, per source: the same node heard via two sources cools down independently. Triggers with no subject node (Schedule, System, MeshCore channel messages) fall back to one shared timer.',
+};
+
 // ─── Triggers (WHEN) ─────────────────────────────────────────────────────────
 
 export const TRIGGERS: BlockDef[] = [
@@ -46,25 +89,37 @@ export const TRIGGERS: BlockDef[] = [
     description: 'Fires when a text message arrives.',
     fields: [
       { name: 'textContains', label: 'Text contains', kind: 'text', placeholder: 'e.g. ping', help: 'Case-insensitive substring match. Leave blank to match any text.' },
-      { name: 'regex', label: 'Text matches regex', kind: 'text', placeholder: 'e.g. ^(test|ping)', advanced: true, help: 'A regular expression matched against the message text.' },
+      // The field directly above says "Case-insensitive substring match", so
+      // silence here reads as "same rules apply". It is not: messageMatchesFilter
+      // lower-cases both sides for textContains and matches the regex against
+      // raw text (triggerContext.ts). #4509 documented this on the
+      // `condition.string` block and missed the trigger, which is the surface
+      // most users actually reach for.
+      {
+        name: 'regex', label: 'Text matches regex', kind: 'text',
+        placeholder: 'e.g. (?i)^(test|ping)', advanced: true,
+        help: 'A regular expression matched against the message text. '
+          + 'Case-sensitive, unlike "Text contains" above — prefix with (?i) to ignore case, e.g. (?i)^(test|ping).',
+      },
       { name: 'channels', label: 'On channels', kind: 'channelMulti', advanced: true, help: 'Match messages that arrive on ANY of these channels (unified by name across your sources). An OR-list — leave none to match any channel. When set, this overrides the single-channel fields below.' },
       { name: 'channelName', label: 'On channel (name)', kind: 'text', placeholder: 'any', advanced: true, help: 'Match by channel name (case-insensitive) — portable across sources where the same channel sits in a different slot. Preferred over the channel # below. Ignored when "On channels" above is set.' },
       { name: 'channel', label: 'On channel #', kind: 'number', placeholder: 'any', advanced: true, help: 'Match by raw channel index. Note: the same channel can be a different index on different sources — use the name above for cross-source automations. Ignored when "On channels" above is set.' },
       { name: 'from', label: 'From node #', kind: 'number', placeholder: 'any', advanced: true, help: 'Only fire for messages from this node number.' },
       COOLDOWN,
+      COOLDOWN_SCOPE,
     ],
   },
   {
     type: 'trigger.nodeDiscovered',
     label: 'A new node is discovered',
     description: 'Fires the first time a node is seen. Note: new-vs-updated detection is coming in a later update — for now this behaves like “A node is updated”. Use that trigger meanwhile.',
-    fields: [COOLDOWN],
+    fields: [COOLDOWN, COOLDOWN_SCOPE],
   },
   {
     type: 'trigger.nodeUpdated',
     label: 'A node is updated',
     description: "Fires when a node's info changes (name, role, position…).",
-    fields: [COOLDOWN],
+    fields: [COOLDOWN, COOLDOWN_SCOPE],
   },
   {
     type: 'trigger.telemetry',
@@ -83,6 +138,7 @@ export const TRIGGERS: BlockDef[] = [
         ],
       },
       COOLDOWN,
+      COOLDOWN_SCOPE,
     ],
   },
   {
@@ -124,6 +180,7 @@ export const TRIGGERS: BlockDef[] = [
       },
       { name: 'shape', label: 'Region', kind: 'geofence', help: 'Draw a circle (center + radius) or a polygon on the map.' },
       COOLDOWN,
+      COOLDOWN_SCOPE,
     ],
   },
 ];
@@ -137,6 +194,16 @@ const EVENT_NUMERIC: Record<string, FieldOpt[]> = {
   'trigger.message': [
     { value: 'hops', label: 'Hop count' }, { value: 'from', label: 'Sender node #' },
     { value: 'channel', label: 'Channel #' }, { value: 'snr', label: 'SNR' }, { value: 'rssi', label: 'RSSI' },
+    // #4340 Phase 3: booleans compared as 1/0 (the engine's asNumber() coerces
+    // them). Needed to express Auto-Acknowledge's {Channel,Direct} ×
+    // {ZeroHop,MultiHop} matrix, where ZeroHop means hops == 0 AND NOT viaMqtt.
+    { value: 'isDM', label: 'Is a direct message (1 = yes, 0 = channel)' },
+    { value: 'viaMqtt', label: 'Arrived via MQTT (1 = yes, 0 = RF)' },
+    // #4340 Phase 4: derived, total (never NaN) form of the ZeroHop half of the
+    // matrix above — computed via Auto-Acknowledge's own autoAckIsZeroHop() on
+    // its own floored hop count, so a hopless packet (no hopStart) reads 1, not
+    // NaN. See triggerContext.ts buildMessageContext for the derivation.
+    { value: 'zeroHop', label: 'Direct RF, 0 hops (1 = yes; 0 = relayed or via MQTT)' },
   ],
   'trigger.telemetry': [{ value: 'value', label: 'Reading value' }, { value: 'nodeNum', label: 'Node #' }],
   'trigger.nodeUpdated': [{ value: 'nodeNum', label: 'Node #' }],
@@ -168,6 +235,9 @@ const NODE_NUMERIC: FieldOpt[] = [
 const NODE_STRING: FieldOpt[] = [
   { value: 'node.longName', label: 'Long name' }, { value: 'node.shortName', label: 'Short name' },
   { value: 'node.nodeId', label: 'Node id' }, { value: 'node.roleName', label: 'Role name (e.g. ROUTER)' },
+  // #4340 Phase 3 — see NODE_COMPLETENESS in engineContext.ts. Three states, so
+  // "complete or not yet known" is expressible with the `is one of` operator.
+  { value: 'node.completeness', label: 'Node info completeness (complete / incomplete / unknown)' },
 ];
 // Latest telemetry of a metric for the subject node.
 const TELEMETRY_FIELDS: FieldOpt[] = [
@@ -202,10 +272,17 @@ const NUMERIC_OP_OPTIONS = [
   { value: '>', label: '> greater than' }, { value: '<', label: '< less than' },
   { value: '>=', label: '≥ at least' }, { value: '<=', label: '≤ at most' },
 ];
-const STRING_OP_OPTIONS = [
+// Exported (one word) so autoAckParity.test.ts (#4340 Phase 3, WP5) can
+// cross-check these labels/values against conditionEvaluator.ts's stringCompare.
+export const STRING_OP_OPTIONS = [
   { value: 'contains', label: 'contains' }, { value: 'eq', label: 'equals' },
   { value: 'startsWith', label: 'starts with' }, { value: 'endsWith', label: 'ends with' },
   { value: 'regex', label: 'matches regex' }, { value: 'notContains', label: "doesn't contain" },
+  // #4340 Phase 3: membership in a comma/whitespace-separated list, mirroring
+  // Auto-Acknowledge's own autoAckIgnoredNodes parser (meshtasticManager.ts,
+  // separators + case-insensitivity) — see conditionEvaluator.ts's `in`/`notIn`.
+  { value: 'in', label: 'is one of (comma list)' },
+  { value: 'notIn', label: "isn't one of (comma list)" },
 ];
 
 // ─── Conditions (IF) ─────────────────────────────────────────────────────────
@@ -230,11 +307,39 @@ export const CONDITIONS: BlockDef[] = [
   {
     type: 'condition.string',
     label: 'Text comparison',
+    // NOTE: a condition block's `description` is not rendered — only the
+    // trigger's is (AutomationBuilder.tsx). Guidance for these operators has to
+    // live in a field's `help`, which is why the casing note sits on `op` below.
     description: 'Compare text — message text, node name, role name…',
     fields: [
       { name: 'field', label: 'Field', kind: 'fieldselect' },
-      { name: 'op', label: 'Operator', kind: 'select', options: STRING_OP_OPTIONS },
-      { name: 'value', label: 'Value', kind: 'text', tokens: true, placeholder: 'e.g. ROUTER' },
+      {
+        name: 'op', label: 'Operator', kind: 'select', options: STRING_OP_OPTIONS,
+        // Casing is NOT uniform across these operators, and nothing said so
+        // until a user hit it (#4507): stringCompare() lower-cases both sides
+        // for every operator except `eq`, `neq` and `regex`. Only `eq` and
+        // `regex` are named below because `neq` is deliberately absent from
+        // STRING_OP_OPTIONS — naming an operator the dropdown doesn't offer
+        // would be worse than saying nothing. See stringCompare() in
+        // server/services/automation/conditionEvaluator.ts.
+        help: '“Equals” and “matches regex” are case-sensitive. The other operators ignore case.',
+      },
+      // Two `value` variants sharing one param name: same stored key, so the
+      // typed value survives switching operators, while the regex case gets its
+      // own placeholder and help. They MUST stay mutually exclusive — both
+      // visible would render a duplicate input on a duplicate React key.
+      {
+        name: 'value', label: 'Value', kind: 'text', tokens: true, placeholder: 'e.g. ROUTER',
+        showIf: { field: 'op', notEquals: 'regex' },
+      },
+      // `(?i)` works because the evaluator compiles with RE2
+      // (src/utils/safeRegex.ts) — plain JS RegExp rejects inline flags.
+      {
+        name: 'value', label: 'Value', kind: 'text', tokens: true,
+        placeholder: 'e.g. (?i)^(test|ping)',
+        help: 'Case-sensitive. Prefix with (?i) to ignore case — e.g. (?i)^(test|ping).',
+        showIf: { field: 'op', equals: 'regex' },
+      },
     ],
   },
   {
@@ -308,8 +413,20 @@ export const ACTIONS: BlockDef[] = [
     type: 'action.tapback',
     label: 'Send a tapback (reaction)',
     description: 'React to the triggering message.',
+    // #4340: protocol/content emoji (the glyphs actually sent over the mesh), not UI
+    // iconography — UiIcon does not apply. Glyphs are interpolated from the shared
+    // table so they cannot drift.
     fields: [
-      { name: 'emoji', label: 'Emoji', kind: 'emoji', placeholder: '👍' },
+      {
+        // 'fixed' | 'hopCount' — see TapbackEmojiMode in src/types/automation.ts.
+        name: 'emojiMode', label: 'Emoji source', kind: 'select',
+        options: [
+          { value: 'fixed', label: 'A fixed emoji' },
+          { value: 'hopCount', label: `The message's hop count (${HOP_COUNT_EMOJIS[0]} direct, ${HOP_COUNT_EMOJIS[1]}–${HOP_COUNT_EMOJIS[HOP_EMOJI_MAX]})` },
+        ],
+        help: `Hop count reacts with ${HOP_COUNT_EMOJIS[0]} for a direct (0-hop) message and ${HOP_COUNT_EMOJIS[1]}–${HOP_COUNT_EMOJIS[HOP_EMOJI_MAX]} above, clamping at ${HOP_COUNT_EMOJIS[HOP_EMOJI_MAX]} — the same table Auto-Acknowledge uses. Triggers with no hop information (Schedule, System) record a skipped no-op.`,
+      },
+      { name: 'emoji', label: 'Emoji', kind: 'emoji', placeholder: '👍', showIf: { field: 'emojiMode', notEquals: 'hopCount' } },
       { name: 'sourceIds', label: 'Send via sources', kind: 'sendSourceMulti', help: 'Which radios send the reaction (MeshCore sources are skipped — tapbacks are Meshtastic-only). Leave none to use the source that triggered the automation — but a source IS required for source-less triggers like System events and Schedules.' },
     ],
   },
@@ -323,6 +440,14 @@ export const ACTIONS: BlockDef[] = [
       { name: 'channels', label: 'On channels', kind: 'channelMulti', help: 'Channels to post to, unified by name + key across your sources (the correct local slot is resolved per source). Leave none to use the triggering channel.' },
       { name: 'to', label: 'DM to node #', kind: 'text', tokens: true, placeholder: 'blank = channel; {{ trigger.from }} replies to sender', advanced: true },
       { name: 'replyToTrigger', label: 'Reply to the triggering message', kind: 'checkbox', advanced: true, help: 'Meshtastic: threads the reply as a tapback. MeshCore has no tapback, so instead it auto-prepends the @[sender]: mention (using {{ trigger.senderLabel }} — sender name, else channel name, else id) to your text, so you don’t have to write it yourself. An existing @[…] mention in your text = no change.' },
+      {
+        name: 'maxAttempts', label: 'DM resend attempts', kind: 'number', advanced: true,
+        placeholder: '1', // 1–3; mirrors SEND_MAX_ATTEMPTS_* in src/types/automation.ts.
+        // Only meaningful for a DM — the queue hardcodes 1 attempt for channel
+        // sends. Reuses Phase 2's showIf.truthy so an unset/blank/0 `to` hides it.
+        showIf: { field: 'to', truthy: true },
+        help: 'Resend this DM (1–3) until the recipient ACKs it — the same retry Auto-Acknowledge uses. Leave blank for a single send. Setting it routes the DM through the source’s outgoing queue, which also spaces sends 30 seconds apart. Meshtastic DMs only: ignored for channel messages and MeshCore.',
+      },
       {
         name: 'scopeMode', label: 'MeshCore scope', kind: 'select', advanced: true,
         options: [

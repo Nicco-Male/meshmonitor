@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import type { BetterSQLite3Database } from 'drizzle-orm/better-sqlite3';
 import { AutomationsRepository } from '../../../db/repositories/automations.js';
 import { AutomationVariablesRepository } from '../../../db/repositories/automationVariables.js';
@@ -302,6 +302,323 @@ describe('AutomationEngineService', () => {
     expect(calls).toHaveLength(2);
   });
 
+  // ── cooldownScope (#4340 Phase 2) ───────────────────────────────────────────
+  describe('cooldownScope (#4340 Phase 2)', () => {
+    it('(a) headline: two senders on one channel cool down independently under node scope', async () => {
+      const { calls, deps } = recorder();
+      await createEnabled('ping', {
+        version: 1,
+        nodes: [
+          { id: 't', type: 'trigger.message', params: { textContains: 'ping', cooldownSeconds: 60, cooldownScope: 'node' } },
+          { id: 'tap', type: 'action.tapback', params: { emoji: '👍' } },
+        ],
+        edges: [{ from: 't', to: 'tap' }],
+      });
+      const engine = engineWith(deps);
+      await engine.load();
+
+      expect(await engine.onMessage(message({ fromNodeNum: 111 }), 'default')).toBe(1); // node 111 fires (t0)
+      clock += 5_000;
+      expect(await engine.onMessage(message({ fromNodeNum: 222 }), 'default')).toBe(1); // node 222 fires — same window, unaffected
+      clock += 15_000;
+      expect(await engine.onMessage(message({ fromNodeNum: 111 }), 'default')).toBe(0); // node 111 still cooling down (t0+20s)
+      clock += 41_000;
+      expect(await engine.onMessage(message({ fromNodeNum: 111 }), 'default')).toBe(1); // node 111 past its window (t0+61s)
+      expect(calls).toHaveLength(3);
+    });
+
+    it('(b) regression: cooldownScope absent reproduces per-automation behaviour exactly', async () => {
+      const { calls, deps } = recorder();
+      await createEnabled('ping', {
+        version: 1,
+        nodes: [
+          // No cooldownScope param at all — the pre-Phase-2 shape.
+          { id: 't', type: 'trigger.message', params: { textContains: 'ping', cooldownSeconds: 60 } },
+          { id: 'tap', type: 'action.tapback', params: { emoji: '👍' } },
+        ],
+        edges: [{ from: 't', to: 'tap' }],
+      });
+      const engine = engineWith(deps);
+      await engine.load();
+
+      expect(await engine.onMessage(message({ fromNodeNum: 111 }), 'default')).toBe(1); // fires (t0)
+      clock += 5_000;
+      // A DIFFERENT node's message is suppressed too — automation-wide, not per-node.
+      expect(await engine.onMessage(message({ fromNodeNum: 222 }), 'default')).toBe(0);
+      clock += 56_000;
+      expect(await engine.onMessage(message({ fromNodeNum: 111 }), 'default')).toBe(1); // past cooldown (t0+61s)
+      expect(calls).toHaveLength(2);
+    });
+
+    it('(c) explicit cooldownScope: automation behaves identically to absent', async () => {
+      const { calls, deps } = recorder();
+      await createEnabled('ping', {
+        version: 1,
+        nodes: [
+          { id: 't', type: 'trigger.message', params: { textContains: 'ping', cooldownSeconds: 60, cooldownScope: 'automation' } },
+          { id: 'tap', type: 'action.tapback', params: { emoji: '👍' } },
+        ],
+        edges: [{ from: 't', to: 'tap' }],
+      });
+      const engine = engineWith(deps);
+      await engine.load();
+
+      expect(await engine.onMessage(message({ fromNodeNum: 111 }), 'default')).toBe(1);
+      clock += 5_000;
+      expect(await engine.onMessage(message({ fromNodeNum: 222 }), 'default')).toBe(0);
+      clock += 56_000;
+      expect(await engine.onMessage(message({ fromNodeNum: 111 }), 'default')).toBe(1);
+      expect(calls).toHaveLength(2);
+    });
+
+    it('(d) sourceNode: the same node on two different sources cools down independently', async () => {
+      const { calls, deps } = recorder();
+      await createEnabled('ping', {
+        version: 1,
+        nodes: [
+          { id: 't', type: 'trigger.message', params: { textContains: 'ping', cooldownSeconds: 60, cooldownScope: 'sourceNode' } },
+          { id: 'tap', type: 'action.tapback', params: { emoji: '👍' } },
+        ],
+        edges: [{ from: 't', to: 'tap' }],
+      });
+      const engine = engineWith(deps);
+      await engine.load();
+
+      expect(await engine.onMessage(message({ fromNodeNum: 111 }), 'a')).toBe(1); // fires on source 'a'
+      clock += 1_000;
+      expect(await engine.onMessage(message({ fromNodeNum: 111 }), 'b')).toBe(1); // same node, different source — fires
+      clock += 1_000;
+      expect(await engine.onMessage(message({ fromNodeNum: 111 }), 'a')).toBe(0); // repeat on 'a' — still cooling down
+      expect(calls).toHaveLength(2);
+    });
+
+    // (e) Spec §6 describes 'bogus' as degrading to automation-wide at RUNTIME —
+    // that is parseCooldownScope's own contract, exercised directly by WP1's
+    // src/types/automation.test.ts. In this engine, though, `load()`
+    // unconditionally runs every stored graph through validateAutomationGraph
+    // (WP1 §2.2, orchestrator-approved §9.1 guard), and that guard rejects an
+    // unrecognised params.cooldownScope on ANY trigger node — so an automation
+    // with cooldownScope: 'bogus' never reaches parseCooldownScope at all; it is
+    // skipped at load with a warning, same as any other structurally-invalid
+    // graph. That is a stricter (and safer) outcome than "silently degrades" —
+    // documented here rather than asserting the spec's literal wording, which
+    // does not hold given WP1's landed validation.
+    it('(e) an unrecognised cooldownScope fails graph validation and the automation never loads', async () => {
+      const { calls, deps } = recorder();
+      await createEnabled('ping', {
+        version: 1,
+        nodes: [
+          { id: 't', type: 'trigger.message', params: { textContains: 'ping', cooldownSeconds: 60, cooldownScope: 'bogus' } },
+          { id: 'tap', type: 'action.tapback', params: { emoji: '👍' } },
+        ],
+        edges: [{ from: 't', to: 'tap' }],
+      });
+      const engine = engineWith(deps);
+      await engine.load();
+
+      expect(engine.countFor('trigger.message')).toBe(0);
+      expect(await engine.onMessage(message({ fromNodeNum: 111 }), 'default')).toBe(0);
+      expect(calls).toHaveLength(0);
+    });
+
+    it('(f1) trace: message dispatch under node scope names the cooling-down node', async () => {
+      const got: any[] = [];
+      automationTraceBus.setSink((_id, payload) => got.push(payload));
+      const a = await createEnabled('ping', {
+        version: 1,
+        nodes: [
+          { id: 't', type: 'trigger.message', params: { textContains: 'ping', cooldownSeconds: 60, cooldownScope: 'node' } },
+          { id: 'tap', type: 'action.tapback', params: { emoji: '👍' } },
+        ],
+        edges: [{ from: 't', to: 'tap' }],
+      });
+      const engine = engineWith(recorder().deps);
+      await engine.load();
+      automationTraceBus.arm(a.id, 'sock1', FAR_FUTURE);
+
+      await engine.onMessage(message({ fromNodeNum: 111, text: 'ping' }), 'default'); // fires
+      clock += 5_000;
+      await engine.onMessage(message({ fromNodeNum: 111, text: 'ping' }), 'default'); // suppressed
+      const cooldownEvent = got.find((g) => g.outcome === 'cooldown');
+      expect(cooldownEvent.reason).toMatch(/cooldown active/);
+      expect(cooldownEvent.reason).toMatch(/node 111/);
+    });
+
+    it('(f2) trace: onSchedule under node scope names automation-wide (no subject node)', async () => {
+      const got: any[] = [];
+      automationTraceBus.setSink((_id, payload) => got.push(payload));
+      const a = await createEnabled('cron', {
+        version: 1,
+        nodes: [
+          { id: 't', type: 'trigger.schedule', params: { cron: '* * * * *', cooldownSeconds: 60, cooldownScope: 'node' } },
+          { id: 'n', type: 'action.notify', params: { body: 'tick' } },
+        ],
+        edges: [{ from: 't', to: 'n' }],
+      });
+      const engine = engineWith(recorder().deps);
+      await engine.load();
+      automationTraceBus.arm(a.id, 'sock1', FAR_FUTURE);
+
+      await engine.onSchedule(a.id); // fires (t0)
+      clock += 5_000;
+      await engine.onSchedule(a.id); // within cooldown
+      const cooldownEvent = got.find((g) => g.outcome === 'cooldown');
+      expect(cooldownEvent.reason).toMatch(/cooldown active/);
+      expect(cooldownEvent.reason).toMatch(/automation-wide/);
+    });
+
+    it('(f3) trace: checkGeofences under node scope names the moving node', async () => {
+      const got: any[] = [];
+      automationTraceBus.setSink((_id, payload) => got.push(payload));
+      const a = await createEnabled('geo-enter', {
+        version: 1,
+        nodes: [
+          { id: 't', type: 'trigger.geofence', params: { event: 'enter', lat: 0, lon: 0, radiusKm: 5, cooldownSeconds: 60, cooldownScope: 'node' } },
+          { id: 'n', type: 'action.notify', params: { body: 'entered' } },
+        ],
+        edges: [{ from: 't', to: 'n' }],
+      });
+      const pos = { lat: 1, lon: 0 }; // outside
+      const geoData = { getNode: async () => ({ nodeNum: 5, latitude: pos.lat, longitude: pos.lon }), getTelemetry: async () => null };
+      const engine = new AutomationEngineService({ automationsRepo: autos, varResolver: resolver, deps: recorder().deps, data: geoData, now: () => clock });
+      await engine.load();
+      automationTraceBus.arm(a.id, 'sock1', FAR_FUTURE);
+
+      await engine.checkGeofences(5, 'default'); // baseline (outside)
+      pos.lat = 0.01; // move inside
+      await engine.checkGeofences(5, 'default'); // enter → fires, marks node 5
+      pos.lat = 1; // move outside (mode is 'enter'; not a fire, just updates state)
+      await engine.checkGeofences(5, 'default');
+      pos.lat = 0.01; // move inside again — same cooldown window
+      await engine.checkGeofences(5, 'default');
+
+      const cooldownEvent = got.find((g) => g.outcome === 'cooldown');
+      expect(cooldownEvent).toBeDefined();
+      expect(cooldownEvent.reason).toMatch(/cooldown active/);
+      expect(cooldownEvent.reason).toMatch(/node 5/);
+    });
+
+    it('(g1) MeshCore: two DMs from different pubkeys under node scope both fire', async () => {
+      const { calls, deps } = recorder();
+      await createEnabled('mc-ping', {
+        version: 1,
+        nodes: [
+          { id: 't', type: 'trigger.message', params: { textContains: 'ping', cooldownSeconds: 60, cooldownScope: 'node' } },
+          { id: 's', type: 'action.sendMessage', params: { text: 'pong' } },
+        ],
+        edges: [{ from: 't', to: 's' }],
+      });
+      const engine = engineWith(deps);
+      await engine.load();
+
+      expect(await engine.onMeshCoreMessage(mcMessage({ fromPublicKey: 'nodeA', text: 'ping' }), 'default')).toBe(1);
+      clock += 5_000;
+      expect(await engine.onMeshCoreMessage(mcMessage({ fromPublicKey: 'nodeB', text: 'ping' }), 'default')).toBe(1);
+      clock += 5_000;
+      expect(await engine.onMeshCoreMessage(mcMessage({ fromPublicKey: 'nodeA', text: 'ping' }), 'default')).toBe(0); // still cooling
+      expect(calls).toHaveLength(2);
+    });
+
+    it('(g2) MeshCore: two channel messages under node scope degrade to automation-wide — second suppressed', async () => {
+      const { calls, deps } = recorder();
+      await createEnabled('mc-ping-ch', {
+        version: 1,
+        nodes: [
+          { id: 't', type: 'trigger.message', params: { textContains: 'ping', cooldownSeconds: 60, cooldownScope: 'node' } },
+          { id: 's', type: 'action.sendMessage', params: { text: 'pong' } },
+        ],
+        edges: [{ from: 't', to: 's' }],
+      });
+      const engine = engineWith(deps);
+      await engine.load();
+
+      // Both on channel slot 0 — fromPublicKey is the synthetic 'channel-0' key,
+      // which subjectKeyOf() never uses, so both events share the degraded
+      // automation-wide key even though they'd naively look like two "senders".
+      expect(await engine.onMeshCoreMessage(mcMessage({ fromPublicKey: 'channel-0', text: 'ping' }), 'default')).toBe(1);
+      clock += 5_000;
+      expect(await engine.onMeshCoreMessage(mcMessage({ fromPublicKey: 'channel-0', text: 'ping' }), 'default')).toBe(0);
+      expect(calls).toHaveLength(1);
+    });
+
+    it('(h) cooldownSeconds: 0 with cooldownScope: node fires on every event', async () => {
+      const { calls, deps } = recorder();
+      await createEnabled('ping', {
+        version: 1,
+        nodes: [
+          { id: 't', type: 'trigger.message', params: { textContains: 'ping', cooldownSeconds: 0, cooldownScope: 'node' } },
+          { id: 'tap', type: 'action.tapback', params: { emoji: '👍' } },
+        ],
+        edges: [{ from: 't', to: 'tap' }],
+      });
+      const engine = engineWith(deps);
+      await engine.load();
+
+      expect(await engine.onMessage(message({ fromNodeNum: 111 }), 'default')).toBe(1);
+      expect(await engine.onMessage(message({ fromNodeNum: 111 }), 'default')).toBe(1);
+      expect(await engine.onMessage(message({ fromNodeNum: 111 }), 'default')).toBe(1);
+      expect(calls).toHaveLength(3);
+    });
+
+    it('(i) eviction: a node inside its window stays suppressed after driving the key set past its bound', async () => {
+      const { calls, deps } = recorder();
+      await createEnabled('ping', {
+        version: 1,
+        nodes: [
+          { id: 't', type: 'trigger.message', params: { textContains: 'ping', cooldownSeconds: 1, cooldownScope: 'node' } },
+          { id: 'tap', type: 'action.tapback', params: { emoji: '👍' } },
+        ],
+        edges: [{ from: 't', to: 'tap' }],
+      });
+      const engine = engineWith(deps);
+      await engine.load();
+
+      // node 999999 fires and starts its 1s cooldown window.
+      expect(await engine.onMessage(message({ fromNodeNum: 999_999 }), 'default')).toBe(1);
+      // Drive > COOLDOWN_KEYS_MAX (4096) distinct senders through, one per ms —
+      // well inside node 999999's 1s window for the earliest ones, well past it
+      // for the bulk, exercising both the exact-expiry prune and the hard trim.
+      for (let i = 0; i < 4200; i++) {
+        clock += 1;
+        await engine.onMessage(message({ fromNodeNum: 1_000_000 + i }), 'default');
+      }
+      // node 999999 is now WAY past its 1s window — it must fire again (behaviour,
+      // not map size, is what eviction must preserve).
+      expect(await engine.onMessage(message({ fromNodeNum: 999_999 }), 'default')).toBe(1);
+
+      // Re-verify the suppression half of the contract still holds post-eviction:
+      // a fresh node fires once, then is suppressed inside its own window.
+      const freshCalls = calls.length;
+      expect(await engine.onMessage(message({ fromNodeNum: 2_000_000 }), 'default')).toBe(1);
+      expect(await engine.onMessage(message({ fromNodeNum: 2_000_000 }), 'default')).toBe(0);
+      expect(calls.length).toBe(freshCalls + 1);
+    });
+
+    it('(j) load-prune: disabling and re-enabling inside the cooldown window lets it fire immediately', async () => {
+      const { calls, deps } = recorder();
+      const a = await createEnabled('ping', {
+        version: 1,
+        nodes: [
+          { id: 't', type: 'trigger.message', params: { textContains: 'ping', cooldownSeconds: 60, cooldownScope: 'node' } },
+          { id: 'tap', type: 'action.tapback', params: { emoji: '👍' } },
+        ],
+        edges: [{ from: 't', to: 'tap' }],
+      });
+      const engine = engineWith(deps);
+      await engine.load();
+
+      expect(await engine.onMessage(message({ fromNodeNum: 111 }), 'default')).toBe(1); // fires, marks node 111
+      await autos.setEnabled(a.id, false);
+      await engine.load(); // automation drops out of the index → its cooldown state is pruned
+      await autos.setEnabled(a.id, true);
+      await engine.load(); // re-enabled with a clean slate
+
+      clock += 5_000; // still well inside the original 60s window
+      expect(await engine.onMessage(message({ fromNodeNum: 111 }), 'default')).toBe(1); // fires immediately
+      expect(calls).toHaveLength(2);
+    });
+  });
+
   it('welcome-once anti-spam via a per-node flag', async () => {
     const { calls, deps } = recorder();
     await varsRepo.createVariable({ name: 'welcomed', type: 'flag', scope: 'node' });
@@ -468,6 +785,116 @@ describe('AutomationEngineService', () => {
     expect(await engine.checkGeofences(9, 'default')).toBe(1); // enter
     expect(await engine.checkGeofences(9, 'default')).toBe(0); // still inside → no re-fire
     expect(calls.filter((c) => c.fn === 'notify')).toHaveLength(1);
+  });
+
+  // ─── geofenceState bounds (#4399) ──────────────────────────────────────────
+
+  it('(geofence load-prune) disabling then re-enabling drops the stale baseline', async () => {
+    const { calls, deps } = recorder();
+    const a = await createEnabled('geo-reload', {
+      version: 1,
+      nodes: [
+        { id: 't', type: 'trigger.geofence', params: { event: 'enter', lat: 0, lon: 0, radiusKm: 5 } },
+        { id: 'n', type: 'action.notify', params: { body: 'entered' } },
+      ],
+      edges: [{ from: 't', to: 'n' }],
+    });
+    const pos = { lat: 1, lon: 0 }; // outside
+    const geoData = { getNode: async () => ({ nodeNum: 42, latitude: pos.lat, longitude: pos.lon }), getTelemetry: async () => null };
+    const engine = new AutomationEngineService({ automationsRepo: autos, varResolver: resolver, deps, data: geoData, now: () => clock });
+    await engine.load();
+
+    expect(await engine.checkGeofences(42, 'default')).toBe(0); // baseline (outside)
+    pos.lat = 0.01; // move inside — would fire on the next check if the baseline survives
+
+    await autos.setEnabled(a.id, false);
+    await engine.load(); // automation drops out of the index → its geofence state is pruned, like lastFired
+    await autos.setEnabled(a.id, true);
+    await engine.load(); // re-enabled with a clean slate
+
+    // With the stale baseline dropped, this reads as a fresh first sighting
+    // (already inside) rather than an outside→inside transition — it does NOT fire.
+    expect(await engine.checkGeofences(42, 'default')).toBe(0);
+    expect(calls).toHaveLength(0);
+  });
+
+  it('(geofence load) reloading a still-enabled automation preserves its baseline', async () => {
+    const { calls, deps } = recorder();
+    await createEnabled('geo-reload-live', {
+      version: 1,
+      nodes: [
+        { id: 't', type: 'trigger.geofence', params: { event: 'enter', lat: 0, lon: 0, radiusKm: 5 } },
+        { id: 'n', type: 'action.notify', params: { body: 'entered' } },
+      ],
+      edges: [{ from: 't', to: 'n' }],
+    });
+    const pos = { lat: 1, lon: 0 }; // outside
+    const geoData = { getNode: async () => ({ nodeNum: 43, latitude: pos.lat, longitude: pos.lon }), getTelemetry: async () => null };
+    const engine = new AutomationEngineService({ automationsRepo: autos, varResolver: resolver, deps, data: geoData, now: () => clock });
+    await engine.load();
+
+    expect(await engine.checkGeofences(43, 'default')).toBe(0); // baseline (outside)
+    await engine.load(); // reload; the automation never left the index
+
+    pos.lat = 0.01; // move inside
+    expect(await engine.checkGeofences(43, 'default')).toBe(1); // enter fires — baseline survived the reload
+    expect(calls).toHaveLength(1);
+  });
+
+  it('(geofence eviction) a recently-touched baseline survives driving the per-automation node set past its bound; a stale one is dropped and logged', async () => {
+    const { deps } = recorder();
+    await createEnabled('geo-evict', {
+      version: 1,
+      nodes: [
+        { id: 't', type: 'trigger.geofence', params: { event: 'enter', lat: 0, lon: 0, radiusKm: 5 } },
+        { id: 'n', type: 'action.notify', params: { body: 'entered' } },
+      ],
+      edges: [{ from: 't', to: 'n' }],
+    });
+    const OUTSIDE = 1;
+    const INSIDE = 0.01;
+    const positions = new Map<number, number>();
+    const geoData = {
+      getNode: async (_sourceId: string | null, nodeNum: number) =>
+        ({ nodeNum, latitude: positions.get(nodeNum) ?? OUTSIDE, longitude: 0 }),
+      getTelemetry: async () => null,
+    };
+    const engine = new AutomationEngineService({ automationsRepo: autos, varResolver: resolver, deps, data: geoData, now: () => clock });
+    await engine.load();
+
+    const loggerModule = await import('../../../utils/logger.js');
+    const warnSpy = vi.spyOn(loggerModule.logger, 'warn');
+
+    // OLD is touched once, before anything else — it will be the least-recently
+    // touched entry once the flood below pushes the per-automation node set past
+    // GEOFENCE_STATE_MAX (4096), so it must be the one evicted.
+    const OLD_NUM = 500_000;
+    expect(await engine.checkGeofences(OLD_NUM, 'default')).toBe(0); // baseline (outside)
+
+    // Drive > GEOFENCE_STATE_MAX (4096) distinct nodes through, one per ms, all
+    // establishing an outside baseline. RECENT_NUM (the last one touched) must
+    // survive any trim pass — it is always the newest entry at the time it lands.
+    let RECENT_NUM = OLD_NUM;
+    for (let i = 0; i < 4200; i++) {
+      clock += 1;
+      RECENT_NUM = 1_000_000 + i;
+      expect(await engine.checkGeofences(RECENT_NUM, 'default')).toBe(0); // baseline
+    }
+
+    // The eviction warning fired at least once, naming the trade-off.
+    expect(warnSpy).toHaveBeenCalled();
+    expect(warnSpy.mock.calls.some((c) => String(c[0]).includes('geofence state trimmed'))).toBe(true);
+
+    // OLD was evicted: its baseline is gone, so moving it inside now reads as a
+    // fresh first sighting (not a transition) — the documented, accepted miss.
+    clock += 1;
+    positions.set(OLD_NUM, INSIDE);
+    expect(await engine.checkGeofences(OLD_NUM, 'default')).toBe(0);
+
+    // RECENT survived: moving it inside is correctly recognised as outside→inside.
+    clock += 1;
+    positions.set(RECENT_NUM, INSIDE);
+    expect(await engine.checkGeofences(RECENT_NUM, 'default')).toBe(1);
   });
 
   // ─── schedule (cron) ───────────────────────────────────────────────────────

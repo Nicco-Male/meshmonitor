@@ -28,7 +28,7 @@ import { useWidgetMode } from '../hooks/useWidgetMode';
 import { useWidgetRange } from '../hooks/useWidgetRange';
 import { useSource } from '../contexts/SourceContext';
 import { getLatestValue } from '../utils/telemetry';
-import { unitScale } from '../utils/telemetryFormat';
+import { telemetryDisplayScale } from '../utils/telemetryFormat';
 import TelemetryGauge from './TelemetryGauge';
 import TelemetryNumericLabel from './TelemetryNumericLabel';
 import { UiIcon } from './icons';
@@ -559,17 +559,15 @@ const TelemetryChart: React.FC<TelemetryChartProps> = React.memo(
 
     // Prepare chart data
     const chartData = prepareChartData(telemetryData, isTemperature, temperatureUnit, solarEstimates, globalMinTime, timeFormat);
-    // Auto-scale current/power so a sub-1 A/W series reads as mA/mW (#3261).
-    // One factor for the whole series (chosen from its largest magnitude)
-    // keeps every point, the axis, the gauge range and the numeric readout on
-    // the same prefix. Temperature keeps its own C/F handling below.
-    const baseUnit = telemetryData[0]?.unit || '';
-    const seriesMaxAbs = telemetryData.reduce(
-      (m, d) => (typeof d.value === 'number' ? Math.max(m, Math.abs(d.value)) : m),
-      0
+    // Humanize uptime and auto-scale current/power (#3261). Shared with the
+    // per-node graphs (TelemetryGraphs) so the two surfaces cannot drift.
+    // Temperature keeps its own C/F handling below.
+    const display = telemetryDisplayScale(
+      favorite.telemetryType,
+      telemetryData.map(d => d.value),
+      telemetryData[0]?.unit || ''
     );
-    const valueScale = isTemperature ? null : unitScale(baseUnit, seriesMaxAbs);
-    const unit = isTemperature ? getTemperatureUnit(temperatureUnit) : (valueScale ? valueScale.unit : baseUnit);
+    const unit = isTemperature ? getTemperatureUnit(temperatureUnit) : display.unit;
 
     // For combined paxcounter chart, merge BLE data
     if (isPaxcounterCombined) {
@@ -600,8 +598,8 @@ const TelemetryChart: React.FC<TelemetryChartProps> = React.memo(
 
     // Apply the chart's display scale to the plotted series. The solar overlay
     // lives on its own axis (watt-hours) and is left untouched.
-    const scaledChartData = valueScale && valueScale.factor !== 1
-      ? chartData.map((d) => ({ ...d, value: d.value == null ? d.value : d.value * valueScale.factor }))
+    const scaledChartData = !isTemperature && display.factor !== 1
+      ? chartData.map((d) => ({ ...d, value: d.value == null ? d.value : d.value * display.factor }))
       : chartData;
 
     // Gauge/numeric modes display a single raw value, so convert it (and the
@@ -609,15 +607,15 @@ const TelemetryChart: React.FC<TelemetryChartProps> = React.memo(
     // for temperature, the stored A/W for current/power), so edits made in the
     // displayed unit are converted back before saving.
     const toDisplay = (v: number) =>
-      isTemperature
-        ? formatTemperature(v, 'C', temperatureUnit)
-        : v * (valueScale ? valueScale.factor : 1);
+      isTemperature ? formatTemperature(v, 'C', temperatureUnit) : v * display.factor;
     const toStored = (v: number) =>
-      isTemperature
-        ? formatTemperature(v, temperatureUnit, 'C')
-        : v / (valueScale ? valueScale.factor : 1);
+      isTemperature ? formatTemperature(v, temperatureUnit, 'C') : v / display.factor;
     const handleRangeChange = (r: { min: number; max: number }) =>
       setRange({ min: toStored(r.min), max: toStored(r.max) });
+
+    // Display formatter for uptime metrics: humanize seconds in the gauge,
+    // the numeric label, the Y-axis ticks and the tooltip (#3261).
+    const uptimeFormatter = display.formatValue;
 
     return (
       <div ref={setNodeRef} style={style} className="dashboard-chart-container">
@@ -685,6 +683,7 @@ const TelemetryChart: React.FC<TelemetryChartProps> = React.memo(
               timestamp={latest.timestamp}
               nodeId={favorite.nodeId}
               onRangeChange={handleRangeChange}
+              formatValue={uptimeFormatter}
             />
           ) : (
             <div className="dashboard-no-data">{t('dashboard.no_chart_data')}</div>
@@ -696,6 +695,7 @@ const TelemetryChart: React.FC<TelemetryChartProps> = React.memo(
               unit={unit}
               color={color}
               timestamp={latest.timestamp}
+              formatValue={uptimeFormatter}
             />
           ) : (
             <div className="dashboard-no-data">{t('dashboard.no_chart_data')}</div>
@@ -711,7 +711,12 @@ const TelemetryChart: React.FC<TelemetryChartProps> = React.memo(
                 tick={{ fontSize: 12 }}
                 tickFormatter={timestamp => formatChartAxisTimestamp(timestamp, globalTimeRange, timeFormat)}
               />
-              <YAxis yAxisId="left" tick={{ fontSize: 12 }} domain={['auto', 'auto']} />
+              <YAxis
+                yAxisId="left"
+                tick={{ fontSize: 12 }}
+                domain={['auto', 'auto']}
+                tickFormatter={uptimeFormatter}
+              />
               <YAxis yAxisId="right" orientation="right" tick={{ fontSize: 12 }} domain={['auto', 'auto']} hide={true} />
               <Tooltip
                 contentStyle={{
@@ -721,6 +726,15 @@ const TelemetryChart: React.FC<TelemetryChartProps> = React.memo(
                   color: '#cdd6f4',
                 }}
                 labelStyle={{ color: '#cdd6f4' }}
+                formatter={
+                  uptimeFormatter
+                    ? (value, name) =>
+                        // Leave the solar overlay (watt-hours) untouched.
+                        name === 'solarEstimate' || typeof value !== 'number'
+                          ? value
+                          : uptimeFormatter(value)
+                    : undefined
+                }
                 labelFormatter={value => {
                   const date = new Date(value);
                   return date.toLocaleString([], {

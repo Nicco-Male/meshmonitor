@@ -18,6 +18,7 @@ import { logger } from '../utils/logger.js';
 import { transportColumnForPacket } from '../utils/nodeTransport.js';
 import { getEnvironmentConfig } from './config/environment.js';
 import { notificationService } from './services/notificationService.js';
+import { getMaxNodeAgeHours } from './services/nodeDisplaySettings.js';
 import { deadDropService, nodeIdHex } from './services/deadDropService.js';
 import { serverEventNotificationService } from './services/serverEventNotificationService.js';
 import packetLogService from './services/packetLogService.js';
@@ -50,6 +51,7 @@ import { shouldGateAutomations, averageStrongestNeighborUtilization, DEFAULT_AIR
 import { resolveLastHopName } from './utils/lastHop.js';
 import { resolveLastHeardSec } from './utils/replayGuard.js';
 import { autoAckIsZeroHop, autoAckCellKey, resolveAutoAckReplyRouting } from './utils/autoAckDecision.js';
+import { hopCountEmoji, HOP_COUNT_EMOJIS } from '../utils/hopEmoji.js';
 import { scriptDependencyEnv } from './utils/scriptRunner.js';
 import { canonicalMessageTime, plausibleRxTime } from './utils/messageTime.js';
 import { canonicalTelemetryType, canonicalTelemetryUnit } from './utils/telemetryKeys.js';
@@ -59,7 +61,7 @@ import { migrateAutomationChannels } from './utils/automationChannelMigration.js
 import { detectChannelMoves } from './utils/channelMoveDetection.js';
 import { detectLocalNodeSpoof, SentPacketIdCache, type SpoofDetectionResult } from './utils/spoofDetection.js';
 import { applyHomoglyphOptimization } from '../utils/homoglyph.js';
-import { PortNum, RoutingError, isPkiError, getRoutingErrorName, CHANNEL_DB_OFFSET, TransportMechanism, resolveRadioPacketTransport, isViaMqtt, MIN_TRACEROUTE_INTERVAL_MS, StoreForwardRequestResponse, getStoreForwardRequestResponseName } from './constants/meshtastic.js';
+import { PortNum, RoutingError, isPkiError, getRoutingErrorName, CHANNEL_DB_OFFSET, TransportMechanism, resolveRadioPacketTransport, isViaMqtt, MIN_TRACEROUTE_INTERVAL_MS, StoreForwardRequestResponse, getStoreForwardRequestResponseName, isUdpBroadcastEnabled, resolveHopLimit } from './constants/meshtastic.js';
 import { normalizeChannelRole } from './constants/channelRole.js';
 import { createRequire } from 'module';
 import { validateCron, scheduleCron, type CronJob } from './utils/cronScheduler.js';
@@ -266,6 +268,14 @@ export interface DeviceInfo {
   altitudeOverride?: number;
   positionOverrideIsPrivate?: boolean;
   positionIsOverride?: boolean;
+  /**
+   * True when `position` holds a trilaterated estimate from the global
+   * `estimated_positions` table rather than a device-reported GPS fix (#4432).
+   * Set by enhanceNodeForClient; mutually exclusive with positionIsOverride.
+   */
+  positionIsEstimated?: boolean;
+  /** Radius of the estimate in km, when known. Only set with positionIsEstimated. */
+  positionEstimateUncertaintyKm?: number;
   hideFromMap?: boolean;
   isStoreForwardServer?: boolean;
 }
@@ -403,6 +413,23 @@ interface PendingTelemetryRequest {
   packetIds: Set<number>; // every packet id belonging to this logical request
   retryTimers: Array<ReturnType<typeof setTimeout>>;
 }
+
+/**
+ * Bounds for `autoAckCooldowns` (#4399). It was previously never evicted at
+ * all — it got away with that because it is per-manager (per-source) and
+ * bounded in practice by one radio's NodeDB, but it has no upper bound in
+ * code, and an MQTT-fed source can see far more distinct nodes.
+ *
+ * Shape copied from the Automation Engine's cooldown-key trim
+ * (automationEngineService.ts COOLDOWN_KEYS_MAX/TRIM_TO, #4396): an exact
+ * expiry pass first, since an auto-ack cooldown entry older than the current
+ * `autoAckCooldownSeconds` window can never suppress anything again — deleting
+ * it is provably behaviour-neutral — with a high-water trim only as a backstop
+ * for the pathological case of more than TRIM_TO distinct nodes acking inside
+ * a single window.
+ */
+const AUTO_ACK_COOLDOWNS_MAX = 4096;
+const AUTO_ACK_COOLDOWNS_TRIM_TO = 2048;
 
 class MeshtasticManager implements ISourceManager {
   public sourceId: string;
@@ -713,7 +740,7 @@ class MeshtasticManager implements ISourceManager {
   private localStatsInterval: NodeJS.Timeout | null = null;
   private timeOffsetSamples: number[] = [];
   private timeOffsetInterval: NodeJS.Timeout | null = null;
-  private localStatsIntervalMinutes: number = 15;  // Default 5 minutes
+  private localStatsIntervalMinutes: number = 15;  // Default 15 minutes
   private timerCronJobs: Map<string, CronJob> = new Map();
   private geofenceNodeState: Map<string, Set<number>> = new Map(); // geofenceId -> set of nodeNums currently inside
   private geofenceWhileInsideTimers: Map<string, NodeJS.Timeout> = new Map(); // geofenceId -> interval timer
@@ -778,6 +805,9 @@ class MeshtasticManager implements ISourceManager {
     hasWifi?: boolean;
     hasEthernet?: boolean;
     hasBluetooth?: boolean;
+    // #3923: firmware 2.8 build capability — XEdDSA signature verification
+    // compiled in. Distinguishes "cannot sign" from "did not sign this packet".
+    hasXeddsa?: boolean;
     // #3684: User capability flags from the local node's NodeInfo, surfaced to the
     // frontend Config tab via getCurrentConfig().localNodeInfo.
     isUnmessagable?: boolean;
@@ -821,7 +851,7 @@ class MeshtasticManager implements ISourceManager {
   private favoritesSupportCache: { version: string; result: boolean } | null = null;
   private cachedAutoAckRegex: { pattern: string; regex: RegExp } | null = null;  // Cached compiled regex
 
-  private autoAckCooldowns: Map<number, number> = new Map(); // nodeNum -> lastResponseTimestamp
+  private autoAckCooldowns: Map<number, number> = new Map(); // nodeNum -> lastResponseTimestamp; bounded, see pruneAutoAckCooldowns (#4399)
   private autoAckProcessedPackets: Set<number> = new Set(); // packetIds already auto-acked (dedup guard)
   private autoResponderCooldowns: Map<string, number> = new Map(); // "triggerIndex:nodeNum" -> lastResponseTimestamp
   private autoResponderProcessedPackets: Set<number> = new Set(); // packetIds already auto-responded (dedup guard)
@@ -846,6 +876,18 @@ class MeshtasticManager implements ISourceManager {
   // favoritesService.ts's header comment for the full rationale.
   private autoFavoritingNodes = new Set<number>();  // Track nodes currently being auto-favorited
   private deviceNodeNums: Set<number> = new Set();  // Nodes in the connected radio's local database
+  /**
+   * Nodes we have positive evidence the radio already holds a PUBLIC KEY for
+   * (issue #4368). Deliberately distinct from `deviceNodeNums`, which only says
+   * the radio knows the node exists — it can know a node without holding its
+   * key, and guarding on it alone would break PKI DMs in that case.
+   *
+   * Gates `pushContactToRadio`. Sending `add_contact` is not free: the firmware
+   * favorites the contact in `NodeDB::addFromContact()` to protect it from
+   * NodeDB eviction, so re-pushing before every DM re-favorited every
+   * recipient. Push only when the radio actually needs the key.
+   */
+  private deviceContactKeyNums: Set<number> = new Set();
   // autoFavoriteSweepRunning moved to FavoritesService (#3962 Phase 4.2a PR4 §4c) — no pinned test reaches into it.
   private rebootMergeInProgress = false;  // Guard against broadcasts during node identity merge
   private lastHeapPurgeAt: number | null = null;  // Timestamp of last auto heap purge
@@ -1662,6 +1704,9 @@ class MeshtasticManager implements ISourceManager {
       this.initConfigCache = [];
       this.startConfigCapture();
       this.deviceNodeNums.clear();
+      // Key evidence is per-connection: a different radio (or one whose NodeDB
+      // was wiped while we were away) may not hold the keys the last one did.
+      this.deviceContactKeyNums.clear();
       this.channel0Exists = false;  // Reset channel 0 cache on reconnect
 
       // Snapshot channel state before config sync for migration detection (#2425)
@@ -2230,7 +2275,7 @@ class MeshtasticManager implements ISourceManager {
     const executeTraceroute = async () => {
       // TX-disabled radios cannot send OTA traceroutes; skip quietly and let the
       // interval keep running so a later TX re-enable resumes automatically (#4294).
-      if (!this.isTxEnabled()) {
+      if (!this.canTransmit()) {
         logger.debug('🗺️ Auto-traceroute: Skipping - TX disabled on this source');
         return;
       }
@@ -2392,7 +2437,7 @@ class MeshtasticManager implements ISourceManager {
     const executeRemoteLocalStats = async () => {
       // TX-disabled radios cannot send remote telemetry requests; skip quietly and
       // let the interval keep running so a later TX re-enable resumes automatically (#4294).
-      if (!this.isTxEnabled()) {
+      if (!this.canTransmit()) {
         logger.debug('📊 Remote LocalStats: Skipping - TX disabled on this source');
         return;
       }
@@ -2664,7 +2709,7 @@ class MeshtasticManager implements ISourceManager {
     this.remoteAdminScannerInterval = setInterval(async () => {
       // TX-disabled radios cannot send remote admin packets; skip quietly and let
       // the interval keep running so a later TX re-enable resumes automatically (#4294).
-      if (!this.isTxEnabled()) {
+      if (!this.canTransmit()) {
         logger.debug('🔑 Remote admin scanner: Skipping - TX disabled on this source');
         return;
       }
@@ -2908,7 +2953,7 @@ class MeshtasticManager implements ISourceManager {
 
     // TX-disabled radios cannot send NodeInfo exchanges; skip quietly and let the
     // interval keep running so a later TX re-enable resumes automatically (#4294).
-    if (!this.isTxEnabled()) {
+    if (!this.canTransmit()) {
       logger.debug('🔐 Key repair: Skipping - TX disabled on this source');
       return;
     }
@@ -3190,7 +3235,7 @@ class MeshtasticManager implements ISourceManager {
     }
 
     try {
-      const maxNodeAgeHours = parseInt(await databaseService.settings.getSetting('maxNodeAgeHours') || '24');
+      const maxNodeAgeHours = await getMaxNodeAgeHours(databaseService.settings, this.sourceId);
       const maxNodeAgeDays = maxNodeAgeHours / 24;
       // Scope to this source so systemNodeCount telemetry reflects only nodes visible
       // to this manager, not a cross-source union.
@@ -3306,7 +3351,7 @@ class MeshtasticManager implements ISourceManager {
         logger.debug(`⏱️ Timer "${trigger.name}" triggered (cron: ${trigger.cronExpression})`);
         // TX-disabled radios cannot send the timer's mesh output; skip quietly and
         // let the cron job keep running so a later TX re-enable resumes automatically (#4294).
-        if (!this.isTxEnabled()) {
+        if (!this.canTransmit()) {
           logger.debug(`⏱️ Timer "${trigger.name}": Skipping - TX disabled on this source`);
           return;
         }
@@ -4140,8 +4185,30 @@ class MeshtasticManager implements ISourceManager {
         const virtualNodeServer = this.virtualNodeServer;
         if (virtualNodeServer) {
           try {
-            await virtualNodeServer.broadcastToClients(data);
-            logger.debug(`📡 Broadcasted ${parsed?.type || 'unparsed'} to virtual node clients (${data.length} bytes)`);
+            if (parsed?.type === 'mqttClientProxyMessage') {
+              // - 'mqttClientProxyMessage': the device is asking its client to publish this
+              //   envelope to the MQTT broker (mqtt.proxy_to_client_enabled). Two consumers
+              //   can act on the SAME frame (#4037 follow-up): when an mqttLink is active,
+              //   handleDeviceMqttProxyMessage() below publishes it to the linked broker, so
+              //   relaying the frame to VN clients would make every connected app publish it
+              //   AGAIN — duplicate publishes on the broker. Even without an mqttLink,
+              //   broadcasting to ALL clients makes each app proxy independently (N duplicate
+              //   publishes). A physical node never has this problem because BLE is
+              //   single-client, so mirror that: drop the frame when the link handles it,
+              //   otherwise relay it to a single delegate (the newest connected client).
+              //   Accepted tradeoff: handleDeviceMqttProxyMessage() can still no-op with
+              //   the link attached (empty topic/data, or echo suppression) — the frame is
+              //   then intentionally dropped by both paths (echo = must not republish;
+              //   malformed = firmware bug).
+              if (this.mqttLinkBroker) {
+                logger.debug(`📡 [${this.sourceId}] mqttClientProxyMessage handled by mqttLink — not relayed to virtual node clients (#4037)`);
+              } else {
+                await virtualNodeServer.broadcastToProxyDelegate(data);
+              }
+            } else {
+              await virtualNodeServer.broadcastToClients(data);
+              logger.debug(`📡 Broadcasted ${parsed?.type || 'unparsed'} to virtual node clients (${data.length} bytes)`);
+            }
           } catch (error) {
             logger.error('Virtual node: Failed to broadcast message to clients:', error);
           }
@@ -4303,13 +4370,18 @@ class MeshtasticManager implements ISourceManager {
           // Block-scoped (no-case-declarations): this `case` clause has no
           // braces of its own, so `const` here needs an explicit block.
           {
-            const prevTxEnabled = this.actualDeviceConfig?.lora?.txEnabled !== false;
+            // Log against canTransmit(), not the raw radio flag: a TX-disabled
+            // node with UDP Broadcast on still reaches the mesh via a LAN peer,
+            // so the autonomous senders keep running (#4394).
+            const prevCanTransmit = this.canTransmit();
             this.actualDeviceConfig = { ...this.actualDeviceConfig, ...parsed.data };
-            const nextTxEnabled = this.actualDeviceConfig?.lora?.txEnabled !== false;
-            if (prevTxEnabled !== nextTxEnabled) {
-              logger.info(nextTxEnabled
+            const nextCanTransmit = this.canTransmit();
+            if (prevCanTransmit !== nextCanTransmit) {
+              logger.info(nextCanTransmit
                 ? `📡 [${this.sourceId}] TX re-enabled — autonomous senders resume`
                 : `🚫 [${this.sourceId}] TX disabled — pausing autonomous senders (node is now receive-only)`);
+            } else if (nextCanTransmit && !this.isTxEnabled()) {
+              logger.debug(`📡 [${this.sourceId}] Radio TX is disabled but UDP Broadcast is on — sends relay via the local network`);
             }
           }
           logger.debug('📊 Merged actualDeviceConfig now has keys:', Object.keys(this.actualDeviceConfig));
@@ -4789,7 +4861,7 @@ class MeshtasticManager implements ISourceManager {
     // Note: Local node's public key is extracted from security config when received
   }
 
-  getLocalNodeInfo(): { nodeNum: number; nodeId: string; longName: string; shortName: string; hwModel?: number; firmwareVersion?: string; rebootCount?: number; isLocked?: boolean; hasWifi?: boolean; hasEthernet?: boolean; hasBluetooth?: boolean } | null {
+  getLocalNodeInfo(): { nodeNum: number; nodeId: string; longName: string; shortName: string; hwModel?: number; firmwareVersion?: string; rebootCount?: number; isLocked?: boolean; hasWifi?: boolean; hasEthernet?: boolean; hasBluetooth?: boolean; hasXeddsa?: boolean } | null {
     return this.localNodeInfo;
   }
 
@@ -5227,6 +5299,9 @@ class MeshtasticManager implements ISourceManager {
       this.localNodeInfo.hasWifi = metadata.hasWifi === true;
       this.localNodeInfo.hasEthernet = metadata.hasEthernet === true;
       this.localNodeInfo.hasBluetooth = metadata.hasBluetooth === true;
+      // Firmware 2.8 build capability, surfaced alongside the transport flags so
+      // the local node reports it the same way a remote node does (#3923).
+      this.localNodeInfo.hasXeddsa = metadata.hasXeddsa === true;
       if (this.isLocalNodeBridged()) {
         logger.debug('🌉 Connected node reports no native WiFi/Ethernet — treating as a bridged node (OTA firmware update disabled)');
       }
@@ -5724,11 +5799,15 @@ class MeshtasticManager implements ISourceManager {
         nodeData.shortName = nodeId.slice(-4);
       }
 
-      // Only include SNR/RSSI if they have valid values
+      // Only include SNR/RSSI if they have valid values.
+      // -128 is the firmware "no SNR" sentinel; 0 dB is a real reading (#3590).
+      // rx_rssi gained explicit presence in firmware 2.8 (`optional int32
+      // rx_rssi = 12`, firmware PR #11271), so absent decodes to null and a
+      // present 0 is a genuine 0 dBm reception — do not filter it out (#3548).
       if (meshPacket.rxSnr != null && meshPacket.rxSnr !== -128) {
         nodeData.snr = meshPacket.rxSnr;
       }
-      if (meshPacket.rxRssi != null && meshPacket.rxRssi !== 0) {
+      if (meshPacket.rxRssi != null) {
         nodeData.rssi = meshPacket.rxRssi;
       }
       await databaseService.upsertNodeAsync(nodeData, this.sourceId);
@@ -6608,7 +6687,7 @@ class MeshtasticManager implements ISourceManager {
             nodeNum: fromNum,
             nodeId: fromNodeId,
             isStoreForwardServer: true,
-            lastHeard: Date.now() / 1000,
+            lastHeard: this.lastHeardFor(meshPacket),
             updatedAt: Date.now(),
           }, this.sourceId);
           break;
@@ -6637,6 +6716,21 @@ class MeshtasticManager implements ISourceManager {
     } catch (error) {
       logger.error('❌ Error processing Store & Forward message:', error);
     }
+  }
+
+  /**
+   * Resolve `lastHeard` for a packet-derived node upsert, applying the replay
+   * guard (see replayGuard.ts) so a stale/replayed frame — e.g. firmware 2.8's
+   * PhoneAPI replaying cached NodeDB position/telemetry with an old `rx_time`,
+   * or a retained MQTT frame — can't advance a node's `lastHeard` past its
+   * true last-contact time (issue #4192/#4445). Every packet-derived
+   * `lastHeard` stamp outside the generic upsert path should go through this.
+   */
+  private lastHeardFor(meshPacket: { rxTime?: unknown }): number | undefined {
+    return resolveLastHeardSec(
+      meshPacket.rxTime != null ? Number(meshPacket.rxTime) : undefined,
+      Date.now(),
+    );
   }
 
   /**
@@ -6892,13 +6986,13 @@ class MeshtasticManager implements ISourceManager {
           const technicalData: any = {
             nodeNum: fromNum,
             nodeId: nodeId,
-            lastHeard: Date.now() / 1000,
+            lastHeard: this.lastHeardFor(meshPacket),
           };
           // -128 is the firmware "no SNR" sentinel; accept 0 dB (issue #3590).
           if (meshPacket.rxSnr != null && meshPacket.rxSnr !== -128) {
             technicalData.snr = meshPacket.rxSnr;
           }
-          if (meshPacket.rxRssi && meshPacket.rxRssi !== 0) {
+          if (meshPacket.rxRssi != null) {
             technicalData.rssi = meshPacket.rxRssi;
           }
           await databaseService.upsertNodeAsync(technicalData, this.sourceId);
@@ -6909,8 +7003,9 @@ class MeshtasticManager implements ISourceManager {
             latitude: coords.latitude,
             longitude: coords.longitude,
             altitude: position.altitude,
-            // Cap lastHeard at current time to prevent stale timestamps from node clock issues
-            lastHeard: Date.now() / 1000,
+            // Replay guard (see replayGuard.ts): omit lastHeard for replayed/retained
+            // frames so a stale position can't resurrect an offline node (#4192/#4445).
+            lastHeard: this.lastHeardFor(meshPacket),
             positionChannel: channelIndex,
             positionPrecisionBits: precisionBits,
             positionGpsAccuracy: gpsAccuracy,
@@ -6925,7 +7020,7 @@ class MeshtasticManager implements ISourceManager {
           if (meshPacket.rxSnr != null && meshPacket.rxSnr !== -128) {
             nodeData.snr = meshPacket.rxSnr;
           }
-          if (meshPacket.rxRssi && meshPacket.rxRssi !== 0) {
+          if (meshPacket.rxRssi != null) {
             nodeData.rssi = meshPacket.rxRssi;
           }
 
@@ -7024,10 +7119,7 @@ class MeshtasticManager implements ISourceManager {
         // Use server time for lastHeard — rxTime from the device clock is unreliable.
         // Replay guard (see replayGuard.ts): omit lastHeard for replayed/retained
         // frames so a stale NodeInfo can't resurrect an offline node.
-        lastHeard: resolveLastHeardSec(
-          meshPacket.rxTime != null ? Number(meshPacket.rxTime) : undefined,
-          Date.now(),
-        ),
+        lastHeard: this.lastHeardFor(meshPacket),
       };
 
       // Capture public key if present
@@ -7035,6 +7127,10 @@ class MeshtasticManager implements ISourceManager {
         // Convert Uint8Array to base64 for storage
         nodeData.publicKey = Buffer.from(user.publicKey).toString('base64');
         nodeData.hasPKC = true;
+        // This NodeInfo reached us THROUGH the radio, so the radio saw the same
+        // key and stored it in its own NodeDB. That is our evidence that a
+        // pre-DM add_contact would be redundant (issue #4368).
+        this.deviceContactKeyNums.add(fromNum);
         logger.debug(`🔐 Received NodeInfo with public key for ${nodeId} (${user.longName}): ${nodeData.publicKey.substring(0, 20)}... (${user.publicKey.length} bytes)`);
 
         // Check for key security issues
@@ -7178,7 +7274,7 @@ class MeshtasticManager implements ISourceManager {
           logger.debug(`📊 Saved local SNR telemetry: ${meshPacket.rxSnr} dB (${reason}, previous: ${latestSnrTelemetry?.value || 'N/A'})`);
         }
       }
-      if (meshPacket.rxRssi && meshPacket.rxRssi !== 0) {
+      if (meshPacket.rxRssi != null) {
         nodeData.rssi = meshPacket.rxRssi;
 
         // Save RSSI as telemetry if it has changed OR if 10+ minutes have passed
@@ -7254,15 +7350,16 @@ class MeshtasticManager implements ISourceManager {
       const nodeData: any = {
         nodeNum: fromNum,
         nodeId: nodeId,
-        // Cap lastHeard at current time to prevent stale timestamps from node clock issues
-        lastHeard: Date.now() / 1000
+        // Replay guard (see replayGuard.ts): omit lastHeard for replayed/retained
+        // frames so stale telemetry can't resurrect an offline node (#4192/#4445).
+        lastHeard: this.lastHeardFor(meshPacket)
       };
 
       // Only include SNR/RSSI if they have valid values
       if (meshPacket.rxSnr != null && meshPacket.rxSnr !== -128) {
         nodeData.snr = meshPacket.rxSnr;
       }
-      if (meshPacket.rxRssi != null && meshPacket.rxRssi !== 0) {
+      if (meshPacket.rxRssi != null) {
         nodeData.rssi = meshPacket.rxRssi;
       }
 
@@ -7414,15 +7511,16 @@ class MeshtasticManager implements ISourceManager {
       const nodeData: any = {
         nodeNum: fromNum,
         nodeId: nodeId,
-        // Cap lastHeard at current time to prevent stale timestamps from node clock issues
-        lastHeard: Date.now() / 1000
+        // Replay guard (see replayGuard.ts): omit lastHeard for replayed/retained
+        // frames so stale paxcounter data can't resurrect an offline node (#4192/#4445).
+        lastHeard: this.lastHeardFor(meshPacket)
       };
 
       // Only include SNR/RSSI if they have valid values
       if (meshPacket.rxSnr != null && meshPacket.rxSnr !== -128) {
         nodeData.snr = meshPacket.rxSnr;
       }
-      if (meshPacket.rxRssi != null && meshPacket.rxRssi !== 0) {
+      if (meshPacket.rxRssi != null) {
         nodeData.rssi = meshPacket.rxRssi;
       }
 
@@ -8296,7 +8394,11 @@ class MeshtasticManager implements ISourceManager {
   private async processWaypointMessage(meshPacket: any, decoded: any): Promise<void> {
     try {
       const fromNum = Number(meshPacket.from ?? 0);
-      await waypointService.upsertFromMesh(this.sourceId, fromNum, decoded);
+      // Record the slot the waypoint arrived on so an edit or a scheduled
+      // rebroadcast goes back out on the same channel (#4341).
+      const rawChannel = meshPacket.channel;
+      const channel = rawChannel === undefined || rawChannel === null ? undefined : Number(rawChannel);
+      await waypointService.upsertFromMesh(this.sourceId, fromNum, decoded, channel);
     } catch (error) {
       logger.error('Error processing waypoint message:', error);
     }
@@ -8644,6 +8746,13 @@ class MeshtasticManager implements ISourceManager {
           // Convert Uint8Array to base64 for storage
           const deviceSyncKey = Buffer.from(nodeInfo.user.publicKey).toString('base64');
 
+          // The radio is reporting a key out of its OWN NodeDB — the most direct
+          // evidence there is that a pre-DM add_contact would be redundant
+          // (issue #4368). Recorded regardless of the mismatch handling below:
+          // a mismatched key still means the radio HAS one, and the DM path
+          // skips PKI (and so the push) entirely while keyMismatchDetected is set.
+          this.deviceContactKeyNums.add(Number(nodeInfo.num));
+
           // Device sync keys should NOT overwrite mesh-received keys for remote nodes.
           // The connected device's internal nodeDb may have stale/incorrect cached keys,
           // while mesh-received keys (from processNodeInfoMessageProtobuf) come directly
@@ -8974,12 +9083,63 @@ class MeshtasticManager implements ISourceManager {
 
 
   /**
-   * Current transmit state for THIS source, read from the in-memory device config.
-   * Defaults to true when config hasn't arrived yet (fail-open: don't block sends
-   * before we know the radio's state). No DB access — safe to call per packet.
+   * Current RADIO transmit state for THIS source, read from the in-memory device
+   * config. Defaults to true when config hasn't arrived yet (fail-open: don't
+   * block sends before we know the radio's state). No DB access — safe to call
+   * per packet.
+   *
+   * This is the raw `lora.txEnabled` truth and nothing else — config
+   * import/export and backup paths depend on it to preserve the device's own
+   * setting (#4294). Use `canTransmit()` to decide whether a send is futile.
    */
   isTxEnabled(): boolean {
     return this.actualDeviceConfig?.lora?.txEnabled !== false;
+  }
+
+  /**
+   * The hop limit THIS node is configured to use for its own outgoing packets,
+   * read from the in-memory device config. Falls back to the firmware default
+   * (3) when the LoRa config hasn't arrived yet. No DB access — safe to call
+   * per packet.
+   *
+   * Packets we build and hand to the radio carry whatever `hop_limit` we set;
+   * the firmware does not substitute the user's setting for us. Meshtastic
+   * Python resolves it client-side the same way (`mesh_interface.py`
+   * `_sendPacket` reads `localConfig.lora.hop_limit` when the caller passes
+   * none), which is why admin commands there reach nodes further than 3 hops
+   * out and ours did not.
+   */
+  getConfiguredHopLimit(): number {
+    return resolveHopLimit(this.actualDeviceConfig?.lora?.hopLimit);
+  }
+
+  /**
+   * True when this node relays its outgoing packets over local-LAN UDP broadcast
+   * (`network.enabledProtocols & UDP_BROADCAST`), read from the in-memory device
+   * config. Defaults to false when the config hasn't arrived (proto3 omits a 0
+   * bit field, so "unknown" and "off" are indistinguishable — treat as off).
+   *
+   * Firmware `Router::send()` calls `udpHandler->onSend(p)` gated only on this
+   * flag, with no `tx_enabled` check, so a TX-disabled node's packets still hit
+   * the LAN and a peer with a working radio can relay them onto the mesh (#4394).
+   */
+  isUdpBroadcastRelayEnabled(): boolean {
+    return isUdpBroadcastEnabled(this.actualDeviceConfig?.network?.enabledProtocols);
+  }
+
+  /**
+   * Whether a send from THIS source has any path onto the mesh (#4394).
+   *
+   * Truth table:
+   *   tx on,  udp off → true   (normal radio TX)
+   *   tx on,  udp on  → true
+   *   tx off, udp on  → true   (RF is dead, but a LAN peer relays for us)
+   *   tx off, udp off → false  (receive-only; sends are futile → TX_DISABLED)
+   *
+   * This — not `isTxEnabled()` — is the guard every transmit primitive uses.
+   */
+  canTransmit(): boolean {
+    return this.isTxEnabled() || this.isUdpBroadcastRelayEnabled();
   }
 
   // Configuration retrieval methods
@@ -9004,7 +9164,7 @@ class MeshtasticManager implements ISourceManager {
       throw new Error('Not connected to Meshtastic node');
     }
 
-    if (!this.isTxEnabled()) {
+    if (!this.canTransmit()) {
       throw new TxDisabledError();
     }
 
@@ -9032,7 +9192,18 @@ class MeshtasticManager implements ISourceManager {
             pkiEncrypted = true;
             logger.debug(`🔐 DM to !${destination.toString(16).padStart(8, '0')} — requesting PKI encryption (node has public key)`);
             try {
-              await this.pushContactToRadio(targetNode);
+              // Only push when the radio actually needs the key (issue #4368).
+              // add_contact is not idempotent from the user's perspective: the
+              // firmware favorites the contact in NodeDB::addFromContact() to
+              // shield it from NodeDB eviction, so pushing before EVERY DM
+              // re-favorited every recipient — including automated Auto-Ack
+              // replies. Pushing once (or never, when the radio already showed
+              // us the key) still guarantees PKI works.
+              if (!this.deviceContactKeyNums.has(destination)) {
+                await this.pushContactToRadio(targetNode);
+              } else {
+                logger.debug(`📇 Skipping add_contact for !${destination.toString(16).padStart(8, '0')} — radio already holds its public key`);
+              }
             } catch {
               // Non-fatal — radio may already have the contact, or the send failed
               // transiently. On failure deviceNodeNums is left untouched (the add only
@@ -9175,7 +9346,7 @@ class MeshtasticManager implements ISourceManager {
       throw new Error('Not connected to Meshtastic node');
     }
 
-    if (!this.isTxEnabled()) {
+    if (!this.canTransmit()) {
       throw new TxDisabledError();
     }
 
@@ -9227,7 +9398,7 @@ class MeshtasticManager implements ISourceManager {
       throw new Error('Not connected to Meshtastic node');
     }
 
-    if (!this.isTxEnabled()) {
+    if (!this.canTransmit()) {
       throw new TxDisabledError();
     }
 
@@ -9306,7 +9477,7 @@ class MeshtasticManager implements ISourceManager {
       throw new Error('Not connected to Meshtastic node');
     }
 
-    if (!this.isTxEnabled()) {
+    if (!this.canTransmit()) {
       throw new TxDisabledError();
     }
 
@@ -9379,7 +9550,7 @@ class MeshtasticManager implements ISourceManager {
       throw new Error('Not connected to Meshtastic node');
     }
 
-    if (!this.isTxEnabled()) {
+    if (!this.canTransmit()) {
       throw new TxDisabledError();
     }
 
@@ -9610,7 +9781,7 @@ class MeshtasticManager implements ISourceManager {
       throw new Error('Not connected to Meshtastic node');
     }
 
-    if (!this.isTxEnabled()) {
+    if (!this.canTransmit()) {
       throw new TxDisabledError();
     }
 
@@ -9895,15 +10066,20 @@ class MeshtasticManager implements ISourceManager {
         body = messageText.length > 100 ? messageText.substring(0, 97) + '...' : messageText;
       }
 
-      // Build navigation data for push notification click handling
+      // Build navigation data for push notification click handling.
+      // `sourceId` is required for the cold-launch deep link: the service
+      // worker builds a `/source/<sourceId>/<tab>` route from it, because the
+      // app root renders DashboardPage and never reads navigation data (#4463).
       const navigationData = isDirectMessage
         ? {
             type: 'dm' as const,
+            sourceId: this.sourceId,
             messageId: message.id,
             senderNodeId: fromNode?.nodeId || message.fromNodeId,
           }
         : {
             type: 'channel' as const,
+            sourceId: this.sourceId,
             channelId: message.channel,
             messageId: message.id,
           };
@@ -9977,7 +10153,7 @@ class MeshtasticManager implements ISourceManager {
       }
 
       // TX-disabled radios cannot send the ack reply; skip quietly (#4294).
-      if (!this.isTxEnabled()) {
+      if (!this.canTransmit()) {
         logger.debug('⏭️ Skipping auto-acknowledge - TX disabled on this source');
         return;
       }
@@ -10143,9 +10319,10 @@ class MeshtasticManager implements ISourceManager {
       // Delivered the same way the trigger arrived: DM→DM, channel→channel.
       // Note: packetId can be 0 (valid unsigned integer), so check explicitly.
       if (cellTapbackEnabled && packetId != null) {
-        // Hop count emojis: *️⃣ for 0 (direct), 1️⃣-7️⃣ for 1-7+ hops
-        const HOP_COUNT_EMOJIS = ['*️⃣', '1️⃣', '2️⃣', '3️⃣', '4️⃣', '5️⃣', '6️⃣', '7️⃣'];
-        const hopEmoji = HOP_COUNT_EMOJIS[Math.min(hopsTraveled, 7)];
+        // Hop count emojis: *️⃣ for 0 (direct), 1️⃣-7️⃣ for 1-7+ hops. Shared with the
+        // Automation Engine's action.tapback emojiMode=hopCount (src/utils/hopEmoji.ts).
+        // `hopsTraveled` is already floored at 0 above, so the fallback is unreachable.
+        const hopEmoji = hopCountEmoji(hopsTraveled) ?? HOP_COUNT_EMOJIS[0];
         const tapbackTarget = isDirectMessage
           ? `!${fromNum.toString(16).padStart(8, '0')}`
           : `channel ${channelIndex}`;
@@ -10222,9 +10399,38 @@ class MeshtasticManager implements ISourceManager {
 
       // Record cooldown timestamp after successful response
       this.autoAckCooldowns.set(fromNum, Date.now());
+      if (this.autoAckCooldowns.size > AUTO_ACK_COOLDOWNS_MAX) {
+        this.pruneAutoAckCooldowns(cooldownSeconds, Date.now());
+      }
     } catch (error) {
       logger.error('❌ Error in auto-acknowledge:', error);
     }
+  }
+
+  /**
+   * Bound `autoAckCooldowns`' growth (#4399). Mirrors the Automation Engine's
+   * cooldown-key trim (automationEngineService.ts pruneCooldownKeys, #4396):
+   * an exact-expiry pass first (an entry older than the current cooldown
+   * window can never suppress anything again, so deleting it is
+   * behaviour-neutral), then a high-water trim of the oldest survivors as a
+   * backstop only. `cooldownSeconds` is the CURRENT per-source setting — the
+   * same value `checkAutoAcknowledge` compares future messages against — so
+   * "expired under the current window" is exactly the right test.
+   */
+  private pruneAutoAckCooldowns(cooldownSeconds: number, now: number): void {
+    const windowMs = cooldownSeconds * 1000;
+    for (const [nodeNum, ts] of this.autoAckCooldowns) {
+      if (now - ts >= windowMs) this.autoAckCooldowns.delete(nodeNum);
+    }
+    if (this.autoAckCooldowns.size <= AUTO_ACK_COOLDOWNS_TRIM_TO) return;
+    // Backstop: more than TRIM_TO distinct nodes acked inside one window.
+    // Drop the oldest — they expire soonest — accepting that those few nodes
+    // may be eligible to ack again slightly early rather than growing without
+    // bound.
+    const byAge = [...this.autoAckCooldowns.entries()].sort((a, b) => a[1] - b[1]);
+    const dropCount = byAge.length - AUTO_ACK_COOLDOWNS_TRIM_TO;
+    for (let i = 0; i < dropCount; i++) this.autoAckCooldowns.delete(byAge[i][0]);
+    logger.debug(`[AutoAck] cooldown map trimmed to ${this.autoAckCooldowns.size} node(s) (source ${this.sourceId})`);
   }
 
   /**
@@ -10303,7 +10509,7 @@ class MeshtasticManager implements ISourceManager {
 
     // TX-disabled radios cannot send ping replies; skip quietly rather than
     // letting sendTextMessage throw TxDisabledError partway through (#4294).
-    if (!this.isTxEnabled()) {
+    if (!this.canTransmit()) {
       logger.debug('⏭️  Auto-ping command received but TX is disabled on this source');
       return false;
     }
@@ -10411,7 +10617,7 @@ class MeshtasticManager implements ISourceManager {
   private async sendNextAutoPing(session: AutoPingSession): Promise<void> {
     // TX-disabled radios cannot send pings; skip this tick quietly and leave the
     // session's interval running so it resumes automatically on TX re-enable (#4294).
-    if (!this.isTxEnabled()) {
+    if (!this.canTransmit()) {
       return;
     }
 
@@ -10722,7 +10928,7 @@ class MeshtasticManager implements ISourceManager {
       }
 
       // TX-disabled radios cannot send the auto-responder reply; skip quietly (#4294).
-      if (!this.isTxEnabled()) {
+      if (!this.canTransmit()) {
         logger.debug('⏭️ Skipping auto-responder - TX disabled on this source');
         return;
       }
@@ -11381,8 +11587,11 @@ class MeshtasticManager implements ISourceManager {
       scriptEnv.HOPS = String(context.hopsTraveled);
       scriptEnv.IS_DIRECT = String(context.isDirectMessage);
     }
-    if (message.rxSnr !== undefined) scriptEnv.SNR = String(message.rxSnr);
-    if (message.rxRssi !== undefined) scriptEnv.RSSI = String(message.rxRssi);
+    // Guard null as well as undefined: an absent rx_rssi decodes to null under
+    // firmware 2.8's explicit presence, and String(null) would hand scripts the
+    // literal string "null" — truthy and non-empty — instead of omitting the var.
+    if (message.rxSnr !== undefined && message.rxSnr !== null) scriptEnv.SNR = String(message.rxSnr);
+    if (message.rxRssi !== undefined && message.rxRssi !== null) scriptEnv.RSSI = String(message.rxRssi);
     scriptEnv.CHANNEL = String(message.channel);
     scriptEnv.VIA_MQTT = String(message.viaMqtt);
 
@@ -12317,7 +12526,9 @@ class MeshtasticManager implements ISourceManager {
 
     // {RSSI} - Received Signal Strength Indicator
     if (result.includes('{RSSI}')) {
-      const rssiValue = (rxRssi !== undefined && rxRssi !== null && rxRssi !== 0)
+      // rx_rssi has explicit presence since firmware 2.8, so a present 0 is a
+      // genuine 0 dBm reading, not "unset" (issue #3548).
+      const rssiValue = (rxRssi !== undefined && rxRssi !== null)
         ? rxRssi.toString()
         : 'N/A';
       result = result.replace(/{RSSI}/g, encode(rssiValue));
@@ -12908,6 +13119,9 @@ class MeshtasticManager implements ISourceManager {
     // restored. Track it locally so the UI's "not in device DB" warning clears on the
     // next poll without waiting for the radio to independently re-report the node.
     this.deviceNodeNums.add(targetNode.nodeNum);
+    // We just handed the radio this node's key, so further pre-DM pushes are
+    // redundant until the connection resets or a key repair purges it (#4368).
+    this.deviceContactKeyNums.add(targetNode.nodeNum);
     logger.debug(`📇 Pushed contact for !${targetNode.nodeNum.toString(16).padStart(8, '0')} to radio NodeDB before PKI DM`);
   }
 
@@ -13331,6 +13545,14 @@ class MeshtasticManager implements ISourceManager {
     return this.deviceNodeNums.has(nodeNum);
   }
 
+  /**
+   * Whether we have evidence the radio already holds this node's public key,
+   * and so does not need an `add_contact` before a PKI DM (issue #4368).
+   */
+  hasDeviceContactKey(nodeNum: number): boolean {
+    return this.deviceContactKeyNums.has(nodeNum);
+  }
+
   // ── Narrow accessors for NodeDbMaintenanceService (#3962 Phase 4.2a PR2 §4f) ──
   // These exist only to bridge previously-private state to the extracted
   // service without widening the fields themselves or touching the
@@ -13358,6 +13580,9 @@ class MeshtasticManager implements ISourceManager {
   /** Drop a node from the connected radio's local-database tracking set. */
   removeDeviceNodeNum(nodeNum: number): void {
     this.deviceNodeNums.delete(nodeNum);
+    // Key-repair purges (sendRemoveNode) take the key with the node, so the
+    // next DM must push the contact again rather than assume it is there.
+    this.deviceContactKeyNums.delete(nodeNum);
   }
 
   // ── Narrow accessor for AutoAnnounceService (#3962 Phase 4.2a PR3 §4b) ──

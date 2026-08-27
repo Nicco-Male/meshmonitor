@@ -57,6 +57,45 @@ describe('securityDigestService', () => {
       const result = formatDigestSummary(issues, baseUrl, false);
       expect(result).toContain('No security issues');
     });
+
+    it('a digest with no externalUrl configured contains no dangling "/security" link', () => {
+      const issues = {
+        total: 5,
+        lowEntropyCount: 1,
+        duplicateKeyCount: 3,
+        excessivePacketsCount: 1,
+        timeOffsetCount: 0,
+        nodes: [],
+        topBroadcasters: [],
+      };
+
+      // baseUrl === '' is what production sends when `externalUrl` is left unset
+      // (its default; #4437 added the writer but did not change this default).
+      // This must not render a dead relative "/security" link.
+      const result = formatDigestSummary(issues, '');
+      expect(result).not.toMatch(/View details/);
+      expect(result).not.toContain('/security');
+    });
+
+    it('a digest with externalUrl configured emits an absolute link', () => {
+      const issues = {
+        total: 5,
+        lowEntropyCount: 1,
+        duplicateKeyCount: 3,
+        excessivePacketsCount: 1,
+        timeOffsetCount: 0,
+        nodes: [],
+        topBroadcasters: [],
+      };
+
+      // Before #4437 this fixture value was one no production write path could
+      // ever produce (`externalUrl` had no writer) — the assertion was correct
+      // in intent but not evidential. #4437 (WP2) added the `externalUrl`
+      // setting + validation in settingsRoutes.ts, so this is now a realistic
+      // value an admin can actually save.
+      const result = formatDigestSummary(issues, 'https://mesh.example');
+      expect(result).toContain('View details: https://mesh.example/security');
+    });
   });
 
   describe('formatDigestDetailed', () => {

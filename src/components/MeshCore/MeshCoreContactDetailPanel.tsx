@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { MeshCoreContact } from '../../utils/meshcoreHelpers';
 import {
@@ -10,10 +10,11 @@ import {
   type PathHop,
 } from '../../utils/meshcorePath';
 import { formatRelativeTime } from '../../utils/datetime';
+import { meshcoreLastHeardMs } from '../../utils/meshcoreAge';
 import { useSettings } from '../../contexts/SettingsContext';
 import { useSource } from '../../contexts/SourceContext';
 import { MeshCoreRemoteConsole } from './MeshCoreRemoteConsole';
-import type { MeshCoreActions, TracePathResult } from './hooks/useMeshCore';
+import type { MeshCoreActions, TracePathResult, ZeroHopPingResult } from './hooks/useMeshCore';
 import api from '../../services/api';
 import '../NodeDetailsBlock.css';
 import { UiIcon } from '../icons';
@@ -46,6 +47,9 @@ interface MeshCoreContactDetailPanelProps {
   /** Send a trace-path diagnostic along the contact's cached path and
    *  return per-hop SNR data. Unset hides the Trace Path button. */
   onTracePath?: (publicKey: string) => Promise<TracePathResult | null>;
+  /** Zero-hop ping (#4393) — trace along a synthetic one-hop path so a reply
+   *  proves the node is in direct RF range. Unset hides the Ping button. */
+  onPingZeroHop?: (publicKey: string) => Promise<ZeroHopPingResult>;
   /** Flood a path-discovery request to learn the forwarding route. The
    *  path update arrives asynchronously. Unset hides the button. */
   onDiscoverPath?: (publicKey: string) => Promise<boolean>;
@@ -97,6 +101,7 @@ export const MeshCoreContactDetailPanel: React.FC<MeshCoreContactDetailPanelProp
   onSetOutPath,
   repeaters,
   onTracePath,
+  onPingZeroHop,
   onDiscoverPath,
   onRemoveContact,
   onExportContact,
@@ -109,6 +114,32 @@ export const MeshCoreContactDetailPanel: React.FC<MeshCoreContactDetailPanelProp
   const { t } = useTranslation();
   const { timeFormat, dateFormat } = useSettings();
   const { sourceId } = useSource();
+  // Tracks the currently-selected contact synchronously (unlike the
+  // `publicKey` prop, which an in-flight async closure captured at call
+  // time and won't see update) so a stale reply can detect that the user
+  // has since switched contacts.
+  const publicKeyRef = useRef(publicKey);
+  publicKeyRef.current = publicKey;
+
+  /**
+   * Every action on this panel is "for the contact that was selected when the
+   * button was pressed". Call this first; the predicate it returns is false
+   * once the user has moved on, which is the signal to drop the reply on the
+   * floor rather than paint it onto whoever is selected now.
+   *
+   * The contact-change effect already clears these fields on switch, so the
+   * bug this guards is specifically a reply landing *after* that clear
+   * (#4514 for ping, #4517 for trace path, and the rest of the handlers here,
+   * which all had the identical shape).
+   *
+   * One guard used by every handler, rather than the same three-line check
+   * copy-pasted nine times — a check that exists in nine places is a check
+   * that will exist in eight after the next handler is added.
+   */
+  const beginContactAction = useCallback(() => {
+    const startedFor = publicKeyRef.current;
+    return () => startedFor === publicKeyRef.current;
+  }, []);
   const [isCollapsed, setIsCollapsed] = useState<boolean>(() => {
     return localStorage.getItem(COLLAPSED_KEY) === 'true';
   });
@@ -123,6 +154,10 @@ export const MeshCoreContactDetailPanel: React.FC<MeshCoreContactDetailPanelProp
   const [traceResult, setTraceResult] = useState<TracePathResult | null>(null);
   const [traceError, setTraceError] = useState<string | null>(null);
   const [discovering, setDiscovering] = useState(false);
+
+  // Zero-hop ping state (#4393)
+  const [pinging, setPinging] = useState(false);
+  const [pingResult, setPingResult] = useState<ZeroHopPingResult | null>(null);
 
   // Remove contact state
   const [removing, setRemoving] = useState(false);
@@ -174,6 +209,8 @@ export const MeshCoreContactDetailPanel: React.FC<MeshCoreContactDetailPanelProp
     setExportSuccess(false);
     setNeighboursLoading(false);
     setNeighboursData(null);
+    setPinging(false);
+    setPingResult(null);
   }, [publicKey]);
 
   // Auto-load stored neighbor data from the database for repeaters.
@@ -233,6 +270,11 @@ export const MeshCoreContactDetailPanel: React.FC<MeshCoreContactDetailPanelProp
   );
   const canShowTraceButton =
     !!onTracePath && canWriteNodes && isCompanion && pathKnown && pathLen! > 0;
+  // Ping needs no cached path (that is the point — it builds a synthetic
+  // one-hop path from the contact's own key hash), so unlike Trace Path it is
+  // offered whether or not an out_path is known.
+  const canShowPingButton =
+    !!onPingZeroHop && canWriteNodes && isCompanion;
   const canShowDiscoverButton =
     !!onDiscoverPath && canWriteNodes && isCompanion;
   const canShowRemoveButton =
@@ -244,11 +286,13 @@ export const MeshCoreContactDetailPanel: React.FC<MeshCoreContactDetailPanelProp
 
   const handleTracePath = async () => {
     if (!onTracePath || tracing) return;
+    const isCurrent = beginContactAction();
     setTracing(true);
     setTraceError(null);
     setTraceResult(null);
     try {
       const result = await onTracePath(publicKey);
+      if (!isCurrent()) return;
       if (result) {
         setTraceResult(result);
       } else {
@@ -257,7 +301,21 @@ export const MeshCoreContactDetailPanel: React.FC<MeshCoreContactDetailPanelProp
         );
       }
     } finally {
-      setTracing(false);
+      if (isCurrent()) setTracing(false);
+    }
+  };
+
+  const handlePingZeroHop = async () => {
+    if (!onPingZeroHop || pinging) return;
+    const isCurrent = beginContactAction();
+    setPinging(true);
+    setPingResult(null);
+    try {
+      const result = await onPingZeroHop(publicKey);
+      if (!isCurrent()) return;
+      setPingResult(result);
+    } finally {
+      if (isCurrent()) setPinging(false);
     }
   };
 
@@ -270,27 +328,30 @@ export const MeshCoreContactDetailPanel: React.FC<MeshCoreContactDetailPanelProp
     if (typeof window !== 'undefined' && !window.confirm(confirmMessage)) {
       return;
     }
+    const isCurrent = beginContactAction();
     setResetting(true);
     setResetError(null);
     try {
       const ok = await onResetPath(publicKey);
+      if (!isCurrent()) return;
       if (!ok) {
         setResetError(
           t('meshcore.contact_details.reset_path_error', 'Reset path failed.'),
         );
       }
     } finally {
-      setResetting(false);
+      if (isCurrent()) setResetting(false);
     }
   };
 
   const handleDiscoverPath = async () => {
     if (!onDiscoverPath || discovering) return;
+    const isCurrent = beginContactAction();
     setDiscovering(true);
     try {
       await onDiscoverPath(publicKey);
     } finally {
-      setDiscovering(false);
+      if (isCurrent()) setDiscovering(false);
     }
   };
 
@@ -357,10 +418,12 @@ export const MeshCoreContactDetailPanel: React.FC<MeshCoreContactDetailPanelProp
       );
       return;
     }
+    const isCurrent = beginContactAction();
     setEditorSaving(true);
     setEditorError(null);
     try {
       const ok = await onSetOutPath(publicKey, joinPathHops(editorHops), editorHashBytes);
+      if (!isCurrent()) return;
       if (!ok) {
         setEditorError(
           t('meshcore.contact_details.edit_path_save_failed', 'Save failed.'),
@@ -369,7 +432,7 @@ export const MeshCoreContactDetailPanel: React.FC<MeshCoreContactDetailPanelProp
         setEditorOpen(false);
       }
     } finally {
-      setEditorSaving(false);
+      if (isCurrent()) setEditorSaving(false);
     }
   };
 
@@ -382,11 +445,13 @@ export const MeshCoreContactDetailPanel: React.FC<MeshCoreContactDetailPanelProp
     if (typeof window !== 'undefined' && !window.confirm(confirmMessage)) {
       return;
     }
+    const isCurrent = beginContactAction();
     setSharing(true);
     setShareError(null);
     setShareSuccess(false);
     try {
       const result = await onShareContact(publicKey);
+      if (!isCurrent()) return;
       if (result.ok) {
         setShareSuccess(true);
         window.setTimeout(() => setShareSuccess(false), 2200);
@@ -397,7 +462,7 @@ export const MeshCoreContactDetailPanel: React.FC<MeshCoreContactDetailPanelProp
         );
       }
     } finally {
-      setSharing(false);
+      if (isCurrent()) setSharing(false);
     }
   };
 
@@ -408,26 +473,33 @@ export const MeshCoreContactDetailPanel: React.FC<MeshCoreContactDetailPanelProp
       `Remove ${name} from the device's contact list? This cannot be undone.`,
     );
     if (typeof window !== 'undefined' && !window.confirm(confirmMessage)) return;
+    const isCurrent = beginContactAction();
     setRemoving(true);
     setRemoveError(null);
     try {
       const ok = await onRemoveContact(publicKey);
+      if (!isCurrent()) return;
       if (!ok) {
         setRemoveError(t('meshcore.contact_details.remove_contact_error', 'Remove contact failed.'));
       }
     } finally {
-      setRemoving(false);
+      if (isCurrent()) setRemoving(false);
     }
   };
 
   const handleExportContact = async () => {
     if (!onExportContact || exporting) return;
+    const isCurrent = beginContactAction();
     setExporting(true);
     setExportSuccess(false);
     try {
       const bytes = await onExportContact(publicKey);
       if (bytes) {
         const url = `meshcore://${bytes.map(b => b.toString(16).padStart(2, '0')).join('')}`;
+        // The copy itself still happens after a contact switch: the user asked
+        // to export *this* contact and is presumably about to paste it. Only
+        // the on-screen confirmation is suppressed, since that would otherwise
+        // appear on the newly-selected contact's card.
         try {
           await navigator.clipboard.writeText(url);
         } catch {
@@ -436,25 +508,29 @@ export const MeshCoreContactDetailPanel: React.FC<MeshCoreContactDetailPanelProp
             url,
           );
         }
-        setExportSuccess(true);
-        window.setTimeout(() => setExportSuccess(false), 2200);
+        if (isCurrent()) {
+          setExportSuccess(true);
+          window.setTimeout(() => setExportSuccess(false), 2200);
+        }
       }
     } finally {
-      setExporting(false);
+      if (isCurrent()) setExporting(false);
     }
   };
 
   const handleGetNeighbours = async () => {
     if (!onGetNeighbours || neighboursLoading) return;
+    const isCurrent = beginContactAction();
     setNeighboursLoading(true);
     setNeighboursData(null);
     try {
       const result = await onGetNeighbours(publicKey, { count: 20 });
+      if (!isCurrent()) return;
       if (result) {
         setNeighboursData({ ...result, fetchedAt: Date.now() });
       }
     } finally {
-      setNeighboursLoading(false);
+      if (isCurrent()) setNeighboursLoading(false);
     }
   };
 
@@ -545,8 +621,8 @@ export const MeshCoreContactDetailPanel: React.FC<MeshCoreContactDetailPanelProp
               available because the device retransmits the stored advert
               regardless of route state. Rendered in one card so the
               actions stay grouped at the bottom of the grid. */}
-          {(canShowResetButton || canShowShareButton || canShowEditButton || canShowTraceButton || canShowDiscoverButton || canShowRemoveButton || canShowExportButton || canShowNeighboursButton) &&
-            (canShowShareButton || canShowEditButton || canShowTraceButton || canShowDiscoverButton || canShowRemoveButton || canShowExportButton || canShowNeighboursButton || pathKnown) && (
+          {(canShowResetButton || canShowShareButton || canShowEditButton || canShowTraceButton || canShowPingButton || canShowDiscoverButton || canShowRemoveButton || canShowExportButton || canShowNeighboursButton) &&
+            (canShowShareButton || canShowEditButton || canShowTraceButton || canShowPingButton || canShowDiscoverButton || canShowRemoveButton || canShowExportButton || canShowNeighboursButton || pathKnown) && (
             <div className="node-detail-card node-detail-card-2col">
               <div className="node-detail-label">
                 {t('meshcore.contact_details.actions_label', 'Actions')}
@@ -599,6 +675,25 @@ export const MeshCoreContactDetailPanel: React.FC<MeshCoreContactDetailPanelProp
                     {tracing
                       ? t('meshcore.contact_details.trace_path_running', 'Tracing…')
                       : t('meshcore.contact_details.trace_path_button', 'Trace Path')}
+                  </button>
+                )}
+                {canShowPingButton && (
+                  <button
+                    type="button"
+                    className="btn-secondary"
+                    onClick={handlePingZeroHop}
+                    disabled={pinging}
+                    title={t(
+                      'meshcore.contact_details.ping_zero_hop_hint',
+                      'Send a zero-hop trace. A reply means this node is in direct radio range (repeaters and room servers only — companions do not repeat traces).',
+                    )}
+                    aria-label={t('meshcore.contact_details.ping_zero_hop_button', 'Ping (0 hop)')}
+                  >
+                    <UiIcon name="radioSignal" size={14} />
+                    {' '}
+                    {pinging
+                      ? t('meshcore.contact_details.ping_zero_hop_running', 'Pinging…')
+                      : t('meshcore.contact_details.ping_zero_hop_button', 'Ping (0 hop)')}
                   </button>
                 )}
                 {canShowDiscoverButton && (
@@ -675,6 +770,42 @@ export const MeshCoreContactDetailPanel: React.FC<MeshCoreContactDetailPanelProp
                 )}
                 {traceError && (
                   <span style={{ color: 'var(--ctp-red)' }} role="alert">{traceError}</span>
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* Zero-hop ping result (#4393). A reply proves a direct RF link;
+              a failure is reported verbatim from the server so "out of range"
+              reads differently from "not a Companion". */}
+          {pingResult && (
+            <div className="node-detail-card node-detail-card-2col">
+              <div className="node-detail-label">
+                {t('meshcore.contact_details.ping_zero_hop_results', 'Zero-Hop Ping')}
+              </div>
+              <div className="node-detail-value" role="status">
+                {pingResult.ok ? (
+                  <span style={{ color: 'var(--ctp-green)' }}>
+                    {t('meshcore.contact_details.ping_zero_hop_direct', 'Direct — in range')}
+                    {' · '}
+                    {t('meshcore.contact_details.ping_zero_hop_rtt', 'RTT')} {pingResult.rttMs} ms
+                    {pingResult.snrToTarget !== null && (
+                      <>
+                        {' · '}
+                        {t('meshcore.contact_details.ping_zero_hop_snr_out', 'SNR at node')}{' '}
+                        <span className={getSignalClass(pingResult.snrToTarget)}>
+                          {pingResult.snrToTarget.toFixed(2)} dB
+                        </span>
+                      </>
+                    )}
+                    {' · '}
+                    {t('meshcore.contact_details.ping_zero_hop_snr_in', 'SNR here')}{' '}
+                    <span className={getSignalClass(pingResult.snrFromTarget)}>
+                      {pingResult.snrFromTarget.toFixed(2)} dB
+                    </span>
+                  </span>
+                ) : (
+                  <span style={{ color: 'var(--ctp-red)' }}>{pingResult.error}</span>
                 )}
               </div>
             </div>
@@ -821,10 +952,7 @@ export const MeshCoreContactDetailPanel: React.FC<MeshCoreContactDetailPanelProp
                 {t('meshcore.contact_details.last_advert', 'Last Advert')}
               </div>
               <div className="node-detail-value">
-                {formatTimestamp(
-                  // lastAdvert is delivered in seconds; convert to ms.
-                  lastAdvert < 1e12 ? lastAdvert * 1000 : lastAdvert,
-                )}
+                {formatTimestamp(meshcoreLastHeardMs({ lastAdvert }) ?? undefined)}
               </div>
             </div>
           )}

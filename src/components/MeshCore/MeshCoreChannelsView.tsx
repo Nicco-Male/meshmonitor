@@ -22,6 +22,7 @@ import { MeshCoreContact, formatMeshCoreChannelName } from '../../utils/meshcore
 import { MeshCoreMessageStream } from './MeshCoreMessageStream';
 import { useAuth } from '../../contexts/AuthContext';
 import { loadChannelLastRead, markChannelRead as persistChannelRead } from './meshcoreUnreadStore';
+import { compareMeshCoreMessages } from './messageOrder';
 import { UiIcon } from '../icons';
 
 const MOBILE_BREAKPOINT = 768;
@@ -111,6 +112,19 @@ export const MeshCoreChannelsView: React.FC<MeshCoreChannelsViewProps> = ({
   // of the global recent-tail). Live updates still arrive via `messages` and
   // are merged in below.
   const [history, setHistory] = useState<MeshCoreMessage[]>([]);
+  // Infinite-scroll pagination for the active channel's history (#4460): does
+  // an older page exist beyond `history`, and is one currently being fetched.
+  // Reset alongside `history` on every channel switch/reconnect.
+  const [hasMoreHistory, setHasMoreHistory] = useState(false);
+  const [loadingOlderHistory, setLoadingOlderHistory] = useState(false);
+  // Mirrors `history` so `loadOlderHistory` always reads the current backlog
+  // length (as the fetch offset) without depending on `history` and thereby
+  // getting a fresh callback identity on every page load.
+  const historyRef = useRef<MeshCoreMessage[]>([]);
+  historyRef.current = history;
+  // Guards `loadOlderHistory` against a stale response landing after the
+  // operator has already switched channels.
+  const activeChannelIdxRef = useRef<number>(0);
   // Accurate persisted message count per channel index (for the list badges),
   // so a quiet channel doesn't read as empty next to a busy one just because
   // the shared pool's recent-tail happened to exclude it.
@@ -305,8 +319,14 @@ export const MeshCoreChannelsView: React.FC<MeshCoreChannelsViewProps> = ({
   // every status/message/node update from the mesh, even with zero user
   // interaction (#3880).
   const { getDefaultScope, fetchSavedRegions, discoverRegions } = actions;
+
+  // Both lookups below exist only to populate the scope-override control, which
+  // is a SEND-side affordance. Their routes are `requireAuth()` +
+  // `configuration: read`, so firing them for a read-only (or anonymous) viewer
+  // is guaranteed to 401 and buys nothing. Gate on `canSend` so the requests are
+  // never made rather than made and ignored.
   useEffect(() => {
-    if (!status?.connected) return;
+    if (!canSend || !status?.connected) return;
     let cancelled = false;
     void (async () => {
       try {
@@ -317,12 +337,13 @@ export const MeshCoreChannelsView: React.FC<MeshCoreChannelsViewProps> = ({
       }
     })();
     return () => { cancelled = true; };
-  }, [status?.connected, getDefaultScope]);
+  }, [canSend, status?.connected, getDefaultScope]);
 
   // Load the global saved-regions catalog (#3770) for the override suggestions.
   // This is a cheap local DB read (no radio traffic), so it's safe to run on
   // mount / source change regardless of connection state.
   useEffect(() => {
+    if (!canSend) return;
     let cancelled = false;
     void (async () => {
       try {
@@ -333,7 +354,7 @@ export const MeshCoreChannelsView: React.FC<MeshCoreChannelsViewProps> = ({
       }
     })();
     return () => { cancelled = true; };
-  }, [fetchSavedRegions, sourceId]);
+  }, [canSend, fetchSavedRegions, sourceId]);
 
   // Union of saved + discovered regions, de-duplicated, for the override
   // datalist. Saved regions come first (operator-curated), then any extra
@@ -382,24 +403,74 @@ export const MeshCoreChannelsView: React.FC<MeshCoreChannelsViewProps> = ({
     if (!sourceId) return;
     let cancelled = false;
     const idx = active.id;
+    activeChannelIdxRef.current = idx;
+    // A fresh channel/reconnect always starts pagination over from the newest
+    // page — any in-flight load-older for the previous channel is now stale.
+    setHasMoreHistory(false);
+    setLoadingOlderHistory(false);
     void (async () => {
       try {
+        // The initial page is intentionally larger than a load-older page
+        // (200 vs. loadOlderHistory's 100 below) — worth front-loading more
+        // on first open since it's the one fetch every channel visit pays
+        // for, while later pages are opportunistic and don't need to match.
         const url = `${baseUrl}/api/sources/${encodeURIComponent(sourceId)}/meshcore/messages/channel/${idx}?limit=200`;
         const response = await csrfFetch(url);
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
         const data = await response.json();
         if (!cancelled) {
           setHistory(data?.success && Array.isArray(data.data) ? (data.data as MeshCoreMessage[]) : []);
+          setHasMoreHistory(Boolean(data?.hasMore));
         }
       } catch (err) {
         if (!cancelled) {
           console.error('Failed to fetch MeshCore channel messages:', err);
           setHistory([]);
+          setHasMoreHistory(false);
         }
       }
     })();
     return () => { cancelled = true; };
   }, [baseUrl, sourceId, active.id, csrfFetch, status?.connected]);
+
+  // Load an older page of the active channel's history (#4460 infinite scroll).
+  // Offset is the current backlog length (oldest-first fetch order means the
+  // next page picks up right where `history`'s oldest entry leaves off).
+  // Idempotent against overlapping calls: bails if a load is already in
+  // flight or the channel has no older page.
+  const loadOlderHistory = useCallback(() => {
+    if (!sourceId || loadingOlderHistory || !hasMoreHistory) return;
+    const idx = active.id;
+    const offset = historyRef.current.length;
+    setLoadingOlderHistory(true);
+    void (async () => {
+      try {
+        const url = `${baseUrl}/api/sources/${encodeURIComponent(sourceId)}/meshcore/messages/channel/${idx}?limit=100&offset=${offset}`;
+        const response = await csrfFetch(url);
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const data = await response.json();
+        // The operator may have switched channels while this was in flight —
+        // discard a response that no longer matches the active channel.
+        if (activeChannelIdxRef.current !== idx) return;
+        if (data?.success && Array.isArray(data.data)) {
+          const older = data.data as MeshCoreMessage[];
+          setHistory(prev => {
+            const seen = new Set(prev.map(m => m.id));
+            const fresh = older.filter(m => !seen.has(m.id));
+            return [...fresh, ...prev];
+          });
+          setHasMoreHistory(Boolean(data.hasMore));
+        } else {
+          setHasMoreHistory(false);
+        }
+      } catch (err) {
+        console.error('Failed to load older MeshCore channel messages:', err);
+        if (activeChannelIdxRef.current === idx) setHasMoreHistory(false);
+      } finally {
+        if (activeChannelIdxRef.current === idx) setLoadingOlderHistory(false);
+      }
+    })();
+  }, [sourceId, baseUrl, csrfFetch, active.id, hasMoreHistory, loadingOlderHistory]);
 
   // Merge the fetched backlog with any live messages for this channel (socket
   // pushes land in `messages`). Dedupe by id, letting the live copy win so
@@ -411,7 +482,11 @@ export const MeshCoreChannelsView: React.FC<MeshCoreChannelsViewProps> = ({
     for (const m of messages) {
       if (activeFilter(m)) byId.set(m.id, m);
     }
-    return Array.from(byId.values()).sort((a, b) => a.timestamp - b.timestamp);
+    // NOT a raw `timestamp` sort: received messages carry the remote's
+    // whole-second `sender_timestamp` while our own sends are ms-precision
+    // Date.now(), so a same-second auto-reply sorted BEFORE its own trigger.
+    // See ./messageOrder.ts.
+    return Array.from(byId.values()).sort(compareMeshCoreMessages);
   }, [history, messages, activeFilter]);
 
   // Mark the active channel read up to its newest visible message. Runs whenever
@@ -471,16 +546,37 @@ export const MeshCoreChannelsView: React.FC<MeshCoreChannelsViewProps> = ({
   const connected = status?.connected ?? false;
 
   // Per-message delete + whole-channel clear (#3981). Both confirm first.
+  //
+  // Both MUST also prune `history`, not just await the action. The stream renders
+  // `filtered` = merge(history, messages), and the hook's delete/clear only prune
+  // the shared `messages` pool — so anything served from the per-channel backlog
+  // (#4460), which is nearly everything on this view, was deleted server-side and
+  // then immediately re-rendered from `history`. That read as "the delete button
+  // does nothing"; verified against the API, the row was already gone from the
+  // database while still on screen.
   const handleDeleteMessage = useCallback(async (m: MeshCoreMessage) => {
     if (!window.confirm(t('meshcore.confirm_delete_message', 'Delete this message?'))) return;
-    await actions.deleteMessage(m.id);
+    const ok = await actions.deleteMessage(m.id);
+    if (ok) {
+      setHistory(prev => prev.filter(x => x.id !== m.id));
+      setCounts(prev => {
+        const current = prev[activeChannelIdxRef.current];
+        if (typeof current !== 'number') return prev;
+        return { ...prev, [activeChannelIdxRef.current]: Math.max(0, current - 1) };
+      });
+    }
   }, [actions, t]);
   const handleClearChannel = useCallback(async () => {
     if (!window.confirm(t(
       'meshcore.confirm_clear_channel',
       'Clear all messages on this channel? This cannot be undone.',
     ))) return;
-    await actions.clearChannelMessages(active.id);
+    const ok = await actions.clearChannelMessages(active.id);
+    if (ok) {
+      setHistory([]);
+      setHasMoreHistory(false);
+      setCounts(prev => ({ ...prev, [active.id]: 0 }));
+    }
   }, [actions, active, t]);
 
   const mobileClass = mobileShowContent ? 'mobile-show-content' : 'mobile-show-list';
@@ -662,6 +758,9 @@ export const MeshCoreChannelsView: React.FC<MeshCoreChannelsViewProps> = ({
           onNodeNameClick={onNodeNameClick}
           onReply={handleReply}
           conversationKey={`channel-${active.id}`}
+          onLoadOlder={loadOlderHistory}
+          hasMoreOlder={hasMoreHistory}
+          loadingOlder={loadingOlderHistory}
           maxBytes={
             showScopeOverride && overrideScope !== null && overrideScope !== ''
               ? 120

@@ -375,6 +375,83 @@ describe('executeAction', () => {
     expect(Array.isArray(result)).toBe(false);
   });
 
+  // ── emojiMode (#4340) ───────────────────────────────────────────────────
+  it('tapback: emojiMode absent defaults to the configured emoji (👍)', async () => {
+    const { calls, deps } = recorder();
+    await executeAction(
+      node('action.tapback', {}),
+      ctx({ from: 5, channel: 3, packetId: 99, isDM: false }),
+      deps,
+    );
+    expect(calls[0].args).toMatchObject({ emoji: '👍' });
+  });
+
+  it("tapback: emojiMode 'fixed' uses the configured emoji", async () => {
+    const { calls, deps } = recorder();
+    await executeAction(
+      node('action.tapback', { emojiMode: 'fixed', emoji: '✅' }),
+      ctx({ from: 5, channel: 3, packetId: 99, isDM: false }),
+      deps,
+    );
+    expect(calls[0].args).toMatchObject({ emoji: '✅' });
+  });
+
+  it("tapback: emojiMode 'hopCount' derives the emoji from trigger.hops (0/3/9/-2)", async () => {
+    const cases: Array<[number, string]> = [[0, '*️⃣'], [3, '3️⃣'], [9, '7️⃣'], [-2, '*️⃣']];
+    for (const [hops, expected] of cases) {
+      const { calls, deps } = recorder();
+      await executeAction(
+        node('action.tapback', { emojiMode: 'hopCount' }),
+        ctx({ from: 5, channel: 3, packetId: 99, isDM: false, hops }),
+        deps,
+      );
+      expect(calls[0].args).toMatchObject({ emoji: expected });
+    }
+  });
+
+  it("tapback: emojiMode 'hopCount' ignores a stale params.emoji", async () => {
+    const { calls, deps } = recorder();
+    await executeAction(
+      node('action.tapback', { emojiMode: 'hopCount', emoji: '💯' }),
+      ctx({ from: 5, channel: 3, packetId: 99, isDM: false, hops: 3 }),
+      deps,
+    );
+    expect(calls[0].args).toMatchObject({ emoji: '3️⃣' });
+  });
+
+  it("tapback: emojiMode 'hopCount' with no hop info records a skip and never calls sendTapback", async () => {
+    const { calls, deps } = recorder();
+    const result = await executeAction(
+      node('action.tapback', { emojiMode: 'hopCount' }),
+      ctx({ from: 5, channel: 3, packetId: 99, isDM: false }), // no `hops` field
+      deps,
+    );
+    expect(result).toEqual({ skipped: true, reason: expect.stringMatching(/no hop count/) });
+    expect(calls).toHaveLength(0);
+  });
+
+  it("tapback: emojiMode 'hopCount' on a MeshCore source with hops present still hits the existing MeshCore skip", async () => {
+    const { calls, deps } = recorder();
+    const result = await executeAction(
+      node('action.tapback', { emojiMode: 'hopCount' }),
+      ctx({ from: 5, channel: 3, packetId: 99, isDM: false, hops: 2 }, 'mc', 'meshcore'),
+      deps,
+    );
+    expect(result).toMatchObject({ skipped: true, reason: 'tapback is not supported on MeshCore' });
+    expect(calls).toHaveLength(0);
+  });
+
+  it("tapback: emojiMode 'hopCount' sends the same derived emoji to every selected source", async () => {
+    const { calls, deps } = recorder();
+    await executeAction(
+      node('action.tapback', { emojiMode: 'hopCount', sourceIds: ['radioA', 'radioB'] }),
+      ctx({ from: 5, channel: 3, packetId: 99, isDM: false, hops: 1 }),
+      deps,
+    );
+    expect(calls.map((c) => c.args.sourceId)).toEqual(['radioA', 'radioB']);
+    expect(calls.every((c) => c.args.emoji === '1️⃣')).toBe(true);
+  });
+
   it('nodeManage: defaults to the subject node and validates op', async () => {
     const { calls, deps } = recorder();
     await executeAction(node('action.nodeManage', { op: 'favorite' }), ctx({ from: 222 }), deps);
@@ -685,6 +762,83 @@ describe('executeAction', () => {
     );
     expect(calls).toHaveLength(1);
     expect(calls[0].args).toMatchObject({ sourceId: 'srcB', channel: 3 });
+  });
+
+  // ── maxAttempts (#4340 Phase 3, WP3 §3.4) ───────────────────────────────
+  describe('sendMessage: maxAttempts forwarding', () => {
+    it('no maxAttempts param ⇒ the call shape has no maxAttempts key at all (unchanged behavior contract)', async () => {
+      const { calls, deps } = recorder();
+      await executeAction(
+        node('action.sendMessage', { text: 'hi', to: '{{ trigger.from }}' }),
+        ctx({ from: 5, channel: 1, isDM: true }),
+        deps,
+      );
+      expect(calls[0].args).not.toHaveProperty('maxAttempts');
+    });
+
+    it('maxAttempts: 2 forwards 2', async () => {
+      const { calls, deps } = recorder();
+      await executeAction(
+        node('action.sendMessage', { text: 'hi', to: '{{ trigger.from }}', maxAttempts: 2 }),
+        ctx({ from: 5, channel: 1, isDM: true }),
+        deps,
+      );
+      expect(calls[0].args.maxAttempts).toBe(2);
+    });
+
+    it("maxAttempts: '3' (string) forwards 3", async () => {
+      const { calls, deps } = recorder();
+      await executeAction(
+        node('action.sendMessage', { text: 'hi', to: '{{ trigger.from }}', maxAttempts: '3' }),
+        ctx({ from: 5, channel: 1, isDM: true }),
+        deps,
+      );
+      expect(calls[0].args.maxAttempts).toBe(3);
+    });
+
+    it('maxAttempts: 9 is clamped to 3 by parseSendMaxAttempts', async () => {
+      const { calls, deps } = recorder();
+      await executeAction(
+        node('action.sendMessage', { text: 'hi', to: '{{ trigger.from }}', maxAttempts: 9 }),
+        ctx({ from: 5, channel: 1, isDM: true }),
+        deps,
+      );
+      expect(calls[0].args.maxAttempts).toBe(3);
+    });
+
+    it("maxAttempts: '' (blank) forwards nothing — no maxAttempts key", async () => {
+      const { calls, deps } = recorder();
+      await executeAction(
+        node('action.sendMessage', { text: 'hi', to: '{{ trigger.from }}', maxAttempts: '' }),
+        ctx({ from: 5, channel: 1, isDM: true }),
+        deps,
+      );
+      expect(calls[0].args).not.toHaveProperty('maxAttempts');
+    });
+
+    it('is forwarded on the channel-multi (source×channel matrix) path too', async () => {
+      const { calls, deps } = recorder();
+      await executeAction(
+        node('action.sendMessage', { text: 'hi', sourceIds: ['A', 'B'], channels: [{ name: 'gauntlet', protocol: 'meshtastic' }], maxAttempts: 2 }),
+        ctxWithChannels({
+          A: [{ id: 2, name: 'gauntlet', role: 2 }],
+          B: [{ id: 5, name: 'gauntlet', role: 2 }],
+        }, { A: 'meshtastic', B: 'meshtastic' }),
+        deps,
+      );
+      expect(calls).toHaveLength(2);
+      expect(calls.every((c) => c.args.maxAttempts === 2)).toBe(true);
+    });
+
+    it('action.tapback never receives maxAttempts, even when params carry one (§9.2)', async () => {
+      const { calls, deps } = recorder();
+      await executeAction(
+        node('action.tapback', { emoji: '👍', maxAttempts: 3 }),
+        ctx({ from: 5, channel: 3, packetId: 99, isDM: true }),
+        deps,
+      );
+      expect(calls[0].args).not.toHaveProperty('maxAttempts');
+    });
   });
 
   it('nothing: is a no-op that calls no deps', async () => {

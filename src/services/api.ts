@@ -37,6 +37,81 @@ export interface MeshtasticContactUrl {
 }
 
 /**
+ * One traceroute a node took part in — as an endpoint or an intermediate hop.
+ * Backs `GET /api/traceroutes/participation/:nodeNum` (epic phase 2 traceroute
+ * picker). Structurally satisfies `TracerouteStripInput` — no adapter needed
+ * to feed `buildTracerouteStripGraph`.
+ *
+ * Deliberately omits `routePositions` — the server projection strips it
+ * (#3092 hop-position leak surface); the strip renders live positions instead.
+ */
+export interface TracerouteParticipationEntry {
+  id: number;
+  timestamp: number;
+  fromNodeNum: number;
+  toNodeNum: number;
+  fromNodeId: string;
+  toNodeId: string;
+  route: string | null;
+  routeBack: string | null;
+  snrTowards: string | null;
+  snrBack: string | null;
+  channel: number | null;
+  participation: 'endpoint' | 'hop';
+  hopCount: number | null;
+}
+
+/**
+ * One row from `GET /api/traceroutes/history/:from/:to`. The handler spreads the
+ * raw DB row and adds `hopCount` — it is NOT the participation projection, so it
+ * carries every stored column. Only the fields consumers actually read are named
+ * here; the index signature keeps the extra columns representable without `any`.
+ */
+export interface TracerouteHistoryEntry {
+  id: number;
+  timestamp: number;
+  fromNodeNum: number;
+  toNodeNum: number;
+  /**
+   * `traceroutes.fromNodeId`/`toNodeId` are `NOT NULL` columns (see
+   * `src/db/schema/traceroutes.ts`), so unlike the spec sketch's optional
+   * marking these are required — matching `TracerouteParticipationEntry`'s
+   * typing of the same underlying columns and what `TracerouteHistoryModal`'s
+   * `DbTraceroute`-derived state requires. See discrepancy log below.
+   */
+  fromNodeId: string;
+  toNodeId: string;
+  /**
+   * The `traceroutes.route`/`routeBack`/`snrTowards`/`snrBack` columns are
+   * nullable at the DB level, and the spec sketch typed these `string | null`
+   * accordingly. But `TracerouteHistoryModal.tsx` (not owned by WP1, must
+   * compile unedited) assigns this type into `TracerouteWithHops`, which
+   * extends the pre-existing `DbTraceroute` — itself typed with these fields
+   * as non-nullable `string`. Matching that (already-imperfect) contract here
+   * is what keeps the modal compiling; `toAggregateRows()` below still
+   * defensively normalizes with `?? null` since the runtime value can be
+   * `null` regardless of what this static type claims.
+   */
+  route: string;
+  routeBack: string;
+  snrTowards: string;
+  snrBack: string;
+  channel?: number | null;
+  hopCount: number;
+  /**
+   * Real, non-nullable DB column (`traceroutes.createdAt`) — the handler
+   * spreads the whole row (§D17), so this is always present on the wire even
+   * though the spec sketch's named-field list omitted it. Named explicitly
+   * (rather than left to the index signature) because `TracerouteHistoryModal`
+   * assigns this type into `TracerouteWithHops` (`DbTraceroute & { hopCount }`),
+   * which requires `createdAt: number` — an index-signature `unknown` is not
+   * assignable to that. See SR_PHASE2_SPEC.md discrepancy log (§3.2/WP1).
+   */
+  createdAt: number;
+  [key: string]: unknown;
+}
+
+/**
  * Error thrown by ApiService.request when the server returns a non-OK response.
  * Callers can distinguish by `status` (e.g. 429 for rate limit) and `code`
  * (machine-readable identifier from the server body) to pick a UX-appropriate
@@ -56,6 +131,52 @@ export class ApiError extends Error {
     this.body = options?.body;
     this.retryAfterSeconds = options?.retryAfterSeconds;
   }
+}
+
+/** Routing-ACK outcome for an admin command that waited for one (#4482). */
+export interface AdminCommandAck {
+  acked: boolean;
+  timedOut: boolean;
+  errorReason: number | null;
+  status: string;
+}
+
+/** Result payload of a settled admin command. */
+export interface AdminCommandResult {
+  message?: string;
+  ack?: AdminCommandAck;
+}
+
+/** First response to POST /api/admin/commands — 200 (local) or 202 (remote). */
+interface AdminCommandAccepted extends AdminCommandResult {
+  success: boolean;
+  /** Present only when the server opened a background operation. */
+  operationId?: string;
+  status?: string;
+}
+
+/** A snapshot of a background admin operation, as returned by the poll endpoint. */
+interface AdminOperationSnapshot {
+  // Mirrors AdminOperationStatus in src/server/services/adminOperationService.ts.
+  // `rejected` (node refused) and `timed_out` (no answer) were split out of
+  // `succeeded` in #4492 so a caller can tell the three apart from `status`
+  // alone, rather than reaching into `result.ack`.
+  status:
+    | 'pending'
+    | 'awaiting_passkey'
+    | 'sending'
+    | 'awaiting_ack'
+    | 'succeeded'
+    | 'rejected'
+    | 'timed_out'
+    | 'failed';
+  result?: AdminCommandResult | null;
+  error?: { code?: string; message?: string } | null;
+}
+
+/** The poll endpoint wraps its payload in the `{ success, data }` envelope. */
+interface AdminOperationEnvelope extends AdminOperationSnapshot {
+  data?: AdminOperationSnapshot;
 }
 
 class ApiService {
@@ -595,7 +716,7 @@ class ApiService {
   }
 
 
-  async importConfig(url: string, nodeNum?: number, sourceId?: string | null): Promise<{ success: boolean; imported: { channels: number; channelDetails: any[]; loraConfig: boolean }; requiresReboot?: boolean }> {
+  async importConfig(url: string, nodeNum?: number, sourceId?: string | null): Promise<{ success: boolean; imported: { channels: number; channelDetails: any[]; loraConfig: boolean; failedChannels?: number; failedChannelDetails?: Array<{ index: number; name: string }> }; requiresReboot?: boolean }> {
     await this.ensureBaseUrl();
     // Use admin endpoint if nodeNum is provided (for remote nodes), otherwise use standard endpoint
     const endpoint = nodeNum !== undefined ? '/api/admin/import-config' : '/api/channels/import-config';
@@ -612,7 +733,26 @@ class ApiService {
       throw new Error(error.error || 'Failed to import configuration');
     }
 
-    return response.json();
+    // Importing to a REMOTE node blocks on the passkey and a burst of admin
+    // sends, so that endpoint answers 202 + operation id (#4482 follow-up).
+    // Budget: up to 45s passkey + ~1s pacing per channel (8 max) + a
+    // requestRemoteConfig round-trip, all of which can retransmit. 5 minutes
+    // leaves room for that without the client abandoning a live import.
+    return this.followAdminOperation(await response.json(), { timeoutMs: 300_000 });
+  }
+
+  /**
+   * Ensure a session passkey is cached for a remote node.
+   *
+   * Acquisition costs up to 45s of mesh time, so the endpoint answers 202 +
+   * operation id for remote nodes and this follows it to completion (#4482
+   * follow-up). Local nodes answer synchronously — they need no passkey.
+   */
+  async ensureSessionPasskey<T extends { success: boolean }>(
+    body: Record<string, unknown>,
+  ): Promise<T> {
+    const accepted = await this.post<AdminCommandAccepted>('/api/admin/ensure-session-passkey', body);
+    return this.followAdminOperation<T>(accepted);
   }
 
   async encodeChannelUrl(channelIds: number[], includeLoraConfig: boolean, nodeNum?: number, sourceId?: string | null): Promise<string> {
@@ -817,16 +957,25 @@ class ApiService {
     return response.json();
   }
 
-  async getTracerouteHistory(fromNodeNum: number, toNodeNum: number, limit: number = 50, sourceId?: string | null) {
-    await this.ensureBaseUrl();
+  /**
+   * Traceroute history between two specific nodes. The endpoint returns a
+   * bare array (no `{success,data}` envelope), so `request()`'s pass-through
+   * behavior (CLAUDE.md) is exactly what's needed here — no unwrapping.
+   */
+  async getTracerouteHistory(
+    fromNodeNum: number,
+    toNodeNum: number,
+    limit: number = 50,
+    sourceId?: string | null,
+  ): Promise<TracerouteHistoryEntry[]> {
     // Scope to the active source so a single-source view (e.g. the radio/TCP
     // source) does not mix in traceroutes recorded by other sources — MQTT
     // broker/bridge sources record many flood-relayed copies of the same reply
     // (see backend traceroute history handler).
     const sourceQuery = sourceId ? `&sourceId=${encodeURIComponent(sourceId)}` : '';
-    const response = await fetch(`${this.baseUrl}/api/traceroutes/history/${fromNodeNum}/${toNodeNum}?limit=${limit}${sourceQuery}`);
-    if (!response.ok) throw new Error('Failed to fetch traceroute history');
-    return response.json();
+    return this.get<TracerouteHistoryEntry[]>(
+      `/api/traceroutes/history/${fromNodeNum}/${toNodeNum}?limit=${limit}${sourceQuery}`,
+    );
   }
 
   async getBaseUrl(): Promise<string> {
@@ -870,6 +1019,25 @@ class ApiService {
       `/api/telemetry/${encodeURIComponent(validatedNodeId ?? nodeId)}/signal-trend${qs}`,
     );
     return body.data;
+  }
+
+  /**
+   * Traceroutes a node took part in (endpoint or intermediate hop) on ONE source.
+   * Backs the Node Details traceroute picker. Unwraps the `{success,data}`
+   * envelope here because `request()` deliberately does not (CLAUDE.md).
+   */
+  async getTracerouteParticipation(
+    nodeNum: number,
+    sourceId: string,
+    opts: { hours?: number; limit?: number } = {},
+  ): Promise<TracerouteParticipationEntry[]> {
+    const params = new URLSearchParams({ sourceId });
+    if (opts.hours != null) params.set('hours', String(opts.hours));
+    if (opts.limit != null) params.set('limit', String(opts.limit));
+    const body = await this.get<{ success: boolean; data: { entries: TracerouteParticipationEntry[] } }>(
+      `/api/traceroutes/participation/${nodeNum}?${params.toString()}`,
+    );
+    return body.data?.entries ?? [];
   }
 
   /** Generate a source-scoped Meshtastic SharedContact URL for a node. */
@@ -1458,6 +1626,119 @@ class ApiService {
     }
 
     return response.json();
+  }
+
+  /**
+   * Send an admin command, transparently following the async operation the
+   * server opens for remote nodes (#4482).
+   *
+   * A remote admin command can take up to 75s of mesh time (session passkey +
+   * routing ACK). The server no longer holds the HTTP request open for that —
+   * it replies 202 with an operation id, and this polls until the operation
+   * settles. Callers keep their plain `await` semantics and the same result
+   * shape (`message`, optional `ack`); only the transport underneath changed.
+   *
+   * A local-node command still returns its result in the first response, so
+   * this resolves without any polling at all.
+   */
+  async sendAdminCommand<T extends { success: boolean; message?: string }>(
+    body: Record<string, unknown>,
+    options?: { signal?: AbortSignal },
+  ): Promise<T> {
+    const accepted = await this.post<AdminCommandAccepted>('/api/admin/commands', body);
+    return this.followAdminOperation<T>(accepted, options);
+  }
+
+  /**
+   * Follow a background admin operation to completion (#4482).
+   *
+   * Shared by every endpoint that can answer 202 + operation id — admin
+   * commands, session-passkey acquisition, and remote config import all block
+   * on the same mesh round-trips and are followed the same way. A response
+   * without an operation id is already final and passes straight through.
+   */
+  private async followAdminOperation<T>(
+    accepted: AdminCommandAccepted,
+    options?: { signal?: AbortSignal; timeoutMs?: number },
+  ): Promise<T> {
+    // Local node (or any server that answered synchronously): already done.
+    if (!accepted?.operationId) {
+      return accepted as unknown as T;
+    }
+
+    const operationId: string = accepted.operationId;
+    const startedAt = Date.now();
+    // Default sits above a single command's ~75s worst case (45s passkey +
+    // 30s ACK). Longer operations pass their own budget — a remote config
+    // import adds ~1s of pacing per channel plus a requestRemoteConfig
+    // round-trip on top of the passkey leg, which 120s does not cover with
+    // any margin on a retransmitting link.
+    const overallTimeoutMs = options?.timeoutMs ?? 120_000;
+    let delayMs = 500;
+
+    for (;;) {
+      if (options?.signal?.aborted) {
+        throw new ApiError('Admin command polling aborted', 0, { code: 'ABORTED' });
+      }
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+      // Ease off quickly at first, then settle into a steady 2s poll.
+      delayMs = Math.min(delayMs * 1.5, 2000);
+
+      if (Date.now() - startedAt > overallTimeoutMs) {
+        throw new ApiError(
+          'Timed out waiting for the admin command to complete',
+          504,
+          { code: 'OPERATION_POLL_TIMEOUT' },
+        );
+      }
+
+      let snapshot: AdminOperationEnvelope;
+      try {
+        snapshot = await this.get<AdminOperationEnvelope>(`/api/admin/operations/${operationId}`);
+      } catch (error) {
+        // A restarted server drops in-flight operations; surface that plainly
+        // rather than spinning until the overall timeout.
+        if (error instanceof ApiError && error.status === 404) {
+          throw new ApiError(
+            'The admin operation is no longer available (the server may have restarted)',
+            404,
+            { code: 'OPERATION_NOT_FOUND' },
+          );
+        }
+        throw error;
+      }
+
+      const operation = snapshot?.data ?? snapshot;
+      // `rejected` and `timed_out` are terminal too (#4492). They MUST be
+      // handled here — before #4492 both settled as `succeeded`, so omitting
+      // them would leave this loop polling a settled operation until the
+      // overall timeout.
+      //
+      // They resolve rather than throw, and carry `result.ack` exactly as
+      // before, so the existing ACK branching in the UI keeps working
+      // unchanged; `status` is added alongside for callers that want to read
+      // the outcome directly instead of destructuring the ack.
+      if (
+        operation?.status === 'succeeded' ||
+        operation?.status === 'rejected' ||
+        operation?.status === 'timed_out'
+      ) {
+        return {
+          success: true,
+          status: operation.status,
+          ...(operation.result ?? {}),
+        } as unknown as T;
+      }
+      if (operation?.status === 'failed') {
+        const failure = operation.error ?? {};
+        throw new ApiError(
+          failure.message || 'Admin command failed',
+          502,
+          { code: failure.code, body: operation },
+        );
+      }
+      // Still pending / awaiting_passkey / sending / awaiting_ack — keep polling.
+    }
   }
 
   async setSecurityConfig(config: {

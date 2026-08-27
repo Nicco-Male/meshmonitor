@@ -16,7 +16,8 @@ import { logger } from '../../utils/logger.js';
 import { requireAuth, optionalAuth, requirePermission } from '../auth/authMiddleware.js';
 import { meshcoreDeviceLimiter, messageLimiter } from '../middleware/rateLimiters.js';
 import { getMeshCoreCredentialStore } from '../services/meshcoreCredentialStore.js';
-import { managerFor, VALIDATION, isValidPublicKey, isValidMessage, auditMeshcoreEvent } from './meshcoreRouteShared.js';
+import { managerFor, VALIDATION, isValidPublicKey, isValidMessage, auditMeshcoreEvent,
+  requireMeshcoreChannelAccess, canAccessMeshcoreChannel } from './meshcoreRouteShared.js';
 
 const router = Router({ mergeParams: true });
 
@@ -55,8 +56,12 @@ router.get('/messages', optionalAuth(), requirePermission('messages', 'read', { 
  * Per-channel message backlog. Unlike /messages (a global recent-tail shared by
  * every channel and DM), this returns just channel :idx's history — so a busy
  * channel can't push another channel's messages out of the visible window.
+ *
+ * Supports `offset` for infinite-scroll pagination (load-older-on-scroll-to-top,
+ * #4460), mirroring the Meshtastic `/api/messages/channel/:channel` endpoint.
+ * `hasMore` in the response tells the client whether an older page exists.
  */
-router.get('/messages/channel/:idx', optionalAuth(), requirePermission('messages', 'read', { sourceIdFrom: 'params.id' }), async (req: Request, res: Response) => {
+router.get('/messages/channel/:idx', optionalAuth(), requireMeshcoreChannelAccess('read'), async (req: Request, res: Response) => {
   try {
     const idx = parseInt(req.params.idx, 10);
     if (isNaN(idx) || idx < 0) {
@@ -68,11 +73,27 @@ router.get('/messages/channel/:idx', optionalAuth(), requirePermission('messages
     } else if (limit > VALIDATION.MAX_MESSAGE_LIMIT) {
       limit = VALIDATION.MAX_MESSAGE_LIMIT;
     }
-    const messages = await managerFor(req, res).getChannelMessages(idx, limit);
+    let offset = parseInt(req.query.offset as string || '0', 10);
+    if (isNaN(offset) || offset < 0) {
+      offset = 0;
+    } else if (offset > VALIDATION.MAX_MESSAGE_OFFSET) {
+      offset = VALIDATION.MAX_MESSAGE_OFFSET;
+    }
+    // The manager already reverses the DB's newest-first rows to oldest-first
+    // (see MeshCoreManager.getChannelMessages), so `page` here is ascending.
+    // Fetch limit+1 to detect whether an older page exists without a
+    // separate COUNT query.
+    const page = await managerFor(req, res).getChannelMessages(idx, limit + 1, offset);
+    const hasMore = page.length > limit;
+    // The extra lookahead row is the oldest one in this ascending array —
+    // i.e. index 0 — so drop it to send exactly `limit` messages, still
+    // oldest-first, to the client.
+    const messages = hasMore ? page.slice(1) : page;
     res.json({
       success: true,
       data: messages,
       count: messages.length,
+      hasMore,
     });
   } catch (error) {
     logger.error('[API] Error getting channel messages:', error);
@@ -87,7 +108,7 @@ router.get('/messages/channel/:idx', optionalAuth(), requirePermission('messages
  * message timestamp per channel (`latestTimestamps`) for the unread indicator
  * (#3703) — channels with no messages are omitted from that map.
  */
-router.get('/messages/channel-counts', optionalAuth(), requirePermission('messages', 'read', { sourceIdFrom: 'params.id' }), async (req: Request, res: Response) => {
+router.get('/messages/channel-counts', optionalAuth(), async (req: Request, res: Response) => {
   try {
     const raw = (req.query.channels as string | undefined) ?? '';
     const indices = raw
@@ -95,7 +116,26 @@ router.get('/messages/channel-counts', optionalAuth(), requirePermission('messag
       .map((s) => parseInt(s.trim(), 10))
       .filter((n) => Number.isInteger(n) && n >= 0);
     // De-dupe and cap to a sane number of channels per request.
-    const unique = Array.from(new Set(indices)).slice(0, 64);
+    const requested = Array.from(new Set(indices)).slice(0, 64);
+
+    // This endpoint takes a LIST, so a single all-or-nothing gate is wrong: a
+    // user who can read one channel would get a 403 for asking about several.
+    // Filter to the channels they may read and answer for those — an empty
+    // result leaks nothing.
+    const user = (req as Request & { user?: { id: number; isAdmin?: boolean } }).user;
+    if (!user) {
+      return res.status(401).json({ error: 'Authentication required', code: 'UNAUTHORIZED' });
+    }
+    const sourceId = typeof req.params.id === 'string' && req.params.id.length > 0
+      ? req.params.id
+      : undefined;
+    const unique = user.isAdmin
+      ? requested
+      : (await Promise.all(
+          requested.map(async (idx) =>
+            (await canAccessMeshcoreChannel(user.id, idx, 'read', sourceId)) ? idx : null),
+        )).filter((idx): idx is number => idx !== null);
+
     const manager = managerFor(req, res);
     const [counts, latestTimestamps] = unique.length > 0
       ? await Promise.all([
@@ -135,7 +175,7 @@ router.delete('/messages', requireAuth(), requirePermission('messages', 'write',
  * Clear every message on a channel index for this source (#3981). Registered
  * before /messages/:id so the two-segment path wins the route match.
  */
-router.delete('/messages/channel/:idx', requireAuth(), requirePermission('messages', 'write', { sourceIdFrom: 'params.id' }), async (req: Request, res: Response) => {
+router.delete('/messages/channel/:idx', requireAuth(), requireMeshcoreChannelAccess('write'), async (req: Request, res: Response) => {
   try {
     const idx = parseInt(req.params.idx, 10);
     if (isNaN(idx) || idx < 0) {

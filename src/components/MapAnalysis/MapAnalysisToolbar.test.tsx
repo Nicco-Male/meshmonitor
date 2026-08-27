@@ -8,6 +8,13 @@ import { MemoryRouter } from 'react-router-dom';
 import MapAnalysisToolbar from './MapAnalysisToolbar';
 import { MapAnalysisProvider } from './MapAnalysisContext';
 
+// #4447: the Back to Sources button must navigate with `showList` state.
+const mockNavigate = vi.fn();
+vi.mock('react-router-dom', async () => {
+  const actual = await vi.importActual<typeof import('react-router-dom')>('react-router-dom');
+  return { ...actual, useNavigate: () => mockNavigate };
+});
+
 vi.mock('../../hooks/useDashboardData', () => ({
   useDashboardSources: () => ({ data: [{ id: 'a', name: 'A' }, { id: 'b', name: 'B' }] }),
   // The Polar Grid toggle resolves own-node positions via these hooks (#3971).
@@ -49,6 +56,7 @@ const wrapper = ({ children }: { children: React.ReactNode }) => {
 describe('MapAnalysisToolbar', () => {
   beforeEach(() => {
     localStorage.clear();
+    mockNavigate.mockClear();
     elevationEnabled = true;
     unifiedNodes = [];
     terrainCapabilities = { enabled: true, terrainTiles: true, isLoading: false };
@@ -205,6 +213,87 @@ describe('MapAnalysisToolbar', () => {
       );
       render(<MapAnalysisToolbar />, { wrapper });
       expect(screen.getByRole('button', { name: '3D View' })).toHaveClass('active');
+    });
+  });
+
+  // #4371 C: toggles the 3D canvas can't act on are disabled with a reason
+  // rather than silently doing nothing.
+  describe('2D-only layer toggles in 3D (#4371 C)', () => {
+    const render3d = () => {
+      localStorage.setItem('mapAnalysis.config.v1', JSON.stringify({ version: 1, viewMode: '3d' }));
+      // Give Polar Grid an own-node position so it isn't disabled for that reason.
+      unifiedNodes = [{ nodeNum: 1, latitude: 30, longitude: -90 }];
+      render(<MapAnalysisToolbar />, { wrapper });
+    };
+
+    it.each(['Heatmap', 'Trails', 'Hop Shading', 'SNR Overlay', 'Waypoints', 'Accuracy Regions', 'ATAK Contacts', 'Polar Grid'])(
+      'disables %s in 3D and says why',
+      (label) => {
+        render3d();
+        const btn = screen.getByRole('button', { name: new RegExp(`^${label}$`, 'i') });
+        expect(btn).toBeDisabled();
+        expect(btn).toHaveAttribute('title', `${label} — 2D view only`);
+      },
+    );
+
+    it.each(['Markers', 'Traceroutes', 'Neighbors'])('leaves %s enabled in 3D (the 3D canvas draws it)', (label) => {
+      render3d();
+      expect(screen.getByRole('button', { name: new RegExp(`^${label}$`, 'i') })).not.toBeDisabled();
+    });
+
+    it('leaves every layer toggle enabled in 2D', () => {
+      render(<MapAnalysisToolbar />, { wrapper });
+      // Polar Grid is excluded: it has its own #3971 own-node-position gate,
+      // covered above.
+      for (const label of ['Heatmap', 'Trails', 'Waypoints', 'SNR Overlay', 'ATAK Contacts']) {
+        expect(screen.getByRole('button', { name: new RegExp(`^${label}$`, 'i') })).not.toBeDisabled();
+      }
+    });
+
+    it('re-enables the 2D-only toggles when a persisted 3d is force-corrected to 2D', () => {
+      // Capabilities resolved unavailable ⇒ MapAnalysisCanvas renders the 2D
+      // map immediately, and writes viewMode:'2d' back a render later. Keying
+      // the gating on raw config.viewMode greyed these out over a 2D map for
+      // that window; both now read the same effective view mode.
+      terrainCapabilities = { enabled: false, terrainTiles: false, isLoading: false };
+      localStorage.setItem('mapAnalysis.config.v1', JSON.stringify({ version: 1, viewMode: '3d' }));
+      render(<MapAnalysisToolbar />, { wrapper });
+      expect(screen.getByRole('button', { name: /^heatmap$/i })).not.toBeDisabled();
+    });
+
+    it('still gates while capabilities are loading (3D is what is on screen)', () => {
+      // Mid-flight the canvas keeps rendering 3D, so the toggles must stay
+      // disabled — flipping them on and back would flicker.
+      terrainCapabilities = { enabled: false, terrainTiles: false, isLoading: true };
+      localStorage.setItem('mapAnalysis.config.v1', JSON.stringify({ version: 1, viewMode: '3d' }));
+      render(<MapAnalysisToolbar />, { wrapper });
+      expect(screen.getByRole('button', { name: /^heatmap$/i })).toBeDisabled();
+    });
+
+    it('keeps a 2D-only layer’s persisted state untouched while in 3D', () => {
+      localStorage.setItem(
+        'mapAnalysis.config.v1',
+        JSON.stringify({
+          version: 1,
+          viewMode: '3d',
+          layers: { heatmap: { enabled: true, lookbackHours: 24 } },
+        }),
+      );
+      render(<MapAnalysisToolbar />, { wrapper });
+      // Disabled, but still shown as on — switching back to 2D restores it.
+      const btn = screen.getByRole('button', { name: /^heatmap$/i });
+      expect(btn).toBeDisabled();
+      expect(btn).toHaveClass('active');
+    });
+  });
+
+  describe('Back to Sources button (#4447)', () => {
+    it('navigates with showList so the dashboard does not bounce to the default landing page', () => {
+      render(<MapAnalysisToolbar />, { wrapper });
+      fireEvent.click(screen.getByRole('button', { name: /back to sources/i }));
+      // Without the flag, DashboardPage's default-landing-page effect redirects
+      // straight back out of the dashboard the user just asked for.
+      expect(mockNavigate).toHaveBeenCalledWith('/', { state: { showList: true } });
     });
   });
 });

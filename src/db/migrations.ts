@@ -143,6 +143,12 @@ import { migration as addXeddsaSignedMigration, runMigration125Postgres, runMigr
 import { migration as addTransportFlagsMigration, runMigration126Postgres, runMigration126Mysql } from '../server/migrations/126_add_transport_flags_to_nodes.js';
 import { migration as addAtakContactsMigration, runMigration127Postgres, runMigration127Mysql } from '../server/migrations/127_add_atak_contacts.js';
 import { migration as mqttOkToMqttViolationsMigration, runMigration128Postgres, runMigration128Mysql } from '../server/migrations/128_mqtt_oktomqtt_violations.js';
+import { migration as addShowAtakContactsMigration, runMigration129Postgres, runMigration129Mysql } from '../server/migrations/129_add_show_atak_contacts_to_map_prefs.js';
+import { migration as addWaypointChannelMigration, runMigration130Postgres, runMigration130Mysql } from '../server/migrations/130_add_waypoint_channel.js';
+import { migration as seedPerSourceNodeDisplayMigration, runMigration131Postgres, runMigration131Mysql } from '../server/migrations/131_seed_per_source_node_display.js';
+import { migration as fanOutSettingsPermissionsMigration, runMigration132Postgres, runMigration132Mysql } from '../server/migrations/132_fan_out_settings_permissions.js';
+import { migration as addMeshCoreObserverKeysMigration, runMigration133Postgres, runMigration133Mysql } from '../server/migrations/133_add_meshcore_observer_keys.js';
+import { migration as clearNullIslandEstimatesMigration, runMigration134Postgres, runMigration134Mysql } from '../server/migrations/134_clear_null_island_estimates.js';
 
 // ============================================================================
 // Registry
@@ -2036,4 +2042,98 @@ registry.register({
   sqlite: (db) => mqttOkToMqttViolationsMigration.up(db),
   postgres: (client) => runMigration128Postgres(client),
   mysql: (pool) => runMigration128Mysql(pool),
+});
+
+// ---------------------------------------------------------------------------
+// Migration 129: persist the "Show ATAK Contacts" map toggle (#4378). #3691
+// added the toggle and its MapContext default but never the column behind it,
+// so every save was silently dropped by the route's explicit field list.
+// ---------------------------------------------------------------------------
+
+registry.register({
+  number: 129,
+  name: 'add_show_atak_contacts_to_map_prefs',
+  settingsKey: 'migration_129_add_show_atak_contacts_to_map_prefs',
+  sqlite: (db) => addShowAtakContactsMigration.up(db),
+  postgres: (client) => runMigration129Postgres(client),
+  mysql: (pool) => runMigration129Mysql(pool),
+});
+
+// ---------------------------------------------------------------------------
+// Migration 130: per-waypoint broadcast channel (#4341). Waypoints used to go
+// out on the implicit slot 0; the editor now lets the user choose, and the
+// choice has to survive reloads and drive the rebroadcast scheduler.
+// NULL = not chosen, and every read site falls back to 0.
+// ---------------------------------------------------------------------------
+
+registry.register({
+  number: 130,
+  name: 'add_waypoint_channel',
+  settingsKey: 'migration_130_add_waypoint_channel',
+  sqlite: (db) => addWaypointChannelMigration.up(db),
+  postgres: (client) => runMigration130Postgres(client),
+  mysql: (pool) => runMigration130Mysql(pool),
+});
+
+// ---------------------------------------------------------------------------
+// Migration 131: seed the per-source Node Display settings (#4412). Copies the
+// current global value (or the documented default) into `source:{id}:{key}` for
+// every existing source and all ten Node Display keys, so Phase 2's per-source
+// reads — which deliberately have no global fallback (#2839) — do not silently
+// fall back to hardcoded defaults on upgrade. Insert-if-absent: never clobbers a
+// value a user already set per-source.
+// ---------------------------------------------------------------------------
+
+registry.register({
+  number: 131,
+  name: 'seed_per_source_node_display',
+  settingsKey: 'migration_131_seed_per_source_node_display',
+  sqlite: (db) => seedPerSourceNodeDisplayMigration.up(db),
+  postgres: (client) => runMigration131Postgres(client),
+  mysql: (pool) => runMigration131Mysql(pool),
+});
+
+// ---------------------------------------------------------------------------
+// Migration 132: fan out `settings` permission grants across every source
+// (#4416). WP1 added 'settings' to SOURCEY_RESOURCES, which makes every
+// existing sourceId=NULL settings grant instantly inert (checkPermissionAsync's
+// sourcey branch requires an exact sourceId match). This migration converts
+// each user's EFFECTIVE settings access — the OR across every settings row
+// they have, regardless of that row's own scope — into an equivalent
+// per-source row on every source that exists today, then removes the
+// now-inert global rows. See PER_SOURCE_NODE_DISPLAY_PHASE6_SPEC.md §3.
+// ---------------------------------------------------------------------------
+
+registry.register({
+  number: 132,
+  name: 'fan_out_settings_permissions',
+  settingsKey: 'migration_132_fan_out_settings_permissions',
+  sqlite: (db) => fanOutSettingsPermissionsMigration.up(db),
+  postgres: (client) => runMigration132Postgres(client),
+  mysql: (pool) => runMigration132Mysql(pool),
+});
+
+// ---------------------------------------------------------------------------
+// Migration 133: create `meshcore_observer_keys` (epic #4457, Phase 1 WP1).
+// One row per MeshCore source holding that source's companion Ed25519 (orlp
+// format) signing key, encrypted at rest. Powers the MeshCore Analyzer
+// Observer MQTT output's auth-token minting (Phase 2/3 consumer).
+// ---------------------------------------------------------------------------
+
+registry.register({
+  number: 133,
+  name: 'add_meshcore_observer_keys',
+  settingsKey: 'migration_133_add_meshcore_observer_keys',
+  sqlite: (db) => addMeshCoreObserverKeysMigration.up(db),
+  postgres: (client) => runMigration133Postgres(client),
+  mysql: (pool) => runMigration133Mysql(pool),
+});
+
+registry.register({
+  number: 134,
+  name: 'clear_null_island_estimates',
+  settingsKey: 'migration_134_clear_null_island_estimates',
+  sqlite: (db) => clearNullIslandEstimatesMigration.up(db),
+  postgres: (client) => runMigration134Postgres(client),
+  mysql: (pool) => runMigration134Mysql(pool),
 });

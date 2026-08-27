@@ -39,8 +39,9 @@ Key properties:
   (below) to scope a workflow to a subset of sources when you want.
 - **Permission-gated.** The tab and its API are gated by a dedicated global `automations`
   permission, separate from the legacy per-source `automation` permission.
-- **Cooldown / rate-limit** per automation prevents mesh spam, plus a per-run action cap and a
-  loop guard so an automation can't runaway-recurse.
+- **Cooldown / rate-limit** per automation, or **per node / per source+node** via the trigger's
+  *Cooldown applies to* (below), prevents mesh spam, plus a per-run action cap and a loop guard
+  so an automation can't runaway-recurse.
 - **Variables** — a separate management area for user-defined values (constants and runtime
   flags/counters) referenced anywhere as `{{ var.name }}`.
 - **Run log** — every fire is recorded with its per-step outcome for debugging.
@@ -93,7 +94,9 @@ every hour). It is backed by a live [croner](https://github.com/Hexagon/croner) 
 - A cron job is armed per enabled schedule automation; **create / update / enable / disable /
   delete** all re-arm correctly (the old job is stopped first, so there are never stale or
   duplicate jobs).
-- The per-automation **cooldown** is honored on each fire.
+- The **cooldown** is honored on each fire. A schedule trigger has no triggering message and no
+  subject node, so its cooldown is always **automation-wide** — the *Cooldown applies to* field
+  isn't offered here (see [Cooldown applies to](#cooldown-applies-to)).
 - The cron is **validated at save time** (5-field, no seconds) — an invalid expression is rejected
   in the builder rather than silently never firing.
 
@@ -114,6 +117,48 @@ inside)** it. The region is drawn directly on a Leaflet map — either a **circl
 or a **polygon** — using the shared geofence map editor. Evaluation is shape-aware (point-in-circle
 or polygon ray-cast). See also the dedicated [Geofence Triggers](/features/geofence-triggers) page.
 
+### Cooldown applies to
+
+The five triggers with a **Cooldown (seconds)** field — **A message is received**, **A new node is
+discovered**, **A node is updated**, **Telemetry is received**, and **A node enters/leaves a
+region** — also get a **Cooldown applies to** select, directly beneath it. It's hidden until you set
+a non-zero cooldown, and setting the cooldown back to `0` hides it again without losing your choice
+— the value is remembered if you raise the cooldown again later. (Schedule and System triggers have
+no cooldown field at all, so they get no scope field either.)
+
+| Value | Meaning |
+| --- | --- |
+| **The whole automation (one shared timer)** | One timer for the whole rule — the default, and what an automation with no scope set (including every automation saved before this feature existed) behaves as. On a busy channel, acking one sender suppresses the ack to the next one until the window elapses. |
+| **Each node separately** | One timer per subject node (the message sender, the telemetry/geofence node, …) — acking one range-tester no longer suppresses the ack to the next. |
+| **Each node, per source** | One timer per (source, node) — the same physical node heard via two sources (e.g. a Meshtastic TCP link and an MQTT bridge) cools down independently. |
+
+**Worked example** — `trigger.message` on channel `Primary`, cooldown `60`, scope **Each node
+separately**:
+
+| t | event | verdict |
+| --- | --- | --- |
+| 0s | node 111 sends "test" | fires |
+| 5s | node 222 sends "test" | **fires** (under *The whole automation* this would be suppressed) |
+| 20s | node 111 sends "test" | suppressed — `cooldown active — 40s remaining (node 111)` |
+| 70s | node 111 sends "test" | fires (window elapsed) |
+
+Under **Each node, per source**, node 111 heard on `tcp-1` and on `mqtt-1` cools down independently
+— a message on one source never suppresses the ack on the other.
+
+**Degraded fallback, honestly stated.** Per-node/per-source scoping needs a subject to key off. When
+an event has none, the cooldown falls back to one shared timer — the same behaviour as *The whole
+automation* — rather than never firing or never cooling down. This applies to:
+
+- **Schedule** and **System** triggers (no triggering message, so no subject node at all).
+- **MeshCore channel messages.** MeshCore **DMs and room posts** get real per-sender cooldown, keyed
+  by the sender's public key — the same identity Auto-Acknowledge's own per-node cooldown uses. A
+  **channel** post cannot, on any design: the protocol carries no per-sender identity on a channel
+  packet, only a synthetic per-channel slot key shared by *every* sender on that channel, so keying
+  off it would look per-node while actually being per-channel.
+
+The live trace names which fallback applied, e.g. `cooldown active — 12s remaining (automation-wide
+(this event has no subject node))`.
+
 ## Conditions
 
 Conditions form the **IF** of each rule. Each condition is a *router*: matched events follow its
@@ -123,8 +168,8 @@ different set — this is how If / ElseIf / Else is built.
 | Condition | What it checks |
 | --- | --- |
 | **Always (no filtering)** | A pass-through that always matches — use it when a rule should act unconditionally |
-| **Number comparison** | A numeric field (`==`, `!=`, `>`, `<`, `>=`, `<=`). Fields come from the event (e.g. hop count, SNR/RSSI), the hydrated **node** record (battery, hops away, role, position, age, …), or the node's **latest telemetry**. The value can be a literal or `{{ var.name }}` |
-| **Text comparison** | A string field (`contains`, `equals`, `starts with`, `ends with`, `matches regex`, `doesn't contain`) over message text, node name/role, etc. |
+| **Number comparison** | A numeric field (`==`, `!=`, `>`, `<`, `>=`, `<=`). Fields come from the event (e.g. hop count, SNR/RSSI, **is a direct message**, **arrived via MQTT**, **direct RF / 0 hops**), the hydrated **node** record (battery, hops away, role, position, age, …), or the node's **latest telemetry**. The value can be a literal or `{{ var.name }}` |
+| **Text comparison** | A string field (`contains`, `equals`, `starts with`, `ends with`, `matches regex`, `doesn't contain`, `is one of`, `isn't one of`) over message text, node name/role, node info completeness, etc. |
 | **Source is one of…** | The **Source filter** — restricts the workflow to a chosen subset of sources (the "global but scopeable" knob). Leave empty to allow any source |
 | **Distance from a point** | The subject node is within / farther than *N* km of a reference lat/lon |
 | **Variable check** | Compares a [user-defined variable](#variables) against a literal or another value; with no operator it tests "is set / flag raised?" |
@@ -132,6 +177,67 @@ different set — this is how If / ElseIf / Else is built.
 
 A missing or undefined field never throws — numeric/string comparisons against it simply evaluate
 **false**.
+
+### `isDM` / `viaMqtt` / `zeroHop` — booleans as `1`/`0`
+
+The message trigger's **Number comparison** field picker offers **Is a direct message** (`isDM`),
+**Arrived via MQTT** (`viaMqtt`), and **Direct RF, 0 hops** (`zeroHop`) alongside hop count, SNR,
+and RSSI. All three resolve as a number — `1` for true, `0` for false — because a boolean value
+compared with `condition.numeric` is coerced the same way (`true → 1`, `false → 0`). Compare with
+`== 1` / `== 0` rather than a boolean literal:
+
+- `isDM == 1` — the message is a direct message; `isDM == 0` — it's a channel/broadcast post.
+- `viaMqtt == 1` — it arrived over an MQTT bridge; `viaMqtt == 0` — it arrived over RF.
+- `zeroHop == 1` — it arrived direct over RF with 0 hops; `zeroHop == 0` — it was relayed (1+
+  hops) or arrived via MQTT.
+
+`zeroHop` is a precomputed convenience for the same "zero-hop, heard directly" test — `hops == 0`
+**and** `viaMqtt == 0` — that Auto-Acknowledge uses to define "ZeroHop" for its own
+{Channel,Direct} × {ZeroHop,MultiHop} response matrix, collapsed into one field. Prefer it over
+hand-rolling the two-condition version, and especially over branching a single `hops > 0` node on
+its true/false ports: a packet with no hop information at all resolves `hops` to `undefined`, so
+both `hops == 0` and `hops > 0` evaluate **false** and neither branch of a `hops`-based split ever
+matches it, while `zeroHop` is always a clean `1` or `0`. A `hops > 0` *branch* also can't be
+reopened in the visual builder once saved — a graph containing a routed condition port round-trips
+back as raw JSON instead of populated fields — so `zeroHop` is both the more faithful and the more
+editable choice.
+
+### `node.completeness` — three states, not a boolean
+
+**Node** field **Node info completeness** (`node.completeness`) resolves to one of three strings:
+
+| Value | Meaning |
+| --- | --- |
+| `complete` | The subject node's row exists and has a real long/short name and a hardware model from NODEINFO. |
+| `incomplete` | The row exists, but NODEINFO hasn't arrived yet (e.g. a default `Node !xxxxxxxx` name). |
+| `unknown` | There is **no** row for the subject at all — or the trigger has no subject node in the first place (Schedule / System triggers). |
+
+The third state is the point: a boolean `isComplete` field can't distinguish "the node is known but
+incomplete" from "nothing is known about this node yet" — both would read as falsy. Auto-Acknowledge's
+own skip-incomplete-nodes behavior only skips a sender when its node row **exists and is incomplete**;
+an unrecognized/unknown sender is never skipped. Reproduce that with a **Text comparison** on
+`node.completeness`, operator **is one of**, value `complete, unknown` — matching everything except
+a confirmed-incomplete node.
+
+### `is one of` / `isn't one of`
+
+The **Text comparison** condition's operator list includes **is one of** (`in`) and **isn't one of**
+(`notIn`) alongside `contains`/`equals`/etc. — membership in a literal, comma- or whitespace-separated
+list, typed directly into the **Value** field (e.g. `complete, unknown` or `!aabbccdd, !11223344`).
+
+- **Separators** — split on any run of commas and/or whitespace (`a,b`, `a, b`, `a  b`, and
+  `a,\nb` all produce the same two-item list).
+- **Case-insensitive** — both the list and the field value are lowercased before comparing, so
+  `ROUTER` matches a list entry of `router`.
+- **Exact-token matching, not substring** — `!aabbccdd` is **not** considered "one of"
+  `!aabbccddee`; each list entry must match the whole field value, the same way a node-id ignore
+  list is meant to work.
+- **Empty value** — an empty/blank list makes `is one of` always **false** and `isn't one of` always
+  **true** — the correct reading of "an unset ignore list ignores nobody."
+
+A common use is a per-source-ignore-list condition — **Text comparison** on **Sender node id**
+(`fromId`), operator **isn't one of**, value the node ids to ignore (`!xxxxxxxx`, comma- or
+whitespace-separated) — which continues the rule only for senders **not** on that list.
 
 ### FINALLY combine modes
 
@@ -154,6 +260,19 @@ or more actions.
 
 Reacts to the triggering message with an emoji. Minimal by design — it carries no routing logic
 (the conditions do the routing).
+
+- **Emoji source** — *A fixed emoji* (default; what every existing automation does before this
+  field existed) or *The message's hop count*.
+- Hop-count mode reacts with `*️⃣` for a direct (0-hop) message and `1️⃣`–`7️⃣` above, clamping at
+  `7️⃣` — the same table Auto-Acknowledge uses, so the two features never drift apart.
+- Triggers with no hop information (a Schedule or System trigger wired to a tapback, or a message
+  whose hop data is missing) record a **skipped no-op**, not a run failure.
+- The **Emoji** field is hidden while hop-count mode is selected; your fixed emoji is remembered if
+  you switch back to it later.
+- MeshCore sources are still skipped — MeshCore has no tapback concept on the protocol.
+- **Send via sources** — which radios send the reaction. Leave none to use the source that
+  triggered the automation — but a source **is required** for source-less triggers (System events
+  and Schedules).
 
 ### Send a message
 
@@ -185,6 +304,23 @@ Sends text to a channel or as a DM, with full `{{ }}` token interpolation in the
   message's scope** (reply on the same region it arrived on), **Unscoped (flood, no region)**, or
   **A specific region…** — the latter reveals a **Region** picker (token-aware). See
   [Regions / Scopes](/features/meshcore#regions-scopes).
+- **DM resend attempts** *(advanced; hidden until **DM to node #** is set)* — resend this DM up to
+  **1–3** times until the recipient ACKs it, the same retry Auto-Acknowledge's own reply uses. Leave
+  blank for a single, direct send — today's behavior for every automation created before this field
+  existed.
+  - **Meshtastic DMs only.** It is ignored for a channel/broadcast send (the queue hardcodes a single
+    attempt there) and for a MeshCore send (MeshCore has no equivalent queue).
+  - **Setting it opts the send into the source's outgoing message queue**, which also **spaces
+    consecutive sends 30 seconds apart** — the same throttle every other queued DM on that source
+    (auto-responder, welcome, mailbox) already runs under. A busy automation that sets this on every
+    fire will send noticeably slower than one that doesn't.
+  - **The run-log shape changes too.** An unset (single-send) DM records the outcome immediately —
+    including a `TX_DISABLED` skip when the source has transmit disabled. A **queued** DM (this field
+    set) is fire-and-forget: the action returns a queue id right away, and if the source has TX
+    disabled, that surfaces later as a logged warning from the queue's own failure handler — **not**
+    as a `TX_DISABLED` skip entry on the run. This mirrors Auto-Acknowledge's own queued-reply
+    behavior exactly; it just means a TX-disabled source shows the action as *queued*, not
+    *skipped*, so don't be surprised if the run log looks like it sent when transmit was actually off.
 
 The overall send is a **source × channel matrix**: each selected source posts to the matching local
 slot of each selected channel.
@@ -262,6 +398,181 @@ to let a repeater finish transmitting before replying. The pause only lasts for 
 durable across a restart; the dry-run [simulator](#testing-dry-run) resolves it instantly instead of
 actually waiting.
 
+## Recipe — per-channel range-test acks (issue #4340)
+
+A common base-station setup runs a busy **primary** community channel plus a quieter secondary
+channel (call it **RangeTest**) set aside for range testers. The operator wants an ack on the
+primary channel to redirect testers to RangeTest, while the ack on RangeTest itself says something
+appropriate for people who are already there. One global Auto-Acknowledge body can't be true in
+both places at once — this recipe answers it with two small automations.
+
+**The key insight:** a hop-count tapback is a **separate packet** whose entire payload is the
+reaction emoji. Moving the "how many hops did that take" signal into the tapback frees the whole
+text body for channel-specific wording — exactly the byte pressure the issue describes.
+
+### Automation A — "Range-test ack — Primary"
+
+**WHEN** *A message is received*
+- **Text contains:** `test` — or use **Text matches regex** `\b(test|ping)\b` for word-boundary
+  matching so it doesn't fire on "latest" or "pingpong".
+- **On channels:** `Primary`.
+- **Cooldown (seconds):** `60`. **Cooldown applies to:** *Each node separately* — see
+  [Cooldown applies to](#cooldown-applies-to). This keys the throttle off the sending node, so
+  acking one range-tester no longer suppresses the ack to the next one who pings inside the same
+  60 seconds.
+
+**THEN**
+1. `Send a tapback (reaction)` → **Emoji source:** *The message's hop count*.
+2. `Send a message` → leave **On channels** empty (it replies on the triggering channel), body:
+
+   ```
+   {{ trigger.hopEmoji }} {{ trigger.senderLabel }} {{ trigger.hops }}h {{ trigger.snr }}dB · range tests → #RangeTest
+   ```
+
+### Automation B — "Range-test ack — RangeTest"
+
+Identical trigger, except **On channels:** `RangeTest`.
+
+**THEN** the same hop-count tapback, plus a body that doesn't repeat the channel redirect (they're
+already there):
+
+```
+{{ trigger.hopEmoji }} {{ trigger.senderLabel }} {{ trigger.hops }}h SNR {{ trigger.snr }} RSSI {{ trigger.rssi }}
+```
+
+### Tapback-only variant
+
+Delete the `Send a message` action from both automations. The hop-count reaction alone answers a
+range test — direct-or-how-many-hops — at 7 bytes and zero channel noise. Add the text action back
+only where you actually want channel-specific wording.
+
+### Why two automations, not one with two rules
+
+The obvious alternative — one automation, trigger on `Primary, RangeTest`, then two rules gated by
+a text condition on the channel — isn't available today: the **Text comparison** condition's field
+picker (`Field` on `condition.string`) offers *Message text*, *Sender node id*, *Recipient node id*,
+and *MeshCore scope/region* for a message trigger, but not the channel name. Use the two-automation
+form above; it costs one extra automation, not any extra typing per rule.
+
+### Byte budget
+
+Keycap emoji (`*️⃣`, `1️⃣`…`7️⃣`) are **7 bytes each** in UTF-8 (base character + `U+FE0F` +
+`U+20E3`, 1 + 3 + 3 bytes). `{{ trigger.hopEmoji }}` therefore costs 7 bytes wherever it appears in
+a text body — one more reason the tapback (whose entire payload *is* the emoji) is the cheaper way
+to carry that signal than embedding it in text.
+
+With representative values (`senderLabel` = `N0CALL-1`, 3 hops, SNR `-6.5`, RSSI `-110`), the two
+example bodies above come out to:
+
+| Body | Bytes (`getUtf8ByteLength`) |
+| --- | --- |
+| Automation A ("… range tests → #RangeTest") | 56 |
+| Automation B ("… SNR … RSSI …") | 38 |
+
+Both are far under any applicable limit, leaving plenty of headroom to make the wording friendlier.
+On the limit itself: the issue's **237 bytes** is the Meshtastic LoRa on-air MTU — the *total*
+packet size, including its 16-byte header, not the usable text payload. The protobuf definitions
+(`protobufs/meshtastic/mesh.proto`, `Constants.DATA_PAYLOAD_LEN`) put the actual `Data` payload
+budget behind that header at **233 bytes**, a few bytes tighter than 237 once the header is
+accounted for. Separately, **MeshMonitor's own `MAX_MESSAGE_BYTES = 200`** constant
+(`src/server/constants/meshtastic.ts`) is a self-imposed, more conservative cap — but it is enforced
+only by the HTTP compose route (`routes/v1/messages.ts`, used by the message-composer UI and the
+public API). The Automation Engine's **Send a message** action does not go through that route: it
+calls the source manager's `sendTextMessage()` directly, so it is **not** subject to the 200-byte
+check or to any MeshMonitor-side truncation. In practice this means an automation body can use the
+full ~233-byte protocol budget if it needs to — but for this recipe there's no need to get anywhere
+near it.
+
+### Closing the loop
+
+Auto-Acknowledge stays a single global body by design; this recipe answers issue #4340 without
+adding a second configuration axis to it, by moving the per-channel branching into the Automation
+Engine feature built for exactly that. Two short automations — one per channel — replace the
+would-be per-channel Auto-Acknowledge field, and the hop-count tapback carries the "how many hops
+did that take" signal for free, in its own packet, regardless of which text (if any) accompanies it.
+
+## Converting Auto-Acknowledge to an automation
+
+The legacy [Auto Acknowledge](/features/automation#auto-acknowledge) feature predates the engine and
+keeps working unchanged. A **Convert to an Automation…** button in its settings section (Info tab →
+**Auto Acknowledge**) turns an existing per-source configuration into one or two editable
+automations, so you can move to the engine without re-typing anything. The button is disabled with
+a tooltip while you have unsaved Auto Acknowledge edits — converting always uses the last **saved**
+configuration.
+
+### What the dialog shows
+
+Opening the dialog builds a preview; nothing is written until you confirm:
+
+- **One card per automation that will be created**, with its rules rendered as plain-English
+  `IF … THEN …` statements.
+- A **conversion report** in four groups — **Not convertible** (always shown, even when empty),
+  **Converted**, **Approximated**, and **Deprecated (nothing to convert)** — one entry per
+  Auto-Acknowledge setting or template token, naming exactly what it became or why it didn't
+  convert.
+- An **existing-conversion banner**, if this source was already converted before, with a **Replace
+  them** checkbox to update those automations in place instead of creating duplicates.
+- Two checkboxes: **Enable the new automation now** (pre-checked to match whether Auto
+  Acknowledge itself is currently enabled) and **Turn off Auto-Acknowledge for this source**,
+  checked by default.
+
+### Up to two automations, not always one
+
+Most configurations convert to a single automation. You get **two** — named `… (Channels)` and
+`… (Direct messages)` — only when the Channel and Direct halves of the response matrix both have at
+least one cell with **Message** or **Tapback** enabled. This isn't a style choice: an automation's
+channel filter also applies to direct messages, but Auto-Acknowledge's channel allowlist only ever
+gated **channel** replies, never DMs. Sharing one automation would silently start filtering your
+Direct replies by channel too — a behaviour change, not a faithful conversion. The dialog always
+states up front how many automations it's about to create and why.
+
+### Your Auto-Acknowledge settings are kept
+
+Checking **"Turn off Auto-Acknowledge for this source"** flips only the feature's own on/off
+switch (`autoAckEnabled`) — every other Auto-Acknowledge setting (the regex, message templates,
+channel allowlist, ignore list, cooldown, delay, …) is left exactly as configured. If the converted
+automation doesn't match what you wanted, re-enable Auto-Acknowledge and you get your original
+behavior back with nothing to reconfigure.
+
+### What doesn't convert
+
+A few settings have no automation equivalent, and are named individually in the **Not convertible**
+group rather than silently dropped:
+
+- **`autoAckTestMessages`** — a UI-only scratchpad for pasting sample text; no server code reads
+  it. Use the engine's own [Test panel](#testing-dry-run) instead.
+- **`autoAckMaxAttempts`** — this is a per-source *queue* setting
+  (`MessageQueueService.resolveDmMaxAttempts()`), not something Auto-Acknowledge itself reads. It
+  keeps governing this source's other automated DMs after conversion regardless of whether you
+  convert. If you want the same resend behavior on the converted automation, add it yourself via
+  **Send a message**'s [**DM resend attempts**](#send-a-message) field — the converter doesn't
+  infer it.
+- An **empty channel allowlist**. An empty Auto-Acknowledge allowlist means the feature never
+  acknowledged *any* channel message — not "every channel" — so the converter creates no Channel
+  automation for it rather than one that would newly answer on every channel.
+- A channel with a **blank name**, or an allowlist where every listed channel is
+  missing/disabled/blank — the report names the index, and that index (or the whole Channel
+  automation, if none resolve) is dropped rather than emitted as an unfiltered, mesh-wide trigger.
+- A handful of message template tokens with no engine equivalent (`{SHORT_NAME}`, `{RABBIT_HOPS}`,
+  `{LAST_HOP}`, `{TRANSPORT}`, `{VERSION}`, `{DURATION}`, `{FEATURES}`, `{NODECOUNT}`,
+  `{DIRECTCOUNT}`, `{IP}`, `{PORT}`) — left verbatim in the converted message text so you can see
+  and fix them.
+
+Some conversions are **approximated** rather than exact, and are called out as such in the report:
+`{HOPS}`/`{NUMBER_HOPS}` becomes `{{ trigger.hops }}`, which — unlike Auto-Acknowledge's own hop
+count — is unfloored, so a hopless packet renders blank instead of `0`; `{SNR}`/`{RSSI}` render
+blank instead of Auto-Acknowledge's literal `N/A` when unavailable; `{DATE}`/`{TIME}` become
+`{{ NOW }}`, which is *send* time in a fixed format rather than *receive* time in your preferred
+format; and a pre-send delay becomes one blocking `action.delay` before the first send, rather than
+Auto-Acknowledge's own non-blocking timer applied independently to the tapback and the reply.
+
+One further gap isn't itemized in the report because it isn't tied to any one setting: Auto
+Acknowledge itself selects the *Direct* vs. standard reply template on the raw "0 hops travelled"
+value, not on the same `viaMqtt`-aware ZeroHop test its own toggles use — so an MQTT-relayed,
+0-hop message can be routed to the *MultiHop* cell for enable/disable purposes while still getting
+the *Direct* message's wording. The converter reproduces this quirk faithfully (it also keys the
+message-text choice off `zeroHop`), rather than "fixing" it into a behavior change.
+
 ## Variables
 
 Variables are a separate, first-class management area under the Automations tab. A variable is
@@ -311,6 +622,7 @@ values, the set-variable value) accept **double-brace tokens**:
 | Token | Resolves to |
 | --- | --- |
 | `{{ trigger.* }}` | A field from the current trigger (e.g. `{{ trigger.text }}`, `{{ trigger.fromId }}`, `{{ trigger.hops }}`, `{{ trigger.value }}`, `{{ trigger.latestVersion }}`). The available fields depend on the trigger type |
+| `{{ trigger.hopEmoji }}` | The message trigger's hop count as an emoji — `*️⃣` direct, `1️⃣`–`7️⃣` (`7️⃣` = 7 or more). Same mapping as the tapback's hop-count mode above. Blank when the hop count is unknown |
 | `{{ trigger.sourceId }}` / `{{ trigger.timestamp }}` | Available for every trigger; `timestamp` renders as a local date/time |
 | `{{ var.name }}` | A user-defined variable; `{{ var.name.field }}` for nested `json` access |
 | `{{ NOW }}` | The current time, rendered as a local `YYYY-MM-DD HH:mm:ss` |
@@ -391,7 +703,10 @@ showing **why it did or didn't run**:
 - **fired** — the trigger matched and the action steps ran; the per-step trace is shown.
 - **prefiltered** — the event was filtered out before the conditions ran (e.g. wrong source/channel),
   with the reason.
-- **cooldown** — the rule matched but was suppressed by its cooldown window.
+- **cooldown** — the rule matched but was suppressed by its cooldown window. The reason names the
+  key that was cooling down, e.g. `cooldown active — 40s remaining (node 111)` or
+  `cooldown active — 12s remaining (automation-wide (this event has no subject node))` (see
+  [Cooldown applies to](#cooldown-applies-to)).
 
 The panel keeps the most recent entries in a rolling buffer and **auto-stops after 5 minutes** (and
 on close or disconnect), so a trace never runs unbounded.

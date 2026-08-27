@@ -66,6 +66,13 @@ interface NeighborEdge {
 }
 
 interface MeshCoreMapProps {
+  /**
+   * Contacts to render. Already age-filtered by the caller
+   * (MeshCoreNodesView applies the per-source `maxNodeAgeHours` with the
+   * favorite / local-node exemptions before passing them down — #4412 Phase 4
+   * §3.4). This component does NOT filter by age; a future second caller must
+   * filter upstream too.
+   */
   contacts: MeshCoreContact[];
   selectedPublicKey: string | null;
   localNodePosition?: { lat: number; lng: number } | null;
@@ -92,7 +99,7 @@ interface MeshCoreMapProps {
 
 export const MeshCoreMap: React.FC<MeshCoreMapProps> = ({ contacts, selectedPublicKey, localNodePosition, onNavigateToDm, isLoading = false, resizeTrigger }) => {
   const { t } = useTranslation();
-  const { mapTileset, customTilesets, setMapTileset } = useSettings();
+  const { mapTileset, customTilesets, setMapTileset, activeStyleJson } = useSettings();
   const { timeFormat, dateFormat } = useDisplaySettings();
   const { sourceId } = useSource();
   const csrfFetch = useCsrfFetch();
@@ -319,7 +326,7 @@ export const MeshCoreMap: React.FC<MeshCoreMapProps> = ({ contacts, selectedPubl
     if (localNodePosition?.lat != null && localNodePosition?.lng != null) {
       return [localNodePosition.lat, localNodePosition.lng];
     }
-    const local = positioned.find(c => c.advName?.includes('(local)'));
+    const local = positioned.find(c => c.isLocal === true);
     if (local) return [local.latitude!, local.longitude!];
     return null;
   }, [localNodePosition, positioned]);
@@ -333,7 +340,7 @@ export const MeshCoreMap: React.FC<MeshCoreMapProps> = ({ contacts, selectedPubl
   const pathSegments = useMemo(() => {
     if (!showPaths || !localPos) return [];
     return positioned
-      .filter(c => !c.advName?.includes('(local)') && typeof c.pathLen === 'number')
+      .filter(c => c.isLocal !== true && typeof c.pathLen === 'number')
       .map(c => ({
         key: c.publicKey,
         from: localPos,
@@ -480,6 +487,7 @@ export const MeshCoreMap: React.FC<MeshCoreMapProps> = ({ contacts, selectedPubl
         zoom={zoom}
         tilesetId={mapTileset}
         customTilesets={customTilesets}
+        styleJson={activeStyleJson ?? undefined}
         showTilesetSelector={showTileSelector}
         onTilesetChange={setMapTileset}
         resizeTrigger={resizeTrigger}

@@ -117,6 +117,66 @@ export type NumericOp = (typeof NUMERIC_OPS)[number];
 export const REQUEST_OPS = ['telemetry', 'position', 'traceroute', 'nodeinfo', 'neighbors', 'advert'] as const;
 export type RequestOp = (typeof REQUEST_OPS)[number];
 
+/** Where action.tapback's emoji comes from. Absent = 'fixed' (pre-4.14 behaviour). */
+export type TapbackEmojiMode = 'fixed' | 'hopCount';
+export const TAPBACK_EMOJI_MODES: readonly TapbackEmojiMode[] = ['fixed', 'hopCount'];
+
+/**
+ * What a trigger's `cooldownSeconds` window is keyed by (#4340 Phase 2).
+ *
+ *  - 'automation'  one timer for the whole rule — the pre-4.14 behaviour and
+ *                  what an ABSENT/unrecognised value means. Never change this.
+ *  - 'node'        one timer per subject node (message sender / telemetry or
+ *                  geofence node), so acking one range-tester does not suppress
+ *                  the ack to the next one.
+ *  - 'sourceNode'  one timer per (source, node), so the same physical node heard
+ *                  via two sources cools down independently.
+ *
+ * Key shapes mirror AutomationVariablesRepository.buildScopeKey exactly
+ * ('' / '<node>' / '<source>:<node>') so cooldown keys and variable scope keys
+ * read identically in logs and traces.
+ */
+export const COOLDOWN_SCOPES = ['automation', 'node', 'sourceNode'] as const;
+export type CooldownScope = (typeof COOLDOWN_SCOPES)[number];
+
+/**
+ * Coerce a stored `params.cooldownScope` to a CooldownScope. Absent, blank, or
+ * unrecognised → 'automation'. Deliberately lenient at RUNTIME (graphs written
+ * before validation existed must still run) while validateAutomationGraph
+ * rejects unrecognised values at SAVE time — the same split Phase 1 used for
+ * action.tapback's emojiMode.
+ */
+export function parseCooldownScope(raw: unknown): CooldownScope {
+  return COOLDOWN_SCOPES.includes(raw as CooldownScope) ? (raw as CooldownScope) : 'automation';
+}
+
+/**
+ * App-level DM resend cap for `action.sendMessage` (#4340 Phase 3).
+ *
+ * Mirrors MessageQueueService's own bound (src/server/messageQueueService.ts:
+ * 75-85, `Math.min(3, Math.max(1, …))`, #4266) — an unbounded value would let an
+ * automation be abused as a repeat-broadcast mechanism. The duplication is
+ * deliberate: this module must stay dependency-free (the frontend imports it),
+ * and the queue's clamp is load-bearing for #4266 and must not be refactored
+ * from here. autoAckParity.test.ts pins the two to the same numbers.
+ */
+export const SEND_MAX_ATTEMPTS_MIN = 1;
+export const SEND_MAX_ATTEMPTS_MAX = 3;
+
+/**
+ * Coerce a stored `params.maxAttempts` to an integer in [1,3], or `undefined`
+ * for absent / blank / unparseable — `undefined` means "one direct send", the
+ * pre-4.14 behaviour every stored automation depends on. Lenient at RUNTIME
+ * while validateAutomationGraph rejects an out-of-range value at SAVE time —
+ * the same split Phase 1 used for emojiMode and Phase 2 for cooldownScope.
+ */
+export function parseSendMaxAttempts(raw: unknown): number | undefined {
+  if (raw == null || raw === '') return undefined;
+  const n = Number(raw);
+  if (!Number.isInteger(n)) return undefined;
+  return Math.min(SEND_MAX_ATTEMPTS_MAX, Math.max(SEND_MAX_ATTEMPTS_MIN, n));
+}
+
 /**
  * Match modes for `condition.meshcoreScope` (#3914). A MeshCore text message
  * carries a region "scope" (`scopeCode` 0 = unscoped, >0 = a region; `scopeName`
@@ -327,6 +387,16 @@ export function validateAutomationGraph(input: unknown): ValidationResult {
   if (errors.length === 0) {
     for (const n of rawNodes as AutomationNode[]) {
       const p = (n.params ?? {}) as Record<string, unknown>;
+      // Cooldown scope (#4340 Phase 2) is a trigger-level param every trigger type
+      // shares, so it is checked once here rather than duplicated into seven cases
+      // (which would silently miss any trigger type added later). Optional:
+      // absent/unset = 'automation', the pre-4.14 behaviour every stored automation
+      // depends on — same contract as action.tapback's emojiMode.
+      if (categoryOf(n.type) === 'trigger'
+          && p.cooldownScope != null
+          && !COOLDOWN_SCOPES.includes(p.cooldownScope as CooldownScope)) {
+        errors.push(`${n.type} "${n.id}" requires params.cooldownScope ∈ {automation,node,sourceNode}`);
+      }
       switch (n.type) {
         case 'flow.collapse':
           if (!COLLAPSE_MODES.includes(p.mode as CollapseMode)) {
@@ -369,6 +439,13 @@ export function validateAutomationGraph(input: unknown): ValidationResult {
             errors.push(`action.requestData "${n.id}" requires a valid params.op`);
           }
           break;
+        case 'action.tapback':
+          // Optional. Absent/unset = 'fixed' — every pre-existing stored automation
+          // must keep validating and behaving exactly as before.
+          if (p.emojiMode != null && !TAPBACK_EMOJI_MODES.includes(p.emojiMode as TapbackEmojiMode)) {
+            errors.push(`action.tapback "${n.id}" requires params.emojiMode ∈ {fixed,hopCount}`);
+          }
+          break;
         case 'action.deviceReboot':
           // `seconds` is optional (Meshtastic reboot delay; MeshCore ignores it).
           if (p.seconds != null) {
@@ -393,6 +470,16 @@ export function validateAutomationGraph(input: unknown): ValidationResult {
           }
           break;
         }
+        case 'action.sendMessage':
+          // Optional. Absent/blank = one direct send — every pre-existing stored
+          // automation must keep validating and behaving exactly as before.
+          if (p.maxAttempts != null && p.maxAttempts !== '') {
+            const attempts = Number(p.maxAttempts);
+            if (!Number.isInteger(attempts) || attempts < SEND_MAX_ATTEMPTS_MIN || attempts > SEND_MAX_ATTEMPTS_MAX) {
+              errors.push(`action.sendMessage "${n.id}" requires params.maxAttempts ∈ [${SEND_MAX_ATTEMPTS_MIN}, ${SEND_MAX_ATTEMPTS_MAX}]`);
+            }
+          }
+          break;
         default:
           break;
       }
