@@ -31,7 +31,9 @@ vi.mock('react-leaflet', () => ({
 }));
 
 vi.mock('../VectorTileLayer', () => ({
-  VectorTileLayer: (p: { url?: string }) => <div data-testid="vector-tile" data-url={p.url} />,
+  VectorTileLayer: (p: { url?: string; styleUrl?: string }) => (
+    <div data-testid="vector-tile" data-url={p.url} data-style-url={p.styleUrl} />
+  ),
 }));
 
 vi.mock('../TilesetSelector', () => ({
@@ -85,6 +87,15 @@ describe('BaseMap', () => {
     const vectorTile = screen.getByTestId('vector-tile');
     expect(vectorTile).toBeInTheDocument();
     expect(vectorTile.getAttribute('data-url')).toBe('https://x/{z}/{x}/{y}.pbf');
+    expect(screen.queryByTestId('raster-tile')).not.toBeInTheDocument();
+  });
+
+  it('renders the built-in dark map from OpenFreeMap instead of CARTO raster tiles', () => {
+    render(<BaseMap center={[0, 0]} zoom={3} tilesetId="cartoDark" />);
+    const vectorTile = screen.getByTestId('vector-tile');
+    expect(vectorTile).toBeInTheDocument();
+    expect(vectorTile.getAttribute('data-style-url')).toBe('https://tiles.openfreemap.org/styles/dark');
+    expect(vectorTile.getAttribute('data-url')).not.toContain('cartocdn.com');
     expect(screen.queryByTestId('raster-tile')).not.toBeInTheDocument();
   });
 

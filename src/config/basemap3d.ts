@@ -5,9 +5,9 @@
  *
  * MapLibre raster sources differ from Leaflet `TileLayer` in two ways that
  * matter here:
- *  - MapLibre has no `{s}` subdomain placeholder — Leaflet-style URLs using
- *    it (`osm`/`osmHot`/`carto*`/`openTopo`) must be expanded into an
- *    explicit `tiles[]` array, one entry per subdomain.
+ *  - MapLibre has no `{s}` subdomain placeholder — Leaflet-style raster URLs
+ *    using it (`osm`/`osmHot`/`openTopo`) must be expanded into an explicit
+ *    `tiles[]` array, one entry per subdomain.
  *  - MapLibre raster sources cannot render a vector (`.pbf`/`.mvt`) tileset
  *    without a full style JSON (out of scope this phase) — vector-only
  *    tilesets fall back to the default `osm` raster basemap for 3D only;

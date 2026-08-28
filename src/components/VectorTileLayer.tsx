@@ -18,15 +18,18 @@ interface VectorTileLayerProps {
   attribution?: string;
   maxZoom?: number;
   styleJson?: Record<string, unknown>;
+  /** Full MapLibre style URL. When present it takes precedence over styleJson/url. */
+  styleUrl?: string;
 }
 
 /**
  * Vector tile layer component for rendering .pbf/.mvt tiles using MapLibre GL
  *
  * Uses MapLibre GL renderer wrapped as a Leaflet layer to display vector tiles.
- * Vector tiles are rendered client-side with a default style, or a custom styleJson.
+ * Vector tiles are rendered from a full style URL, a custom styleJson, or the
+ * built-in fallback style for raw .pbf/.mvt tile endpoints.
  */
-export function VectorTileLayer({ url, attribution, maxZoom = 14, styleJson }: VectorTileLayerProps) {
+export function VectorTileLayer({ url, attribution, maxZoom = 14, styleJson, styleUrl }: VectorTileLayerProps) {
   const map = useMap();
 
   useEffect(() => {
@@ -34,7 +37,11 @@ export function VectorTileLayer({ url, attribution, maxZoom = 14, styleJson }: V
 
     let style: unknown;
 
-    if (styleJson) {
+    if (styleUrl) {
+      // MapLibre accepts a remote style JSON URL directly. This is used by the
+      // built-in OpenFreeMap basemaps and avoids provider-specific API keys.
+      style = styleUrl;
+    } else if (styleJson) {
       // Deep-clone and patch all vector sources to point at the active tile URL
       const patched = JSON.parse(JSON.stringify(styleJson));
       if (patched.sources && typeof patched.sources === 'object') {
@@ -318,7 +325,7 @@ export function VectorTileLayer({ url, attribution, maxZoom = 14, styleJson }: V
         map.removeLayer(vectorLayer);
       } catch { /* layer may already be removed */ }
     };
-  }, [map, url, attribution, maxZoom, styleJson]);
+  }, [map, url, attribution, maxZoom, styleJson, styleUrl]);
 
   return null;
 }

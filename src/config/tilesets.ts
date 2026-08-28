@@ -30,6 +30,8 @@ export interface TilesetConfig {
   readonly description: string;
   readonly isCustom?: boolean;
   readonly isVector?: boolean;
+  /** Full MapLibre style URL for style-backed vector basemaps. */
+  readonly styleUrl?: string;
 }
 
 export const TILESETS: Readonly<Record<PredefinedTilesetId, TilesetConfig>> = {
@@ -49,21 +51,27 @@ export const TILESETS: Readonly<Record<PredefinedTilesetId, TilesetConfig>> = {
     maxZoom: 19,
     description: 'Humanitarian OpenStreetMap Team style'
   },
+  // Keep the historical carto* IDs so persisted user preferences continue to
+  // resolve, but use OpenFreeMap now that CARTO raster basemaps require an API key.
   cartoDark: {
     id: 'cartoDark',
     name: 'Dark Mode',
-    url: 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png',
-    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/attributions">CARTO</a>',
+    url: 'https://tiles.openfreemap.org/styles/dark',
+    styleUrl: 'https://tiles.openfreemap.org/styles/dark',
+    attribution: '<a href="https://openfreemap.org/">OpenFreeMap</a> &copy; <a href="https://openmaptiles.org/">OpenMapTiles</a> Data from <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
     maxZoom: 19,
-    description: 'Dark theme map'
+    description: 'Dark theme map powered by OpenFreeMap',
+    isVector: true
   },
   cartoLight: {
     id: 'cartoLight',
     name: 'Light Mode',
-    url: 'https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png',
-    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/attributions">CARTO</a>',
+    url: 'https://tiles.openfreemap.org/styles/positron',
+    styleUrl: 'https://tiles.openfreemap.org/styles/positron',
+    attribution: '<a href="https://openfreemap.org/">OpenFreeMap</a> &copy; <a href="https://openmaptiles.org/">OpenMapTiles</a> Data from <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
     maxZoom: 19,
-    description: 'Clean light theme map'
+    description: 'Clean light theme map powered by OpenFreeMap',
+    isVector: true
   },
   openTopo: {
     id: 'openTopo',

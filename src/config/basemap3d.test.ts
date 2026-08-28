@@ -37,6 +37,16 @@ describe('resolve3DBasemap', () => {
     expect(result.tiles).toEqual([TILESETS.esriSatellite.url]);
   });
 
+  it('falls back to osm for the built-in OpenFreeMap light/dark vector styles', () => {
+    for (const id of ['cartoDark', 'cartoLight'] as const) {
+      const result = resolve3DBasemap(id, []);
+      expect(result.usedFallback).toBe(true);
+      expect(result.attribution).toBe(TILESETS.osm.attribution);
+      expect(result.maxZoom).toBe(TILESETS.osm.maxZoom);
+      expect(result.tiles[0]).toContain('tile.openstreetmap.org');
+    }
+  });
+
   it('falls back to osm for a custom vector-only tileset', () => {
     const custom: CustomTileset[] = [
       {

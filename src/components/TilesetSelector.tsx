@@ -61,9 +61,16 @@ export const TilesetSelector: React.FC<TilesetSelectorProps> = ({
               >
                 <div
                   className="tileset-preview"
-                  style={{
-                    backgroundImage: `url(${getTilePreviewUrl(tileset.url)})`
-                  }}
+                  style={tileset.styleUrl
+                    ? {
+                        // Full MapLibre style URLs return JSON rather than an
+                        // image tile, so show a neutral swatch in the selector.
+                        backgroundImage: 'none',
+                        backgroundColor: tileset.id === 'cartoDark' ? '#1f2933' : '#eef0f2'
+                      }
+                    : {
+                        backgroundImage: `url(${getTilePreviewUrl(tileset.url)})`
+                      }}
                 />
                 <div className="tileset-name">
                   {tileset.name}

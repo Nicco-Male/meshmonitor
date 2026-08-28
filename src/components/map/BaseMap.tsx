@@ -75,7 +75,7 @@ export interface BaseMapProps {
  *   (regression vs NodesTab's pre-BaseMap keyless `TileLayer`). The only
  *   option `updateGridLayer`/`setUrl` do NOT patch is `maxZoom`, so we remount
  *   only when the zoom ceiling genuinely changes; same-`maxZoom` swaps (the
- *   common case, e.g. osm↔carto↔osmHot, all 19) refresh in place.
+ *   common case, e.g. osm↔osmHot, both 19) refresh in place.
  * - **Vector `VectorTileLayer`** is keyed by the resolved tileset id: a
  *   MapLibre style/url change needs a clean remount, and raster↔vector swaps
  *   remount anyway (different component type).
@@ -145,6 +145,7 @@ export function BaseMap({
               attribution={tileset.attribution}
               maxZoom={tileset.maxZoom}
               styleJson={styleJson}
+              styleUrl={tileset.styleUrl}
             />
           )
           : (
