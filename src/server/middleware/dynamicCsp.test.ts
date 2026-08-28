@@ -90,6 +90,20 @@ describe('buildCspHeader - frame-ancestors', () => {
   });
 });
 
+describe('buildCspHeader - built-in map providers', () => {
+  beforeEach(() => {
+    mockGetSetting.mockReset();
+    mockGetSetting.mockResolvedValue(null);
+  });
+
+  it('allows OpenFreeMap fetches used by the built-in MapLibre light/dark basemaps', async () => {
+    const header = await buildCspHeader(true, true, []);
+    const directives = directivesFromHeader(header);
+
+    expect(directives['connect-src']).toContain('https://tiles.openfreemap.org');
+  });
+});
+
 describe('buildCspHeader - custom analytics CSP domains (#3409)', () => {
   beforeEach(() => {
     mockGetSetting.mockReset();

@@ -98,6 +98,9 @@ export async function buildConnectSrcDirective(isProduction: boolean, cookieSecu
     'https://*.basemaps.cartocdn.com',
     'https://*.tile.opentopomap.org',
     'https://server.arcgisonline.com',
+    // OpenFreeMap styles/vector tiles are loaded by MapLibre via fetch/XHR,
+    // so they must be allowed by connect-src (img-src alone is not enough).
+    'https://tiles.openfreemap.org',
   ];
 
   // Add HTTP fallbacks for development
