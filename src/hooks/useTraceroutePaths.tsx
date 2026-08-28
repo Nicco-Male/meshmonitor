@@ -25,6 +25,7 @@ import {
   averageNonSentinelSnr,
   type TracerouteRenderSegment,
 } from '../utils/tracerouteSegments';
+import type { DirectionalTracerouteRenderSegment } from '../utils/tracerouteDirections';
 import { TraceroutePathsLayer } from '../components/map/layers/TraceroutePathsLayer';
 import RouteSegmentPopup from '../components/map/popups/RouteSegmentPopup';
 import { darkOverlayColors } from '../config/overlayColors';
@@ -205,7 +206,7 @@ export function useTraceroutePaths({
     const segmentSNRs = new Map<string, Array<{ snr: number; timestamp: number }>>();
     const segmentHasMqtt = new Map<string, boolean>();
     const segmentLatestTimestamp = new Map<string, number>();
-    const segmentsList: TracerouteRenderSegment[] = [];
+    const segmentsList: DirectionalTracerouteRenderSegment[] = [];
 
     // The normal map overlay is intentionally short-lived: a traceroute may
     // stay visible for at most 4 hours if its capture-time geometry is still
@@ -219,16 +220,17 @@ export function useTraceroutePaths({
       return timestamp >= cutoffTime;
     });
 
-    // Deduplicate: keep only the most recent traceroute per node pair
+    // Deduplicate only within the same request direction. A->B and B->A are
+    // independent evidence and both must survive so the map can determine
+    // whether a physical segment is actually bidirectional.
     const tracerouteMap = new Map<string, TracerouteDigest>();
     recentTraceroutes.forEach(tr => {
-      // Create a bidirectional key (same for A→B and B→A)
-      const key = [tr.fromNodeNum, tr.toNodeNum].sort().join('-');
+      const key = `${tr.fromNodeNum}->${tr.toNodeNum}`;
       const existing = tracerouteMap.get(key);
       const timestamp = tr.timestamp || tr.createdAt || 0;
       const existingTimestamp = existing?.timestamp || existing?.createdAt || 0;
 
-      // Keep the most recent traceroute for this node pair
+      // Keep the most recent traceroute for this request direction.
       if (!existing || timestamp > existingTimestamp) {
         tracerouteMap.set(key, tr);
       }
@@ -276,6 +278,11 @@ export function useTraceroutePaths({
         segmentsList.push({
           ...segment,
           key: `tr-${idx}-${segment.key}`,
+          // Keep the occurrence-level values before pair aggregation below.
+          // The shared layer uses them to build separate A->B / B->A stats.
+          observedSnr: segment.avgSnr,
+          observedTimestamp: timestamp,
+          observedIsMqtt: segment.isMqtt,
         });
       }
     });
@@ -311,7 +318,7 @@ export function useTraceroutePaths({
     // numbers directly on the segment (`fromNodeNum`/`toNodeNum`) so the
     // popup/className below can read them straight off `seg` instead of a
     // side-table lookup.
-    const renderSegments: TracerouteRenderSegment[] = filteredSegments.map(segment => {
+    const renderSegments: DirectionalTracerouteRenderSegment[] = filteredSegments.map(segment => {
       const segmentKey = segmentPairKey(segment);
       const usage = segmentTraceIds.get(segmentKey)?.size ?? 1;
       // A segment is MQTT/IP only when the firmware reported the unknown-SNR
@@ -454,7 +461,7 @@ export function useTraceroutePaths({
   }, [showPaths, traceroutesDigest, nodesPositionDigest, distanceUnit, themeColors.snrColors, themeColors.mqttSegment, themeColors.overlay0, callbacks, visibleNodeNums, mapZoom, liveNodePositions]);
 
   // Separate memoization for selected node traceroute (showRoute)
-  // This can change independently without re-rendering the base map markers
+  // This can change independently without re-rendering base map markers
   const selectedNodeTraceroute = useMemo(() => {
     // Skip rendering traceroute if the selected node is the current/local node
     if (!showRoute || !selectedNodeId || selectedNodeId === currentNodeId) return null;
