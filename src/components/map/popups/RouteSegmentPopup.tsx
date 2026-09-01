@@ -311,7 +311,7 @@ export default function RouteSegmentPopup({
   return (
     <Popup>
       <div className="route-popup">
-        <h4>Route Segment</h4>
+        <h4>TRACEROUTE · Route Segment</h4>
         {isMqtt && <div className="mqtt-badge">via IP</div>}
         <div className="route-endpoints">
           <EndpointName name={fromName} onClick={onFromNodeClick} />
