@@ -318,7 +318,7 @@ function TraceroutePathsLayerImpl(props: TraceroutePathsLayerProps): ReactElemen
             <Tooltip direction="top">{name} (estimated)</Tooltip>
             <Popup>
               <div className="route-popup">
-                <h4>Estimated Route Hop</h4>
+                <h4>TRACEROUTE · Estimated Route Hop</h4>
                 <div className="route-endpoints"><strong>{name}</strong></div>
                 <div className="route-usage">
                   Position estimated from adjacent traceroute signals; not a reported GPS fix.
