@@ -60,7 +60,7 @@ describe('RouteSegmentPopup', () => {
   it('renders a read-only route segment without SNR statistics when no RF samples exist', () => {
     renderPopup({ isMqtt: true, snrSamples: [{ snr: -32, timestamp: Date.now() }] });
 
-    expect(screen.getByText('Route Segment')).toBeInTheDocument();
+    expect(screen.getByText('TRACEROUTE · Route Segment')).toBeInTheDocument();
     expect(screen.getByText('Alpha')).toBeInTheDocument();
     expect(screen.getByText('Bravo')).toBeInTheDocument();
     expect(screen.getByText('via IP')).toBeInTheDocument();
