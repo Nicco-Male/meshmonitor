@@ -28,9 +28,9 @@ function formatSnr(snr: unknown): string {
  * Report time for a direction, formatted relative to now. Uses the NeighborInfo
  * report `timestamp` (milliseconds — the same field the server freshness window
  * divides by 1000). `lastRxTime` is intentionally not used here: its unit is
- * ambiguous across firmware and would risk a wrong "heard" age.
+ * ambiguous across firmware and would risk a wrong "reported" age.
  */
-function formatHeard(timestamp: unknown): string | null {
+function formatReported(timestamp: unknown): string | null {
   const ms = typeof timestamp === 'number' && timestamp > 0 ? timestamp : null;
   return ms == null ? null : formatRelativeTime(ms);
 }
@@ -47,8 +47,8 @@ export default function DashboardNeighborPopup({ link }: DashboardNeighborPopupP
   const bidirectional = !!link?.bidirectional;
   const transportClass: string = link?.transportClass ?? 'rf';
 
-  const forwardHeard = formatHeard(link?.timestamp);
-  const reverseHeard = formatHeard(link?.reverseTimestamp);
+  const forwardReported = formatReported(link?.timestamp);
+  const reverseReported = formatReported(link?.reverseTimestamp);
   // The reverse direction's data exists when the link is bidirectional (the dedup
   // dropped that row but stashed its signal on the kept record).
   const hasReverse = bidirectional || link?.reverseSnr != null;
@@ -60,7 +60,7 @@ export default function DashboardNeighborPopup({ link }: DashboardNeighborPopupP
           {nodeName} <UiIcon name={bidirectional ? 'bidirectional' : 'forward'} size={15} /> {neighborName}
         </div>
         <span className="node-popup-subtitle">
-          {bidirectional ? 'Bidirectional' : 'One-way'} · {TRANSPORT_LABEL[transportClass] ?? transportClass}
+          NEIGHBOR INFO · {bidirectional ? 'Bidirectional' : 'One-way'} · {TRANSPORT_LABEL[transportClass] ?? transportClass}
         </span>
       </div>
 
@@ -70,7 +70,7 @@ export default function DashboardNeighborPopup({ link }: DashboardNeighborPopupP
             <span className="node-popup-icon"><UiIcon name="wifi" size={16} /></span>
             <span className="node-popup-value">
               {nodeName} to {neighborName}: SNR {formatSnr(link?.snr)}
-              {forwardHeard ? ` · heard ${forwardHeard}` : ''}
+              {forwardReported ? ` · reported ${forwardReported}` : ''}
             </span>
           </div>
 
@@ -79,7 +79,7 @@ export default function DashboardNeighborPopup({ link }: DashboardNeighborPopupP
               <span className="node-popup-icon"><UiIcon name="wifi" size={16} /></span>
               <span className="node-popup-value">
                 {neighborName} to {nodeName}: SNR {formatSnr(link?.reverseSnr)}
-                {reverseHeard ? ` · heard ${reverseHeard}` : ''}
+                {reverseReported ? ` · reported ${reverseReported}` : ''}
               </span>
             </div>
           )}
