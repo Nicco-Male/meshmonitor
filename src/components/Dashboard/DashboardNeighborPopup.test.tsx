@@ -30,7 +30,7 @@ describe('DashboardNeighborPopup', () => {
     const title = screen.getByText((_, element) => element?.classList.contains('node-popup-title') ?? false);
     expect(title).toHaveTextContent(/Alpha.*Bravo/);
     expect(title.querySelector('[data-ui-icon="bidirectional"]')).toBeInTheDocument();
-    expect(screen.getByText(/Bidirectional/)).toBeInTheDocument();
+    expect(screen.getByText(/NEIGHBOR INFO · Bidirectional · RF \(LoRa\)/)).toBeInTheDocument();
 
     // Forward direction: Alpha → Bravo with its own SNR.
     expect(screen.getByText(/Alpha to Bravo: SNR 5\.25 dB/)).toBeInTheDocument();
@@ -60,7 +60,7 @@ describe('DashboardNeighborPopup', () => {
     const title = screen.getByText((_, element) => element?.classList.contains('node-popup-title') ?? false);
     expect(title).toHaveTextContent(/Solo.*Mate/);
     expect(title.querySelector('[data-ui-icon="forward"]')).toBeInTheDocument();
-    expect(screen.getByText(/One-way · MQTT/)).toBeInTheDocument();
+    expect(screen.getByText(/NEIGHBOR INFO · One-way · MQTT/)).toBeInTheDocument();
     expect(screen.getByText(/Solo to Mate: SNR 8\.00 dB/)).toBeInTheDocument();
     // No reverse row when there's no reverse data.
     expect(screen.queryByText(/Mate to Solo/)).not.toBeInTheDocument();
