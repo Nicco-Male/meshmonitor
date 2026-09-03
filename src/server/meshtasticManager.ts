@@ -77,6 +77,7 @@ import { FavoritesService } from './services/favoritesService.js';
 import { DeviceAdminService } from './services/deviceAdminService.js';
 import { RemoteAdminService } from './services/remoteAdminService.js';
 import { tracerouteCampaignCoordinator } from './services/tracerouteCampaignCoordinator.js';
+import { tracerouteSchedulerService, type TracerouteScheduleOptions } from './services/tracerouteSchedulerService.js';
 import { ConnState, dispatch, type SmContext } from './meshtastic/connectionStateMachine.js';
 import fs from 'fs';
 import path from 'path';
@@ -725,7 +726,7 @@ class MeshtasticManager implements ISourceManager {
     isDM: boolean;
     replyChannel: number;
     packetId?: number;
-    timeoutHandle: NodeJS.Timeout;
+    timeoutHandle: NodeJS.Timeout | null;
   }> = new Map(); // Track user-initiated traceroutes from the autoresponder
   private pendingTracerouteTimestamps: Map<number, number> = new Map(); // Track when traceroutes were initiated for timeout detection
 
@@ -2277,13 +2278,26 @@ class MeshtasticManager implements ISourceManager {
             const targetName = targetNode.longName || targetNode.nodeId;
             logger.debug(`🗺️ Auto-traceroute: Sending traceroute to ${targetName} (${targetNode.nodeId}) on channel ${channel}`);
 
-            // Log the auto-traceroute attempt to database
+            // Log the attempt as soon as it enters the central queue. Timeout
+            // tracking starts only after the scheduler actually transmits it.
             await databaseService.logAutoTracerouteAttemptAsync(targetNode.nodeNum, targetName, this.sourceId);
             this.pendingAutoTraceroutes.add(targetNode.nodeNum);
-            this.pendingTracerouteTimestamps.set(targetNode.nodeNum, Date.now());
 
-            this.lastTracerouteSentTime = Date.now();
-            await this.sendTraceroute(targetNode.nodeNum, channel);
+            try {
+              await this.sendTraceroute(targetNode.nodeNum, channel, {
+                priority: 'automatic',
+                timeoutMs: 75_000,
+              });
+              this.lastTracerouteSentTime = Date.now();
+              if (this.pendingAutoTraceroutes.has(targetNode.nodeNum)) {
+                this.pendingTracerouteTimestamps.set(targetNode.nodeNum, Date.now());
+              }
+            } catch (error) {
+              this.pendingAutoTraceroutes.delete(targetNode.nodeNum);
+              this.pendingTracerouteTimestamps.delete(targetNode.nodeNum);
+              await databaseService.updateAutoTracerouteResultByNodeAsync(targetNode.nodeNum, false).catch(() => {});
+              throw error;
+            }
 
             // Check for timed-out traceroutes (> 5 minutes old)
             this.checkTracerouteTimeouts();
@@ -7956,7 +7970,7 @@ class MeshtasticManager implements ISourceManager {
       // If this was an autoresponder-initiated traceroute, send a compact reply
       if (this.pendingAutoresponderTraceroutes.has(fromNum)) {
         const pending = this.pendingAutoresponderTraceroutes.get(fromNum)!;
-        clearTimeout(pending.timeoutHandle);
+        if (pending.timeoutHandle) clearTimeout(pending.timeoutHandle);
         this.pendingAutoresponderTraceroutes.delete(fromNum);
 
         // Build compact route string using short names (must fit within 200 bytes)
@@ -9179,14 +9193,51 @@ class MeshtasticManager implements ISourceManager {
     }
   }
 
-  async sendTraceroute(destination: number, channel: number = 0): Promise<void> {
-    tracerouteCampaignCoordinator.assertAvailable(this.sourceId);
-    await this.sendTraceroutePacket(destination, channel);
+  async sendTraceroute(
+    destination: number,
+    channel: number = 0,
+    scheduling: TracerouteScheduleOptions = {},
+  ): Promise<void> {
+    const localNodeNum = this.localNodeInfo?.nodeNum;
+    if (!localNodeNum) {
+      throw new Error('Local node information not available');
+    }
+
+    await tracerouteSchedulerService.enqueue({
+      sourceId: this.sourceId,
+      localNodeNum,
+      destination,
+      channel,
+      priority: scheduling.priority ?? 'manual',
+      rfDomain: scheduling.rfDomain,
+      timeoutMs: scheduling.timeoutMs,
+      ownerKey: scheduling.ownerKey,
+      send: () => this.sendTraceroutePacket(destination, channel),
+    });
   }
 
-  /** Send a traceroute owned by the active campaign reservation. */
-  async sendCampaignTraceroute(destination: number, channel: number = 0): Promise<void> {
-    await this.sendTraceroutePacket(destination, channel);
+  /** Send a traceroute owned by a campaign through the same global RF scheduler. */
+  async sendCampaignTraceroute(
+    destination: number,
+    channel: number = 0,
+    scheduling: TracerouteScheduleOptions = {},
+  ): Promise<void> {
+    const localNodeNum = this.localNodeInfo?.nodeNum;
+    if (!localNodeNum) {
+      throw new Error('Local node information not available');
+    }
+
+    await tracerouteSchedulerService.enqueue({
+      sourceId: this.sourceId,
+      localNodeNum,
+      destination,
+      channel,
+      priority: scheduling.priority ?? 'campaign',
+      rfDomain: scheduling.rfDomain,
+      timeoutMs: scheduling.timeoutMs,
+      ownerKey: scheduling.ownerKey,
+      send: () => this.sendTraceroutePacket(destination, channel),
+    });
   }
 
   private async sendTraceroutePacket(destination: number, channel: number): Promise<void> {
@@ -11148,37 +11199,45 @@ class MeshtasticManager implements ISourceManager {
               1
             );
 
-            // Set up 75-second timeout to reply if no response arrives
+            // Register before queueing so a very fast response can still be
+            // correlated. The 75-second response timeout starts only after the
+            // global scheduler actually transmits the trace.
             const TRACEROUTE_TIMEOUT_MS = 75000;
-            const timeoutHandle = setTimeout(() => {
-              const pending = this.pendingAutoresponderTraceroutes.get(targetNodeNum);
-              if (!pending) return;
-              this.pendingAutoresponderTraceroutes.delete(targetNodeNum);
-              const timeoutMsg = `${targetName.substring(0, 15)} did not respond within timeout`;
-              this.messageQueue.enqueue(
-                this.truncateMessageForMeshtastic(timeoutMsg, 200),
-                pending.isDM ? pending.replyToNodeNum : 0,
-                undefined,
-                () => { logger.debug('✅ Traceroute timeout reply delivered'); },
-                (reason: string) => { logger.warn(`❌ Traceroute timeout reply failed: ${reason}`); },
-                pending.isDM ? undefined : pending.replyChannel,
-                1
-              );
-            }, TRACEROUTE_TIMEOUT_MS);
-
-            // Register the pending traceroute so the result handler can reply
             this.pendingAutoresponderTraceroutes.set(targetNodeNum, {
               replyToNodeNum: message.fromNodeNum,
               isDM: isDirectMessage,
               replyChannel: isDirectMessage ? -1 : (message.channel as number),
               packetId,
-              timeoutHandle,
+              timeoutHandle: null,
             });
 
             // Send the actual traceroute packet
             try {
               const channel = targetNode.channel ?? 0;
-              await this.sendTraceroute(targetNodeNum, channel);
+              await this.sendTraceroute(targetNodeNum, channel, {
+                priority: 'manual',
+                timeoutMs: TRACEROUTE_TIMEOUT_MS,
+              });
+
+              const pending = this.pendingAutoresponderTraceroutes.get(targetNodeNum);
+              if (pending) {
+                pending.timeoutHandle = setTimeout(() => {
+                  const current = this.pendingAutoresponderTraceroutes.get(targetNodeNum);
+                  if (!current) return;
+                  this.pendingAutoresponderTraceroutes.delete(targetNodeNum);
+                  const timeoutMsg = `${targetName.substring(0, 15)} did not respond within timeout`;
+                  this.messageQueue.enqueue(
+                    this.truncateMessageForMeshtastic(timeoutMsg, 200),
+                    current.isDM ? current.replyToNodeNum : 0,
+                    undefined,
+                    () => { logger.debug('✅ Traceroute timeout reply delivered'); },
+                    (reason: string) => { logger.warn(`❌ Traceroute timeout reply failed: ${reason}`); },
+                    current.isDM ? undefined : current.replyChannel,
+                    1
+                  );
+                }, TRACEROUTE_TIMEOUT_MS);
+              }
+
               logger.debug(`🔍 Auto-responder traceroute to ${targetName} (${targetNode.nodeId}) initiated by ${nodeId}`);
 
               // Record cooldown timestamp
@@ -11188,7 +11247,8 @@ class MeshtasticManager implements ISourceManager {
               }
             } catch (error: any) {
               logger.error(`❌ Auto-responder traceroute to ${targetName} failed: ${error.message}`);
-              clearTimeout(timeoutHandle);
+              const pending = this.pendingAutoresponderTraceroutes.get(targetNodeNum);
+              if (pending?.timeoutHandle) clearTimeout(pending.timeoutHandle);
               this.pendingAutoresponderTraceroutes.delete(targetNodeNum);
               const errMsg = `Failed to traceroute: ${error.message?.substring(0, 30)}`;
               this.messageQueue.enqueue(
