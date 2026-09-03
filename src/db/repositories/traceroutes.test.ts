@@ -373,6 +373,37 @@ function runTraceroutesTests(getBackend: () => TestBackend) {
     expect(unrelated[0].fromNodeNum).toBe(5005);
   });
 
+  it('getLatestSuccessfulTracerouteByNodes ignores pending and out-of-window rows', async () => {
+    const backend = getBackend();
+    if (!backend.available) {
+      console.log(`⚠ Skipped: ${backend.skipReason}`);
+      return;
+    }
+
+    const now = Date.now();
+    await repo.insertTraceroute(makeTraceroute({
+      route: '[]',
+      timestamp: now - 20_000,
+      createdAt: now - 20_000,
+    }));
+    await repo.insertTraceroute(makeTraceroute({
+      route: '[3003]',
+      timestamp: now - 5_000,
+      createdAt: now - 5_000,
+    }));
+    // Newest row is only a pending request and must not count as a success.
+    await repo.insertTraceroute(makeTraceroute({
+      timestamp: now,
+      createdAt: now,
+    }));
+
+    const recent = await repo.getLatestSuccessfulTracerouteByNodes(2002, 1001, now - 10_000, ALL_SOURCES);
+    expect(recent?.route).toBe('[3003]');
+
+    const outsideWindow = await repo.getLatestSuccessfulTracerouteByNodes(1001, 2002, now - 1_000, ALL_SOURCES);
+    expect(outsideWindow).toBeNull();
+  });
+
   it('getTracerouteCount - returns correct count', async () => {
     const backend = getBackend();
     if (!backend.available) {

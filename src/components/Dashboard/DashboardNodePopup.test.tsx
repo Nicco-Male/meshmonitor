@@ -134,6 +134,23 @@ describe('DashboardNodePopup', () => {
     );
   });
 
+  it('opens a multi-source traceroute campaign with the popup node', () => {
+    const onTracerouteCampaign = vi.fn();
+    render(
+      <DashboardNodePopup
+        pos={pos}
+        onTracerouteCampaign={onTracerouteCampaign}
+        node={{ nodeNum: 100, nodeId: '!00000064', longName: 'Shared Node' }}
+      />,
+    );
+    fireEvent.click(screen.getByRole('button', { name: /Traceroute multi-sorgente/i }));
+    expect(onTracerouteCampaign).toHaveBeenCalledWith({
+      nodeNum: 100,
+      nodeId: '!00000064',
+      name: 'Shared Node',
+    });
+  });
+
   it('renders source rows as disabled (non-clickable) when no onSourceSelect is given', () => {
     render(
       <DashboardNodePopup

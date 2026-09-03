@@ -18,6 +18,7 @@ import { useDisplaySettings } from '../../contexts/SettingsContext';
 import { NodeCard } from '../map/popups/NodeCard';
 import { IdentityItems, SignalItems, PositionItem, LastHeardFooter, SourcesList } from '../map/popups/sections';
 import { toNodeCardModel, type NodeSourceRef } from '../map/popups/nodeCardModel';
+import { UiIcon } from '../icons';
 
 export type { NodeSourceRef };
 
@@ -29,9 +30,11 @@ interface DashboardNodePopupProps {
    * map uses this to jump to that source's Node Details view for this node.
    */
   onSourceSelect?: (source: NodeSourceRef, nodeId: string | undefined) => void;
+  /** Opens the Unified multi-source traceroute campaign with this node selected. */
+  onTracerouteCampaign?: (target: { nodeNum: number; nodeId?: string; name?: string }) => void;
 }
 
-export default function DashboardNodePopup({ node, pos, onSourceSelect }: DashboardNodePopupProps) {
+export default function DashboardNodePopup({ node, pos, onSourceSelect, onTracerouteCampaign }: DashboardNodePopupProps) {
   const { timeFormat, dateFormat, distanceUnit } = useDisplaySettings();
 
   const model = toNodeCardModel(node, 'meshtastic', { pos });
@@ -53,6 +56,19 @@ export default function DashboardNodePopup({ node, pos, onSourceSelect }: Dashbo
             dateFormat={dateFormat}
           />
           <SourcesList sources={model.sources} nodeId={model.nodeId} onSourceSelect={onSourceSelect} />
+          {onTracerouteCampaign && model.nodeNum != null && (
+            <button
+              type="button"
+              className="node-popup-btn dashboard-traceroute-campaign-popup-btn"
+              onClick={() => onTracerouteCampaign({
+                nodeNum: model.nodeNum!,
+                nodeId: model.nodeId,
+                name: model.longName,
+              })}
+            >
+              <UiIcon name="route" size={15} /> Traceroute multi-sorgente
+            </button>
+          )}
         </>
       }
     />

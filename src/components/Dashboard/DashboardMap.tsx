@@ -24,6 +24,7 @@ import type { CustomTileset } from '../../config/tilesets';
 import DashboardWaypoints from './DashboardWaypoints';
 import DashboardAtakContacts from './DashboardAtakContacts';
 import DashboardNodePopup, { type NodeSourceRef } from './DashboardNodePopup';
+import TracerouteCampaignModal from './TracerouteCampaignModal';
 import DashboardNeighborPopup from './DashboardNeighborPopup';
 import GeoJsonOverlay from '../GeoJsonOverlay';
 import PolarGridOverlay from '../PolarGridOverlay';
@@ -66,6 +67,7 @@ import {
   decomposeTraceroute,
   type TracerouteRenderSegment,
 } from '../../utils/tracerouteSegments';
+import type { TracerouteCampaignTargetInput } from '../../types/tracerouteCampaign';
 
 export interface DashboardMapProps {
   nodes: any[];
@@ -221,6 +223,12 @@ export default function DashboardMap({
   const isUnified = sourceId === UNIFIED_SOURCE_ID;
   const polarSourceIds = isUnified ? allSourceIds : sourceId ? [sourceId] : [];
   const sourceStatuses = useSourceStatuses(polarSourceIds);
+  const [campaignModalOpen, setCampaignModalOpen] = useState(false);
+  const [campaignInitialTarget, setCampaignInitialTarget] = useState<TracerouteCampaignTargetInput | null>(null);
+  const openCampaign = (target: TracerouteCampaignTargetInput | null = null) => {
+    setCampaignInitialTarget(target);
+    setCampaignModalOpen(true);
+  };
 
   // Tile selector + legend overlays — hidden by default, toggled from the Map
   // Features panel. Persisted under the same localStorage keys the NodesTab map
@@ -704,7 +712,12 @@ export default function DashboardMap({
       opacity: ageOpacity,
       children: (
         <Popup>
-          <DashboardNodePopup node={node} pos={pos} onSourceSelect={onNodeSourceSelect} />
+          <DashboardNodePopup
+            node={node}
+            pos={pos}
+            onSourceSelect={onNodeSourceSelect}
+            onTracerouteCampaign={isUnified ? openCampaign : undefined}
+          />
         </Popup>
       ),
     };
@@ -923,6 +936,16 @@ export default function DashboardMap({
           </div>
           {!isMapControlsCollapsed && (
           <>
+          {isUnified && (
+            <button
+              type="button"
+              className="map-control-item dashboard-campaign-launch"
+              onClick={() => openCampaign()}
+            >
+              <UiIcon name="route" size={15} />
+              <span>Campagna traceroute</span>
+            </button>
+          )}
           {/* #3636: node-to-node LOS distance measurement toggle. Needs at least
               two positioned nodes to be meaningful. */}
           <label className="map-control-item" title="Measure straight-line distance between two nodes">
@@ -1101,6 +1124,17 @@ export default function DashboardMap({
             <p>Select a source with nodes that have GPS positions to see them on the map.</p>
           </div>
         </div>
+      )}
+
+      {isUnified && (
+        <TracerouteCampaignModal
+          open={campaignModalOpen}
+          onClose={() => setCampaignModalOpen(false)}
+          nodes={nodes}
+          sources={allSources}
+          sourceStatuses={sourceStatuses}
+          initialTarget={campaignInitialTarget}
+        />
       )}
     </div>
   );

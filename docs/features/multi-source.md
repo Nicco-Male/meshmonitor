@@ -62,6 +62,45 @@ Nearly every top-level view has a **source picker** in the header. It controls w
 
 Your picker choice persists per view and per user.
 
+## Sequential traceroute campaigns
+
+The **Unified** dashboard can run a traceroute campaign against manually selected Meshtastic
+nodes. Open **Map Features → Traceroute campaign**, or open a node marker and choose
+**Traceroute multi-source** to preselect that node.
+
+A campaign:
+
+- uses only enabled, connected `meshtastic_tcp` sources selected in the dialog; MQTT and MeshCore
+  sources are read-only or use a different path model and are not offered;
+- sends exactly one traceroute at a time and waits for its response or timeout before using the
+  next source;
+- moves source/node pairs with a successful traceroute inside the configured recent-history
+  window to the front, newest success first;
+- can either continue through every source or stop attempts for a target node after its first
+  success;
+- shows live per-source results and can be cancelled while it is running.
+
+The default recent-history window is 24 hours, the response timeout is 75 seconds, and the pause
+between attempts is 5 seconds. All three values can be changed before starting. When a selected
+target is the local node of one source, only that source/target attempt is skipped.
+
+Campaigns run in the server process and remain active if the dialog is closed. Only one campaign
+can run at a time, preventing two operators from interleaving bursts across the same radios. The
+most recent campaign state is kept in memory for live UI inspection; it is not retained across a
+MeshMonitor restart.
+
+The session API used by the Unified UI is:
+
+```text
+POST /api/traceroute-campaigns
+GET  /api/traceroute-campaigns/active
+GET  /api/traceroute-campaigns/latest
+GET  /api/traceroute-campaigns/{campaignId}
+POST /api/traceroute-campaigns/{campaignId}/cancel
+```
+
+Starting a campaign requires `traceroute:write` permission on every selected source.
+
 ## Virtual Node
 
 Virtual Node is a MeshMonitor feature that lets mobile Meshtastic apps connect *through* MeshMonitor instead of directly to the node. In 4.0 it is **per-source**.

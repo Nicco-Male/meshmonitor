@@ -4,7 +4,7 @@
  * Handles traceroute and route segment database operations.
  * Supports SQLite, PostgreSQL, and MySQL through Drizzle ORM.
  */
-import { eq, and, desc, lt, or, isNull, gte, notInArray, count } from 'drizzle-orm';
+import { eq, and, desc, lt, or, isNull, isNotNull, gte, notInArray, count } from 'drizzle-orm';
 import { BaseRepository, DrizzleDatabase, SourceScope } from './base.js';
 import { DatabaseType, DbTraceroute, DbRouteSegment } from '../types.js';
 
@@ -194,6 +194,42 @@ export class TraceroutesRepository extends BaseRepository {
       .limit(limit);
 
     return this.normalizeBigInts(result) as DbTraceroute[];
+  }
+
+  /**
+   * Return the newest completed traceroute for a node pair inside a time
+   * window. Pending request rows have every route/SNR payload column NULL;
+   * completed direct routes legitimately store `[]`, so IS NOT NULL is the
+   * correct success test (truthiness is not).
+   */
+  async getLatestSuccessfulTracerouteByNodes(
+    fromNodeNum: number,
+    toNodeNum: number,
+    sinceTimestamp: number,
+    sourceId?: SourceScope,
+  ): Promise<DbTraceroute | null> {
+    const { traceroutes } = this.tables;
+    const result = await this.db
+      .select()
+      .from(traceroutes)
+      .where(and(
+        or(
+          and(eq(traceroutes.fromNodeNum, fromNodeNum), eq(traceroutes.toNodeNum, toNodeNum)),
+          and(eq(traceroutes.fromNodeNum, toNodeNum), eq(traceroutes.toNodeNum, fromNodeNum)),
+        ),
+        gte(traceroutes.timestamp, sinceTimestamp),
+        or(
+          isNotNull(traceroutes.route),
+          isNotNull(traceroutes.routeBack),
+          isNotNull(traceroutes.snrTowards),
+          isNotNull(traceroutes.snrBack),
+        ),
+        this.withSourceScope(traceroutes, sourceId),
+      ))
+      .orderBy(desc(traceroutes.timestamp))
+      .limit(1);
+
+    return result.length > 0 ? this.normalizeBigInts(result)[0] as DbTraceroute : null;
   }
 
   /**
