@@ -26,6 +26,33 @@ interface TraceNodePresentation {
   detail: string;
 }
 
+interface TraceSchedulerEntry {
+  sourceId: string;
+  localNodeNum: number;
+  destination: number;
+  channel: number;
+  priority: 'manual' | 'campaign' | 'automation' | 'automatic' | 'retry';
+  enqueuedAt: number;
+  startedAt?: number;
+}
+
+interface TraceSchedulerStatus {
+  maxActive: 1;
+  cooldownMs: number;
+  active: TraceSchedulerEntry | null;
+  queue: TraceSchedulerEntry[];
+}
+
+function schedulerPriorityLabel(priority: TraceSchedulerEntry['priority']): string {
+  switch (priority) {
+    case 'manual': return 'Manuale';
+    case 'campaign': return 'Campagna';
+    case 'automation': return 'Automazione';
+    case 'automatic': return 'Autotrace';
+    case 'retry': return 'Retry';
+  }
+}
+
 function asRecord(value: unknown): Record<string, unknown> {
   return typeof value === 'object' && value !== null ? value as Record<string, unknown> : {};
 }
@@ -211,6 +238,7 @@ export default function TracerouteCampaignPanel({
   const [loading, setLoading] = useState(false);
   const [checkingActive, setCheckingActive] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [schedulerStatus, setSchedulerStatus] = useState<TraceSchedulerStatus | null>(null);
 
   const nodeOptions = useMemo(() => {
     const byNodeNum = new Map<number, NodeOption>();
@@ -280,12 +308,37 @@ export default function TracerouteCampaignPanel({
     return () => window.clearInterval(interval);
   }, [polledCampaignId, polledCampaignStatus]);
 
+  useEffect(() => {
+    let cancelled = false;
+    const refreshScheduler = () => {
+      void api.get<TraceSchedulerStatus>('/api/traceroutes/scheduler/status')
+        .then((status) => { if (!cancelled) setSchedulerStatus(status); })
+        .catch(() => { /* Scheduler status is diagnostic; do not block campaign controls. */ });
+    };
+    refreshScheduler();
+    const interval = window.setInterval(refreshScheduler, 1000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
+    };
+  }, []);
+
   const filteredNodes = nodeOptions.filter((node) => !search.trim()
     || node.searchText.includes(search.trim().toLocaleLowerCase()));
   const nodeByNum = useMemo(
     () => new Map(nodeOptions.map((node) => [node.nodeNum, node])),
     [nodeOptions],
   );
+  const sourceNameById = useMemo(
+    () => new Map(sources.map((source) => [source.id, source.name])),
+    [sources],
+  );
+  const schedulerEntryText = (entry: TraceSchedulerEntry) => {
+    const sourceName = sourceNameById.get(entry.sourceId) ?? entry.sourceId;
+    const target = nodeByNum.get(entry.destination);
+    const targetName = target?.name ?? target?.nodeId ?? `!${entry.destination.toString(16).padStart(8, '0')}`;
+    return { sourceName, targetName };
+  };
   const toggleTarget = (nodeNum: number) => setSelectedTargetNums((current) => {
     const next = new Set(current);
     if (next.has(nodeNum)) next.delete(nodeNum); else next.add(nodeNum);
@@ -375,6 +428,57 @@ export default function TracerouteCampaignPanel({
         </header>
 
         {error && <div className="traceroute-campaign-error" role="alert">{error}</div>}
+
+        {schedulerStatus && (schedulerStatus.active || schedulerStatus.queue.length > 0) && (
+          <div className="traceroute-campaign-results">
+            <div className="traceroute-campaign-summary">
+              <div>
+                <strong>Scheduler RF · 1 trace alla volta</strong>
+                <span>
+                  {schedulerStatus.active
+                    ? (() => {
+                        const entry = schedulerEntryText(schedulerStatus.active);
+                        return `Attivo: ${entry.sourceName} → ${entry.targetName}`;
+                      })()
+                    : 'Cooldown prima del prossimo trace'}
+                </span>
+              </div>
+              <div className="traceroute-campaign-counts">
+                <span>{schedulerStatus.queue.length} in coda</span>
+              </div>
+            </div>
+            {schedulerStatus.queue.length > 0 && (
+              <div className="traceroute-campaign-job-groups">
+                <section className="traceroute-campaign-job-group">
+                  <h3>Prossimi traceroute</h3>
+                  {schedulerStatus.queue.slice(0, 6).map((entry, index) => {
+                    const label = schedulerEntryText(entry);
+                    return (
+                      <div
+                        key={`${entry.sourceId}-${entry.destination}-${entry.channel}-${entry.enqueuedAt}-${index}`}
+                        className="traceroute-campaign-job is-queued"
+                      >
+                        <span className="traceroute-campaign-job-icon"><UiIcon name="timer" size={15} /></span>
+                        <span className="traceroute-campaign-job-source">
+                          <strong>{label.sourceName}</strong>
+                          <small>→ {label.targetName}</small>
+                        </span>
+                        <span className="traceroute-campaign-job-status">
+                          <strong>#{index + 1} · {schedulerPriorityLabel(entry.priority)}</strong>
+                        </span>
+                      </div>
+                    );
+                  })}
+                  {schedulerStatus.queue.length > 6 && (
+                    <div className="traceroute-campaign-empty">
+                      +{schedulerStatus.queue.length - 6} altri in coda
+                    </div>
+                  )}
+                </section>
+              </div>
+            )}
+          </div>
+        )}
 
         {!campaign ? (
           <div className="traceroute-campaign-setup">

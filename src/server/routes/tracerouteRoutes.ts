@@ -3,8 +3,13 @@ import { requirePermission } from '../auth/authMiddleware.js';
 import databaseService from '../../services/database.js';
 import { ALL_SOURCES } from '../../db/repositories/index.js';
 import { logger } from '../../utils/logger.js';
+import { tracerouteRequestScheduler } from '../services/tracerouteRequestScheduler.js';
 
 const router = Router();
+
+router.get('/scheduler/status', (_req: Request, res: Response) => {
+  res.json(tracerouteRequestScheduler.getStatus());
+});
 
 router.get('/recent', async (req: Request, res: Response) => {
   try {
