@@ -65,12 +65,12 @@ Your picker choice persists per view and per user.
 ## Sequential traceroute campaigns
 
 The **Unified** dashboard can run a traceroute campaign against manually selected Meshtastic
-nodes. Open **Map Features → Traceroute campaign**, or open a node marker and choose
-**Traceroute multi-source** to preselect that node.
+nodes from a dedicated page. Open **Map Features → Traceroute campaign**, or open a node marker
+and choose **Traceroute multi-source** to open the page with that node already selected.
 
 A campaign:
 
-- uses only enabled, connected `meshtastic_tcp` sources selected in the dialog; MQTT and MeshCore
+- uses only enabled, connected `meshtastic_tcp` sources selected on the page; MQTT and MeshCore
   sources are read-only or use a different path model and are not offered;
 - sends exactly one traceroute at a time and waits for its response or timeout before using the
   next source;
@@ -84,10 +84,11 @@ The default recent-history window is 24 hours, the response timeout is 75 second
 between attempts is 5 seconds. All three values can be changed before starting. When a selected
 target is the local node of one source, only that source/target attempt is skipped.
 
-Campaigns run in the server process and remain active if the dialog is closed. Only one campaign
-can run at a time, preventing two operators from interleaving bursts across the same radios. The
-most recent campaign state is kept in memory for live UI inspection; it is not retained across a
-MeshMonitor restart.
+Campaigns run in the server process and remain active when the operator returns to the map or
+navigates elsewhere. Reopening the page resumes its live status. Only one campaign can run at a
+time, preventing two operators from interleaving bursts across the same radios. The most recent
+campaign state is kept in memory for live UI inspection; it is not retained across a MeshMonitor
+restart.
 
 The session API used by the Unified UI is:
 

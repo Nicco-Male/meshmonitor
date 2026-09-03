@@ -591,31 +591,92 @@
   gap: 0.35rem;
 }
 
-/* ── Unified sequential traceroute campaign ─────────────────────────────── */
+/* ── Unified sequential traceroute campaign page ────────────────────────── */
 
-.traceroute-campaign-overlay {
-  position: fixed;
-  inset: 0;
-  z-index: 10000;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 1rem;
-  background: rgba(0, 0, 0, 0.68);
-  backdrop-filter: blur(2px);
+.traceroute-campaign-page {
+  min-height: 100dvh;
+  background: var(--ctp-crust);
+  color: var(--ctp-text);
 }
 
-.traceroute-campaign-modal {
-  width: min(900px, 100%);
-  max-height: min(880px, calc(100vh - 2rem));
+.traceroute-campaign-page-nav {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 56px;
+  padding: 0.65rem max(1rem, calc((100vw - 1080px) / 2));
+  border-bottom: 1px solid var(--ctp-surface0);
+  background: color-mix(in srgb, var(--ctp-mantle) 94%, transparent);
+  backdrop-filter: blur(10px);
+}
+
+.traceroute-campaign-back {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.48rem 0.68rem;
+  border: 1px solid var(--ctp-surface1);
+  border-radius: 6px;
+  background: var(--ctp-surface0);
+  color: var(--ctp-text);
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.traceroute-campaign-back:hover {
+  border-color: var(--ctp-blue);
+  color: var(--ctp-blue);
+}
+
+.traceroute-campaign-brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  color: var(--ctp-lavender);
+  font-size: 1.05rem;
+  font-weight: 700;
+}
+
+.traceroute-campaign-brand img {
+  width: 23px;
+  height: 23px;
+  object-fit: contain;
+}
+
+.traceroute-campaign-page-main {
+  width: min(1080px, calc(100% - 2rem));
+  margin: 0 auto;
+  padding: 1.5rem 0 3rem;
+}
+
+.traceroute-campaign-panel-page {
+  width: 100%;
   display: flex;
   flex-direction: column;
-  overflow: hidden;
   border: 1px solid var(--ctp-surface1);
   border-radius: 12px;
   background: var(--ctp-mantle);
   color: var(--ctp-text);
-  box-shadow: 0 22px 70px rgba(0, 0, 0, 0.5);
+  box-shadow: 0 14px 42px rgba(0, 0, 0, 0.28);
+}
+
+.traceroute-campaign-loading,
+.traceroute-campaign-load-error {
+  margin-bottom: 0.8rem;
+  padding: 0.65rem 0.8rem;
+  border: 1px solid var(--ctp-surface1);
+  border-radius: 7px;
+  background: var(--ctp-mantle);
+  color: var(--ctp-subtext0);
+  font-size: 0.82rem;
+}
+
+.traceroute-campaign-load-error {
+  border-color: color-mix(in srgb, var(--ctp-red) 55%, transparent);
+  color: var(--ctp-red);
 }
 
 .traceroute-campaign-header,
@@ -648,7 +709,6 @@
   border-bottom: 0;
 }
 
-.traceroute-campaign-icon-btn,
 .traceroute-campaign-btn,
 .traceroute-campaign-inline-actions button,
 .traceroute-campaign-panel-title button {
@@ -657,11 +717,6 @@
   background: var(--ctp-surface0);
   color: var(--ctp-text);
   cursor: pointer;
-}
-
-.traceroute-campaign-icon-btn {
-  display: inline-flex;
-  padding: 0.45rem;
 }
 
 .traceroute-campaign-btn {
@@ -701,7 +756,6 @@
 .traceroute-campaign-setup,
 .traceroute-campaign-results {
   min-height: 0;
-  overflow-y: auto;
   padding: 1rem 1.2rem;
 }
 
@@ -961,8 +1015,10 @@
 .traceroute-campaign-job-status small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 @media (max-width: 700px) {
-  .traceroute-campaign-overlay { padding: 0; }
-  .traceroute-campaign-modal { width: 100%; max-height: 100vh; height: 100%; border-radius: 0; }
+  .traceroute-campaign-page-nav { padding: 0.55rem 0.75rem; }
+  .traceroute-campaign-brand span { display: none; }
+  .traceroute-campaign-page-main { width: 100%; padding: 0; }
+  .traceroute-campaign-panel-page { border-width: 0 0 1px; border-radius: 0; box-shadow: none; }
   .traceroute-campaign-setup { grid-template-columns: 1fr; }
   .traceroute-campaign-options,
   .traceroute-campaign-numeric-options { grid-column: 1; }

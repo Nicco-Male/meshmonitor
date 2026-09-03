@@ -347,6 +347,39 @@ describe('DashboardMap', () => {
     mocks.sources = [];
   });
 
+  it('opens the standalone traceroute campaign from Unified map controls', () => {
+    const onTracerouteCampaign = vi.fn();
+    render(
+      <DashboardMap
+        {...defaultProps}
+        sourceId="__unified__"
+        onTracerouteCampaign={onTracerouteCampaign}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /Campagna traceroute/i }));
+    expect(onTracerouteCampaign).toHaveBeenCalledWith(null);
+  });
+
+  it('opens the standalone page with the popup node preselected', () => {
+    const onTracerouteCampaign = vi.fn();
+    render(
+      <DashboardMap
+        {...defaultProps}
+        sourceId="__unified__"
+        nodes={[nodeWithMergedPosition]}
+        onTracerouteCampaign={onTracerouteCampaign}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /Traceroute multi-sorgente/i }));
+    expect(onTracerouteCampaign).toHaveBeenCalledWith({
+      nodeNum: 100,
+      nodeId: 'node-7',
+      name: 'Merged Position Node',
+    });
+  });
+
   // --- Default Map Center vs auto-fit (issue #4125) ---------------------------
 
   it('auto-fits bounds to node positions when no Default Map Center is configured', () => {

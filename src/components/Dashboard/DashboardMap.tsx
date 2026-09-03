@@ -24,7 +24,6 @@ import type { CustomTileset } from '../../config/tilesets';
 import DashboardWaypoints from './DashboardWaypoints';
 import DashboardAtakContacts from './DashboardAtakContacts';
 import DashboardNodePopup, { type NodeSourceRef } from './DashboardNodePopup';
-import TracerouteCampaignModal from './TracerouteCampaignModal';
 import DashboardNeighborPopup from './DashboardNeighborPopup';
 import GeoJsonOverlay from '../GeoJsonOverlay';
 import PolarGridOverlay from '../PolarGridOverlay';
@@ -91,6 +90,8 @@ export interface DashboardMapProps {
    * page can navigate to that source's Node Details view for the node.
    */
   onNodeSourceSelect?: (source: NodeSourceRef, nodeId: string | undefined) => void;
+  /** Opens the standalone sequential traceroute page, optionally preselecting a node. */
+  onTracerouteCampaign?: (target: TracerouteCampaignTargetInput | null) => void;
   /**
    * True while the FIRST fetch of `nodes` for the current selection is still
    * in flight (from `useDashboardSourceData`/`useDashboardUnifiedData`'s
@@ -189,6 +190,7 @@ export default function DashboardMap({
   sourceId,
   maxNodeAgeHours,
   onNodeSourceSelect,
+  onTracerouteCampaign,
   isLoading = false,
 }: DashboardMapProps) {
   const {
@@ -223,12 +225,6 @@ export default function DashboardMap({
   const isUnified = sourceId === UNIFIED_SOURCE_ID;
   const polarSourceIds = isUnified ? allSourceIds : sourceId ? [sourceId] : [];
   const sourceStatuses = useSourceStatuses(polarSourceIds);
-  const [campaignModalOpen, setCampaignModalOpen] = useState(false);
-  const [campaignInitialTarget, setCampaignInitialTarget] = useState<TracerouteCampaignTargetInput | null>(null);
-  const openCampaign = (target: TracerouteCampaignTargetInput | null = null) => {
-    setCampaignInitialTarget(target);
-    setCampaignModalOpen(true);
-  };
 
   // Tile selector + legend overlays — hidden by default, toggled from the Map
   // Features panel. Persisted under the same localStorage keys the NodesTab map
@@ -716,7 +712,9 @@ export default function DashboardMap({
             node={node}
             pos={pos}
             onSourceSelect={onNodeSourceSelect}
-            onTracerouteCampaign={isUnified ? openCampaign : undefined}
+            onTracerouteCampaign={isUnified && onTracerouteCampaign
+              ? (target) => onTracerouteCampaign(target)
+              : undefined}
           />
         </Popup>
       ),
@@ -936,11 +934,11 @@ export default function DashboardMap({
           </div>
           {!isMapControlsCollapsed && (
           <>
-          {isUnified && (
+          {isUnified && onTracerouteCampaign && (
             <button
               type="button"
               className="map-control-item dashboard-campaign-launch"
-              onClick={() => openCampaign()}
+              onClick={() => onTracerouteCampaign?.(null)}
             >
               <UiIcon name="route" size={15} />
               <span>Campagna traceroute</span>
@@ -1126,16 +1124,6 @@ export default function DashboardMap({
         </div>
       )}
 
-      {isUnified && (
-        <TracerouteCampaignModal
-          open={campaignModalOpen}
-          onClose={() => setCampaignModalOpen(false)}
-          nodes={nodes}
-          sources={allSources}
-          sourceStatuses={sourceStatuses}
-          initialTarget={campaignInitialTarget}
-        />
-      )}
     </div>
   );
 }

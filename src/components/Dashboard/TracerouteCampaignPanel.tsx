@@ -9,9 +9,7 @@ import type {
 import type { DashboardSource, SourceStatus } from '../../hooks/useDashboardData';
 import { UiIcon } from '../icons';
 
-interface TracerouteCampaignModalProps {
-  open: boolean;
-  onClose: () => void;
+interface TracerouteCampaignPanelProps {
   nodes: unknown[];
   sources: DashboardSource[];
   sourceStatuses: Map<string, SourceStatus | null>;
@@ -74,14 +72,12 @@ function statusIcon(job: TracerouteCampaignJob) {
   return <UiIcon name="error" size={15} />;
 }
 
-export default function TracerouteCampaignModal({
-  open,
-  onClose,
+export default function TracerouteCampaignPanel({
   nodes,
   sources,
   sourceStatuses,
   initialTarget,
-}: TracerouteCampaignModalProps) {
+}: TracerouteCampaignPanelProps) {
   const [selectedTargetNums, setSelectedTargetNums] = useState<Set<number>>(new Set());
   const [selectedSourceIds, setSelectedSourceIds] = useState<Set<string>>(new Set());
   const [search, setSearch] = useState('');
@@ -100,8 +96,18 @@ export default function TracerouteCampaignModal({
       const option = nodeOption(raw);
       if (option) byNodeNum.set(option.nodeNum, option);
     }
+    if (initialTarget && !byNodeNum.has(initialTarget.nodeNum)) {
+      const nodeId = initialTarget.nodeId ?? `!${initialTarget.nodeNum.toString(16).padStart(8, '0')}`;
+      const name = initialTarget.name ?? nodeId;
+      byNodeNum.set(initialTarget.nodeNum, {
+        ...initialTarget,
+        nodeId,
+        name,
+        searchText: `${name} ${nodeId} ${initialTarget.nodeNum} ${initialTarget.nodeNum.toString(16)}`.toLocaleLowerCase(),
+      });
+    }
     return [...byNodeNum.values()].sort((a, b) => (a.name ?? '').localeCompare(b.name ?? ''));
-  }, [nodes]);
+  }, [nodes, initialTarget]);
 
   const eligibleSources = useMemo(() => sources.filter((source) =>
     source.enabled && source.type === 'meshtastic_tcp'), [sources]);
@@ -116,7 +122,6 @@ export default function TracerouteCampaignModal({
   );
 
   useEffect(() => {
-    if (!open) return;
     setError(null);
     setSearch('');
     setSelectedTargetNums(initialTarget ? new Set([initialTarget.nodeNum]) : new Set());
@@ -137,12 +142,12 @@ export default function TracerouteCampaignModal({
       })
       .finally(() => { if (!cancelled) setCheckingActive(false); });
     return () => { cancelled = true; };
-  }, [open, initialTarget, connectedSourceIds]);
+  }, [initialTarget, connectedSourceIds]);
 
   const polledCampaignId = campaign?.id;
   const polledCampaignStatus = campaign?.status;
   useEffect(() => {
-    if (!open || !polledCampaignId || (polledCampaignStatus !== 'queued' && polledCampaignStatus !== 'running')) return;
+    if (!polledCampaignId || (polledCampaignStatus !== 'queued' && polledCampaignStatus !== 'running')) return;
     const interval = window.setInterval(() => {
       void api.get<TracerouteCampaign>(`/api/traceroute-campaigns/${polledCampaignId}`)
         .then(setCampaign)
@@ -151,9 +156,7 @@ export default function TracerouteCampaignModal({
         ));
     }, 1000);
     return () => window.clearInterval(interval);
-  }, [open, polledCampaignId, polledCampaignStatus]);
-
-  if (!open) return null;
+  }, [polledCampaignId, polledCampaignStatus]);
 
   const filteredNodes = nodeOptions.filter((node) => !search.trim()
     || node.searchText.includes(search.trim().toLocaleLowerCase()));
@@ -217,16 +220,12 @@ export default function TracerouteCampaignModal({
   ])).entries()] : [];
 
   return (
-    <div className="traceroute-campaign-overlay" role="presentation">
-      <section className="traceroute-campaign-modal" role="dialog" aria-modal="true" aria-labelledby="traceroute-campaign-title">
+    <section className="traceroute-campaign-panel-page" aria-labelledby="traceroute-campaign-title">
         <header className="traceroute-campaign-header">
           <div>
             <h2 id="traceroute-campaign-title"><UiIcon name="route" size={20} /> Campagna traceroute</h2>
             <p>Interroga le sorgenti una alla volta e aspetta l’esito prima di proseguire.</p>
           </div>
-          <button type="button" className="traceroute-campaign-icon-btn" onClick={onClose} aria-label="Chiudi">
-            <UiIcon name="close" size={18} />
-          </button>
         </header>
 
         {error && <div className="traceroute-campaign-error" role="alert">{error}</div>}
@@ -351,7 +350,6 @@ export default function TracerouteCampaignModal({
             </button>
           )}
         </footer>
-      </section>
-    </div>
+    </section>
   );
 }

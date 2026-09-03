@@ -39,6 +39,7 @@ import UnifiedPacketMonitorPage from './pages/UnifiedPacketMonitorPage.tsx';
 import GlobalSettingsPage from './pages/GlobalSettingsPage.tsx';
 import UsersPage from './pages/UsersPage.tsx';
 import MeshCoreSourcePage from './pages/MeshCoreSourcePage.tsx';
+import TracerouteCampaignPage from './pages/TracerouteCampaignPage.tsx';
 import { useDashboardSources } from './hooks/useDashboardData';
 import './index.css';
 import { AuthProvider } from './contexts/AuthContext';
@@ -156,6 +157,10 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
             <Route
               path="unified/packets"
               element={sharedProviders(<UnifiedPacketMonitorPage />)}
+            />
+            <Route
+              path="unified/traceroute-campaign"
+              element={sharedProviders(<TracerouteCampaignPage />)}
             />
 
             {/* Analysis workspace */}

@@ -23,6 +23,7 @@ import {
 } from '../hooks/useDashboardData';
 import { useMeshCoreNeighbors } from '../hooks/useMapAnalysisData';
 import type { DashboardSource } from '../hooks/useDashboardData';
+import type { TracerouteCampaignTargetInput } from '../types/tracerouteCampaign';
 import DashboardSidebar from '../components/Dashboard/DashboardSidebar';
 import DashboardMap from '../components/Dashboard/DashboardMap';
 import type { NodeSourceRef } from '../components/Dashboard/DashboardNodePopup';
@@ -56,6 +57,12 @@ function DashboardInner() {
   const { mapTileset, customTilesets, defaultMapCenterLat, defaultMapCenterLon, maxNodeAgeHours, defaultLandingPage } = useSettings();
   const navigate = useNavigate();
   const location = useLocation();
+
+  const openTracerouteCampaign = (initialTarget: TracerouteCampaignTargetInput | null) => {
+    void navigate('/unified/traceroute-campaign', {
+      state: initialTarget ? { initialTarget } : undefined,
+    });
+  };
 
   /**
    * Invalidate the source list cache after a mutation so the sidebar
@@ -990,6 +997,7 @@ function DashboardInner() {
           sourceId={selectedSourceId}
           maxNodeAgeHours={maxNodeAgeHours}
           onNodeSourceSelect={handleNodeSourceSelect}
+          onTracerouteCampaign={openTracerouteCampaign}
           isLoading={sourceData.isLoading}
         />
       </div>

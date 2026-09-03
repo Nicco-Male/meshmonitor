@@ -3,7 +3,7 @@
  */
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
-import TracerouteCampaignModal from './TracerouteCampaignModal';
+import TracerouteCampaignPanel from './TracerouteCampaignPanel';
 
 const apiMocks = vi.hoisted(() => ({
   get: vi.fn(),
@@ -14,7 +14,7 @@ vi.mock('../../services/api', () => ({
   default: apiMocks,
 }));
 
-describe('TracerouteCampaignModal', () => {
+describe('TracerouteCampaignPanel', () => {
   beforeEach(() => {
     apiMocks.get.mockReset().mockResolvedValue({ campaign: null });
     apiMocks.post.mockReset().mockResolvedValue({
@@ -31,9 +31,7 @@ describe('TracerouteCampaignModal', () => {
 
   it('preselects the popup target, excludes unavailable sources, and submits the chosen behavior', async () => {
     render(
-      <TracerouteCampaignModal
-        open
-        onClose={vi.fn()}
+      <TracerouteCampaignPanel
         initialTarget={{ nodeNum: 42, nodeId: '!0000002a', name: 'Tower Node' }}
         nodes={[
           { nodeNum: 42, nodeId: '!0000002a', longName: 'Tower Node' },
@@ -51,6 +49,7 @@ describe('TracerouteCampaignModal', () => {
       />,
     );
 
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
     expect(screen.getByLabelText(/Tower Node/i)).toBeChecked();
     expect(screen.getByLabelText(/Source A/i)).toBeChecked();
     expect(screen.getByLabelText(/Source B/i)).toBeDisabled();
