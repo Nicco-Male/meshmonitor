@@ -4,7 +4,7 @@ import { useSettings, TimeFormat, DateFormat } from '../contexts/SettingsContext
 import { formatDateTime } from '../utils/datetime';
 import { DraggableOverlay } from './DraggableOverlay';
 import { MESHCORE_CATEGORIES, NODE_TYPE_CATEGORY_META } from '../utils/nodeTypeCategory';
-import { roleGlyphMarkerSvg } from '../utils/mapIcons';
+import { mobilityBadgeMarkerSvg, NODE_ROLE_COLORS, roleGlyphMarkerSvg } from '../utils/mapIcons';
 import './MapLegend.css';
 import { UiIcon } from './icons';
 
@@ -34,6 +34,8 @@ interface MapLegendProps {
   /** Render the MeshCore node-type glyph legend (issue #3546). Opt-in so the
    *  Meshtastic maps that share this component are unaffected. */
   showNodeTypes?: boolean;
+  /** Explain semantic role colors and the fixed/mobile car marker. */
+  showSemanticNodeStyles?: boolean;
 }
 
 // Default position: top-right, below the Features checkbox panel, right-aligned with it
@@ -44,7 +46,7 @@ const getDefaultPosition = () => ({
   y: 60 + 10 + 250 + 20 // header + features top + features height + gap = 340
 });
 
-const MapLegend: React.FC<MapLegendProps> = ({ positionHistory, unmappedCount, showNodeTypes }) => {
+const MapLegend: React.FC<MapLegendProps> = ({ positionHistory, unmappedCount, showNodeTypes, showSemanticNodeStyles }) => {
   const { t } = useTranslation();
   const { overlayColors } = useSettings();
   const [isCollapsed, setIsCollapsed] = useState(() => {
@@ -80,7 +82,7 @@ const MapLegend: React.FC<MapLegendProps> = ({ positionHistory, unmappedCount, s
     >
       <div className={`map-legend ${isCollapsed ? 'collapsed' : ''}`}>
         <div className="legend-header">
-          <span className="legend-title">{t('map.legend.hops')}</span>
+          <span className="legend-title">{showSemanticNodeStyles ? t('map.legend.hopsOutline', 'Hops (outline)') : t('map.legend.hops')}</span>
           <button
             className="legend-collapse-btn"
             onClick={handleToggleCollapse}
@@ -102,6 +104,42 @@ const MapLegend: React.FC<MapLegendProps> = ({ positionHistory, unmappedCount, s
                 <span className="legend-gradient-label">6+</span>
               </div>
             </div>
+            {showSemanticNodeStyles && (
+              <>
+                <div className="legend-divider" />
+                <span className="legend-title">{t('map.legend.nodeColors', 'Node colors')}</span>
+                <div className="legend-item">
+                  <span className="legend-dot" style={{ background: NODE_ROLE_COLORS.client }} />
+                  <span className="legend-label">{t('map.legend.clientNodes', 'Client')}</span>
+                </div>
+                <div className="legend-item">
+                  <span className="legend-line-sample" style={{ display: 'inline-flex', width: 20, height: 20 }} aria-hidden="true"
+                    dangerouslySetInnerHTML={{ __html: roleGlyphMarkerSvg('mtRouter', NODE_ROLE_COLORS.backbone, 20) }} />
+                  <span className="legend-label">{t('map.legend.backboneNodes', 'Router / backbone')}</span>
+                </div>
+                <div className="legend-item">
+                  <span className="legend-line-sample" style={{ display: 'inline-flex', width: 20, height: 20 }} aria-hidden="true"
+                    dangerouslySetInnerHTML={{ __html: roleGlyphMarkerSvg('mtSensor', NODE_ROLE_COLORS.sensor, 20) }} />
+                  <span className="legend-label">{t('map.legend.sensorNodes', 'Sensor')}</span>
+                </div>
+                <div className="legend-item">
+                  <span className="legend-dot" style={{ background: NODE_ROLE_COLORS.infrastructure }} />
+                  <span className="legend-label">{t('map.legend.infrastructureNodes', 'Base / infrastructure')}</span>
+                </div>
+                <div className="legend-item">
+                  <span className="legend-dot" style={{ background: NODE_ROLE_COLORS.tracker }} />
+                  <span className="legend-label">{t('map.legend.trackerNodes', 'Tracker')}</span>
+                </div>
+                <div className="legend-item">
+                  <span className="legend-line-sample" style={{ display: 'inline-flex', width: 20, height: 20 }} aria-hidden="true"
+                    dangerouslySetInnerHTML={{ __html: mobilityBadgeMarkerSvg(NODE_ROLE_COLORS.client, 20) }} />
+                  <span className="legend-label">{t('map.legend.mobileNode', 'Car = mobile; no car = fixed')}</span>
+                </div>
+                <span className="legend-sublabel" style={{ fontSize: '0.7rem', color: 'var(--ctp-subtext0)', marginTop: '2px' }}>
+                  {t('map.legend.roleBodyHopOutline', 'Body/glyph = role · outline = hop distance')}
+                </span>
+              </>
+            )}
             <div className="legend-divider" />
             <span className="legend-title">{t('map.legend.neighbors', 'Neighbors')}</span>
             {/* Line style: solid = bidirectional, dashed = one-way */}

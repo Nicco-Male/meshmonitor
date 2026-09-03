@@ -16,6 +16,8 @@ import {
   createNodeIcon,
   createTracerouteEndpointIcon,
   getHopColor,
+  getNodeRoleColor,
+  NODE_ROLE_COLORS,
   roleGlyphMarkerSvg,
 } from './markerIcons';
 import type { NodeTypeCategory } from '../../utils/nodeTypeCategory';
@@ -244,6 +246,57 @@ describe('createNodeIcon — variant:"meshtastic" (default) unchanged code paths
   });
 });
 
+describe('createNodeIcon — semantic role colors and mobility', () => {
+  it('maps client, backbone, sensor, infrastructure and tracker roles to distinct colors', () => {
+    expect(getNodeRoleColor('mtClient')).toBe(NODE_ROLE_COLORS.client);
+    expect(getNodeRoleColor('mtRouter')).toBe(NODE_ROLE_COLORS.backbone);
+    expect(getNodeRoleColor('mtSensor')).toBe(NODE_ROLE_COLORS.sensor);
+    expect(getNodeRoleColor('mtClientBase')).toBe(NODE_ROLE_COLORS.infrastructure);
+    expect(getNodeRoleColor('mtTracker')).toBe(NODE_ROLE_COLORS.tracker);
+  });
+
+  it('uses role color for the body while retaining hop color as the outline', () => {
+    const icon = createNodeIcon({
+      hops: 3,
+      roleCategory: 'mtClient',
+      semanticRoleColor: true,
+      pinStyle: 'meshmonitor',
+    }) as unknown as FixtureDivIconOptions;
+    expect(icon.html).toContain(NODE_ROLE_COLORS.client);
+    expect(icon.html).toContain(getHopColor(3));
+  });
+
+  it('draws a car for a mobile standard pin and not for a fixed one', () => {
+    const mobile = createNodeIcon({
+      hops: 1,
+      roleCategory: 'mtClient',
+      semanticRoleColor: true,
+      isMobile: true,
+      pinStyle: 'meshmonitor',
+    }) as unknown as FixtureDivIconOptions;
+    const fixed = createNodeIcon({
+      hops: 1,
+      roleCategory: 'mtClient',
+      semanticRoleColor: true,
+      isMobile: false,
+      pinStyle: 'meshmonitor',
+    }) as unknown as FixtureDivIconOptions;
+    expect(mobile.html).toContain("data-node-mobility='mobile'");
+    expect(fixed.html).not.toContain("data-node-mobility='mobile'");
+  });
+
+  it('treats TRACKER-style roles as mobile before movement history is available', () => {
+    const icon = createNodeIcon({
+      hops: 1,
+      roleCategory: 'mtTracker',
+      semanticRoleColor: true,
+      isMobile: false,
+      pinStyle: 'meshmonitor',
+    }) as unknown as FixtureDivIconOptions;
+    expect(icon.html).toContain(NODE_ROLE_COLORS.tracker);
+    expect(icon.html).toContain("data-node-mobility='mobile'");
+  });
+});
 describe('createNodeIcon — cache-relevant purity', () => {
   it('same inputs produce equal (deep-equal) html/options across calls', () => {
     const opts = { hops: 3, isSelected: false, isRouter: true, shortName: 'X', showLabel: true, pinStyle: 'meshmonitor' as const };

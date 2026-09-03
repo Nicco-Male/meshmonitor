@@ -692,7 +692,7 @@ export default function DashboardMap({
     return {
       key: markerKey,
       position: [pos.lat, pos.lng],
-      iconSig: `${hops}|${shortName ?? ''}|${isRouter ? 1 : 0}|${roleCategory}|${node.isUnmessagable ? 1 : 0}|${mapPinStyle}`,
+      iconSig: `${hops}|${shortName ?? ''}|${isRouter ? 1 : 0}|${roleCategory}|${node.mobile === 1 || node.isMobile === true ? 1 : 0}|${node.isUnmessagable ? 1 : 0}|${mapPinStyle}|semantic-role-v1`,
       buildIcon: () =>
         createNodeIcon({
           variant: 'meshtastic',
@@ -700,6 +700,8 @@ export default function DashboardMap({
           isSelected: false,
           isRouter,
           roleCategory,
+          semanticRoleColor: true,
+          isMobile: node.mobile === 1 || node.isMobile === true,
           isUnmessagable: !!node.isUnmessagable,
           shortName,
           showLabel: true,
@@ -823,7 +825,7 @@ export default function DashboardMap({
 
         <MapBoundsUpdater positions={nodePositions} sourceId={sourceId} skip={hasConfiguredDefaultCenter} />
 
-        {showLegend && <MapLegend />}
+        {showLegend && <MapLegend showSemanticNodeStyles />}
 
         {geoJsonLayers.length > 0 && <GeoJsonOverlay layers={geoJsonLayers} />}
 

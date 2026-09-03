@@ -145,6 +145,80 @@ export function getHopColor(
  *  explicitly; this is only a fallback for callers that omit it. */
 const MESHCORE_DEFAULT_COLOR = '#cba6f7';
 
+/**
+ * Semantic node colors used by the main Meshtastic maps. The role color is
+ * the marker's primary fill/glyph; hop distance remains visible as the
+ * outline, so the two dimensions no longer compete for the same color.
+ */
+export const NODE_ROLE_COLORS = {
+  client: '#2563eb',
+  backbone: '#8b5cf6',
+  sensor: '#06b6d4',
+  infrastructure: '#14b8a6',
+  tracker: '#f59e0b',
+  tactical: '#ec4899',
+  unknown: '#64748b',
+} as const;
+
+/** Return the semantic role color for a node-type category. */
+export function getNodeRoleColor(category?: NodeTypeCategory): string {
+  switch (category) {
+    case 'repeater':
+    case 'mtRouter':
+    case 'mtRouterLate':
+    case 'mtRepeater':
+    case 'mtRouterClient':
+      return NODE_ROLE_COLORS.backbone;
+    case 'sensor':
+    case 'mtSensor':
+      return NODE_ROLE_COLORS.sensor;
+    case 'roomServer':
+    case 'mtClientBase':
+      return NODE_ROLE_COLORS.infrastructure;
+    case 'mtTracker':
+    case 'mtTakTracker':
+    case 'mtLostAndFound':
+      return NODE_ROLE_COLORS.tracker;
+    case 'mtTak':
+      return NODE_ROLE_COLORS.tactical;
+    case 'companion':
+    case 'standard':
+    case 'mtClient':
+    case 'mtClientMute':
+    case 'mtClientHidden':
+      return NODE_ROLE_COLORS.client;
+    default:
+      return NODE_ROLE_COLORS.unknown;
+  }
+}
+
+/** TRACKER-style roles are mobile by definition even before enough position
+ * history exists for MeshMonitor's >100 m movement detector. */
+export function isInherentlyMobileCategory(category?: NodeTypeCategory): boolean {
+  return category === 'mtTracker' || category === 'mtTakTracker' || category === 'mtLostAndFound';
+}
+
+/** Compact car badge used on circular/role markers and in map legends. */
+export function mobilityBadgeMarkerSvg(color: string, size = 20): string {
+  return `<svg data-node-mobility='mobile' width='${size}' height='${size}' viewBox='0 0 24 24' xmlns='http://www.w3.org/2000/svg'>`
+    + `<circle cx='12' cy='12' r='11' fill='white' fill-opacity='0.97' stroke='${color}' stroke-width='1.5' />`
+    + `<path d='M5 17h14v-5l-2-4H7l-2 4v5Z' fill='${color}' />`
+    + `<path d='M7 12h10' stroke='white' stroke-width='1.5' stroke-linecap='round' />`
+    + `<circle cx='7.5' cy='17' r='1.7' fill='#555' />`
+    + `<circle cx='16.5' cy='17' r='1.7' fill='#555' />`
+    + `</svg>`;
+}
+
+/** Car silhouette replacing the center dot on a mobile standard pin. */
+function mobilePinGlyphSvg(): string {
+  return `<g data-node-mobility='mobile'>`
+    + `<path d='M16 21h16v-6l-3-4H19l-3 4v6Z' fill='white' />`
+    + `<path d='M19 15h10' stroke='#555' stroke-width='1.4' stroke-linecap='round' />`
+    + `<circle cx='20' cy='21' r='2' fill='#555' />`
+    + `<circle cx='28' cy='21' r='2' fill='#555' />`
+    + `</g>`;
+}
+
 export interface CreateNodeIconOptions {
   // --- existing (unchanged code paths; Meshtastic parity) ---
   /** used when color kind = hops (default) */
@@ -162,6 +236,10 @@ export interface CreateNodeIconOptions {
   /** When true, overlay a "no direct messages" badge on the marker (issue
    *  #4295). Meshtastic variant only. */
   isUnmessagable?: boolean;
+  /** Opt into role-first marker coloring. Defaults off for backwards compatibility. */
+  semanticRoleColor?: boolean;
+  /** Existing MeshMonitor mobility detector output. */
+  isMobile?: boolean;
   // --- new (source-tech parameters, Phase 4 #4047) ---
   /** Source-tech variant. Defaults to 'meshtastic' — every existing caller's
    *  code path is unchanged. */
@@ -198,6 +276,8 @@ export function createNodeIcon(options: CreateNodeIconOptions): L.DivIcon {
     pinStyle = 'meshmonitor',
     roleCategory,
     isUnmessagable = false,
+    semanticRoleColor = false,
+    isMobile = false,
     variant = 'meshtastic',
     fixedColor,
     labelName,
@@ -254,7 +334,10 @@ export function createNodeIcon(options: CreateNodeIconOptions): L.DivIcon {
   }
 
   // --- Meshtastic (default) — unchanged code paths below ---
-  const color = fixedColor ?? getHopColor(hops);
+  const hopColor = getHopColor(hops);
+  const color = fixedColor ?? (semanticRoleColor ? getNodeRoleColor(roleCategory) : hopColor);
+  const outlineColor = fixedColor ?? hopColor;
+  const resolvedMobile = !!isMobile || isInherentlyMobileCategory(roleCategory);
   // A non-standard role gets a dedicated glyph; standard falls through to the
   // existing pin/circle rendering.
   const roleInner =
@@ -278,10 +361,29 @@ export function createNodeIcon(options: CreateNodeIconOptions): L.DivIcon {
       ">${unmessageableBadgeSvg(unmessageableBadgeSize)}</div>
     ` : '';
 
+  // Mobile circular/role markers carry a bottom-left car badge. Plain
+  // MeshMonitor pins put the car inside the pin instead.
+  const mobilityBadgeSize = Math.round(size * 0.4);
+  const mobilityBadge = resolvedMobile && (pinStyle === 'official' || !!roleInner || isRouter) ? `
+      <div style='
+        position: absolute;
+        bottom: -2px;
+        left: -2px;
+        width: ${mobilityBadgeSize}px;
+        height: ${mobilityBadgeSize}px;
+        filter: drop-shadow(0 1px 2px rgba(0,0,0,0.4));
+        pointer-events: none;
+      '>${mobilityBadgeMarkerSvg(color, mobilityBadgeSize)}</div>
+    ` : '';
+
   // Official Meshtastic style: Circle with always-visible label
   if (pinStyle === 'official') {
     const circleSize = size;
     const emojiName = shortName && isEmoji(shortName);
+    const officialStrokeColor = semanticRoleColor && !fixedColor ? outlineColor : color;
+    const semanticRoleAccent = semanticRoleColor && !fixedColor
+      ? `<circle cx='24' cy='24' r='17' fill='${color}' fill-opacity='0.13' stroke='${color}' stroke-width='2' />`
+      : '';
 
     // Issue #4154: the always-visible short-name text is the entire point of
     // this pin style, so it must render for every role — a role glyph must
@@ -292,11 +394,13 @@ export function createNodeIcon(options: CreateNodeIconOptions): L.DivIcon {
     // the base circle.
     const markerSvg = emojiName ? `
       <svg width="${circleSize}" height="${circleSize}" viewBox="0 0 48 48" xmlns="http://www.w3.org/2000/svg">
-        <circle cx="24" cy="24" r="20" fill="white" fill-opacity="0.95" stroke="${color}" stroke-width="${strokeWidth}" />
+        <circle cx="24" cy="24" r="20" fill="white" fill-opacity="0.95" stroke="${officialStrokeColor}" stroke-width="${strokeWidth}" />
+        ${semanticRoleAccent}
       </svg>
     ` : `
       <svg width="${circleSize}" height="${circleSize}" viewBox="0 0 48 48" xmlns="http://www.w3.org/2000/svg">
-        <circle cx="24" cy="24" r="20" fill="white" fill-opacity="0.95" stroke="${color}" stroke-width="${strokeWidth}" />
+        <circle cx="24" cy="24" r="20" fill="white" fill-opacity="0.95" stroke="${officialStrokeColor}" stroke-width="${strokeWidth}" />
+        ${semanticRoleAccent}
         <text x="24" y="28" text-anchor="middle" font-family="Arial, sans-serif" font-size="12" font-weight="bold" fill="#333">${shortName || '?'}</text>
       </svg>
     `;
@@ -346,6 +450,7 @@ export function createNodeIcon(options: CreateNodeIconOptions): L.DivIcon {
         ${markerSvg}
         ${emojiOverlay}
         ${roleBadge}
+        ${mobilityBadge}
         ${unmessageableBadge}
       </div>
     `;
@@ -362,15 +467,17 @@ export function createNodeIcon(options: CreateNodeIconOptions): L.DivIcon {
   // MeshMonitor style: Pin/tower markers with zoom-based labels.
   // A role glyph (when present) renders over a white background circle, the
   // same treatment the router tower already uses (issue #3546).
+  const roleStrokeColor = semanticRoleColor && !fixedColor ? outlineColor : color;
+  const pinStrokeColor = semanticRoleColor && !fixedColor ? outlineColor : 'white';
   const markerSvg = roleInner ? `
     <svg width="${size}" height="${size}" viewBox="0 0 48 48" xmlns="http://www.w3.org/2000/svg">
-      <circle cx="24" cy="24" r="20" fill="white" fill-opacity="0.95" stroke="${color}" stroke-width="${strokeWidth}" />
+      <circle cx="24" cy="24" r="20" fill="white" fill-opacity="0.95" stroke="${roleStrokeColor}" stroke-width="${strokeWidth}" />
       ${roleInner}
     </svg>
   ` : isRouter ? `
     <svg width="${size}" height="${size}" viewBox="0 0 48 48" xmlns="http://www.w3.org/2000/svg">
       <!-- Background circle -->
-      <circle cx="24" cy="24" r="20" fill="white" fill-opacity="0.95" stroke="${color}" stroke-width="${strokeWidth}" />
+      <circle cx="24" cy="24" r="20" fill="white" fill-opacity="0.95" stroke="${roleStrokeColor}" stroke-width="${strokeWidth}" />
       <!-- Tower base -->
       <rect x="19" y="32" width="10" height="12" fill="#555" />
       <!-- Tower body -->
@@ -389,9 +496,9 @@ export function createNodeIcon(options: CreateNodeIconOptions): L.DivIcon {
     <svg width="${size}" height="${size}" viewBox="0 0 48 48" xmlns="http://www.w3.org/2000/svg">
       <!-- Pin shape -->
       <path d="M 24 4 C 16 4 10 10 10 18 C 10 30 24 44 24 44 C 24 44 38 30 38 18 C 38 10 32 4 24 4 Z"
-            fill="${color}" stroke="white" stroke-width="${strokeWidth}" />
+            fill="${color}" stroke="${pinStrokeColor}" stroke-width="${strokeWidth}" />
       <!-- Inner circle -->
-      <circle cx="24" cy="18" r="6" fill="white" />
+      ${resolvedMobile ? mobilePinGlyphSvg() : '<circle cx="24" cy="18" r="6" fill="white" />'}
     </svg>
   `;
 
@@ -424,6 +531,7 @@ export function createNodeIcon(options: CreateNodeIconOptions): L.DivIcon {
     <div class="${classes}" style="position: relative; width: ${size}px; height: ${size}px;">
       ${markerSvg}
       ${label}
+      ${mobilityBadge}
       ${unmessageableBadge}
     </div>
   `;

@@ -16,7 +16,7 @@ import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useMapAnalysisCtx } from './MapAnalysisContext';
 import { useVisibleNodeTypeCategories } from './useVisibleNodeTypeCategories';
-import { roleGlyphMarkerSvg } from '../../utils/mapIcons';
+import { getNodeRoleColor, mobilityBadgeMarkerSvg, NODE_ROLE_COLORS, roleGlyphMarkerSvg } from '../../utils/mapIcons';
 import {
   categoryGlyphFamily,
   NODE_TYPE_CATEGORY_META,
@@ -94,7 +94,20 @@ export default function MapLegend() {
           {showMarkers && (
             <section>
               <h4>Markers</h4>
-              <div className="row"><Swatch color="#6698f5" /> Node</div>
+              <div className="row"><Swatch color={NODE_ROLE_COLORS.client} /> Client</div>
+              <div className="row"><Swatch color={NODE_ROLE_COLORS.backbone} /> Router / backbone</div>
+              <div className="row"><Swatch color={NODE_ROLE_COLORS.sensor} /> Sensor</div>
+              <div className="row"><Swatch color={NODE_ROLE_COLORS.infrastructure} /> Base / infrastructure</div>
+              <div className="row"><Swatch color={NODE_ROLE_COLORS.tracker} /> Tracker</div>
+              <div className="row">
+                <span
+                  className="map-analysis-legend-swatch"
+                  style={{ background: 'transparent', width: 20, height: 20, display: 'inline-block' }}
+                  aria-hidden="true"
+                  dangerouslySetInnerHTML={{ __html: mobilityBadgeMarkerSvg(NODE_ROLE_COLORS.client, 20) }}
+                /> Mobile (car); no car = fixed
+              </div>
+              <div className="row caption">Body/glyph = role · outline = hop distance</div>
             </section>
           )}
           {showMarkers && legendCategories.length > 0 && (
@@ -106,7 +119,7 @@ export default function MapLegend() {
                     className="map-analysis-legend-swatch"
                     style={{ background: 'transparent', width: 20, height: 20, display: 'inline-block' }}
                     aria-hidden="true"
-                    dangerouslySetInnerHTML={{ __html: roleGlyphMarkerSvg(c, '#6698f5', 20) }}
+                    dangerouslySetInnerHTML={{ __html: roleGlyphMarkerSvg(c, getNodeRoleColor(c), 20) }}
                   />{' '}
                   {t(NODE_TYPE_CATEGORY_META[c].labelKey, NODE_TYPE_CATEGORY_META[c].label)}
                 </div>
