@@ -37,10 +37,10 @@ function DashboardDestination() {
 }
 
 describe('TracerouteCampaignPage', () => {
-  it('passes the popup target to the page and returns to Unified without blocking navigation', () => {
+  it('reads the popup target from the new-tab URL and returns to Unified', () => {
     const initialTarget = { nodeNum: 42, nodeId: '!0000002a', name: 'Tower Node' };
     render(
-      <MemoryRouter initialEntries={[{ pathname: '/unified/traceroute-campaign', state: { initialTarget } }]}>
+      <MemoryRouter initialEntries={['/unified/traceroute-campaign?nodeNum=42&nodeId=%210000002a&name=Tower+Node']}>
         <Routes>
           <Route path="/unified/traceroute-campaign" element={<TracerouteCampaignPage />} />
           <Route path="/" element={<DashboardDestination />} />

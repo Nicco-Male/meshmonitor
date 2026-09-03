@@ -1,3 +1,4 @@
+import { useMemo } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
 import TracerouteCampaignPanel from '../components/Dashboard/TracerouteCampaignPanel';
 import { UiIcon } from '../components/icons';
@@ -20,7 +21,18 @@ export default function TracerouteCampaignPage() {
   const { data: sources = [] } = useDashboardSources();
   const sourceStatuses = useSourceStatuses(sources.map((source) => source.id));
   const unifiedData = useDashboardUnifiedData(sources, true);
-  const initialTarget = (location.state as TracerouteCampaignLocationState | null)?.initialTarget ?? null;
+  const initialTarget = useMemo(() => {
+    const params = new URLSearchParams(location.search);
+    const nodeNum = Number(params.get('nodeNum'));
+    if (Number.isInteger(nodeNum) && nodeNum > 0 && nodeNum < 0xffffffff) {
+      return {
+        nodeNum,
+        nodeId: params.get('nodeId') ?? undefined,
+        name: params.get('name') ?? undefined,
+      };
+    }
+    return (location.state as TracerouteCampaignLocationState | null)?.initialTarget ?? null;
+  }, [location.search, location.state]);
 
   const returnToDashboard = () => {
     void navigate('/', { state: { showList: true } });

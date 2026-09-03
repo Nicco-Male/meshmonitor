@@ -96,7 +96,18 @@ vi.mock('../components/Dashboard/DashboardSidebar', () => ({
 }));
 
 vi.mock('../components/Dashboard/DashboardMap', () => ({
-  default: () => <div data-testid="dashboard-map" />,
+  default: ({ onTracerouteCampaign }: {
+    onTracerouteCampaign?: (target: { nodeNum: number; nodeId?: string; name?: string } | null) => void;
+  }) => (
+    <div data-testid="dashboard-map">
+      <button type="button" onClick={() => onTracerouteCampaign?.(null)}>Open campaign</button>
+      <button type="button" onClick={() => onTracerouteCampaign?.({
+        nodeNum: 42,
+        nodeId: '!0000002a',
+        name: 'Tower Node',
+      })}>Open campaign for node</button>
+    </div>
+  ),
 }));
 
 vi.mock('../components/LoginModal', () => ({
@@ -185,6 +196,26 @@ describe('DashboardPage', () => {
   it('renders the map', () => {
     renderPage();
     expect(screen.getByTestId('dashboard-map')).toBeInTheDocument();
+  });
+
+  it('opens the traceroute campaign in a new tab and carries the popup target in the URL', () => {
+    const openSpy = vi.spyOn(window, 'open').mockImplementation(() => null);
+    try {
+      renderPage();
+      fireEvent.click(screen.getByRole('button', { name: 'Open campaign for node' }));
+
+      expect(openSpy).toHaveBeenCalledTimes(1);
+      const [rawUrl, target, features] = openSpy.mock.calls[0];
+      const url = new URL(String(rawUrl), 'https://meshmonitor.test');
+      expect(url.pathname).toBe('/unified/traceroute-campaign');
+      expect(url.searchParams.get('nodeNum')).toBe('42');
+      expect(url.searchParams.get('nodeId')).toBe('!0000002a');
+      expect(url.searchParams.get('name')).toBe('Tower Node');
+      expect(target).toBe('_blank');
+      expect(features).toBe('noopener,noreferrer');
+    } finally {
+      openSpy.mockRestore();
+    }
   });
 
   it('shows "Sign In" button when not authenticated', () => {

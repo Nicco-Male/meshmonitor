@@ -66,7 +66,8 @@ Your picker choice persists per view and per user.
 
 The **Unified** dashboard can run a traceroute campaign against manually selected Meshtastic
 nodes from a dedicated page. Open **Map Features → Traceroute campaign**, or open a node marker
-and choose **Traceroute multi-source** to open the page with that node already selected.
+and choose **Traceroute multi-source** to open the page in a new browser tab with that node already
+selected. The Unified map remains available in the original tab while the campaign runs.
 
 A campaign:
 

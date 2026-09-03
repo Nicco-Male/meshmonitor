@@ -59,9 +59,15 @@ function DashboardInner() {
   const location = useLocation();
 
   const openTracerouteCampaign = (initialTarget: TracerouteCampaignTargetInput | null) => {
-    void navigate('/unified/traceroute-campaign', {
-      state: initialTarget ? { initialTarget } : undefined,
-    });
+    const params = new URLSearchParams();
+    if (initialTarget) {
+      params.set('nodeNum', String(initialTarget.nodeNum));
+      if (initialTarget.nodeId) params.set('nodeId', initialTarget.nodeId);
+      if (initialTarget.name) params.set('name', initialTarget.name);
+    }
+    const query = params.toString();
+    const url = `${appBasename}/unified/traceroute-campaign${query ? `?${query}` : ''}`;
+    window.open(url, '_blank', 'noopener,noreferrer');
   };
 
   /**
