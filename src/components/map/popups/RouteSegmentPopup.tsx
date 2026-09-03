@@ -200,7 +200,9 @@ export interface RouteSegmentPopupProps {
   usageCount?: number;
   /** Override the segment's samples with a consumer-owned aggregate. */
   snrSamples?: Array<{ snr: number; timestamp?: number }>;
-  /** Override whether any observation for this segment travelled over IP. */
+  /** Override whether firmware reported the generic unknown-SNR sentinel. */
+  snrUnknown?: boolean;
+  /** Override explicit IP/MQTT transport evidence. Never inferred from SNR. */
   isMqtt?: boolean;
   /** Optional Dashboard-only attribution. */
   sourceName?: string | null;
@@ -250,6 +252,7 @@ export default function RouteSegmentPopup({
   distanceUnit,
   usageCount = segment.usageCount ?? 1,
   snrSamples = segment.snrSamples ?? [],
+  snrUnknown = segment.snrUnknown ?? false,
   isMqtt = segment.isMqtt,
   sourceName,
   lastSeen,
@@ -336,6 +339,14 @@ export default function RouteSegmentPopup({
         {typeof lastSeen === 'number' && lastSeen > 0 && (
           <div className="route-usage">
             Last traced: <strong>{formatRelativeTime(lastSeen)}</strong>
+          </div>
+        )}
+        {!snrStats && snrUnknown && (
+          <div className="route-snr-stats">
+            <h5>SNR:</h5>
+            <div className="snr-stat-row">
+              <span className="stat-value">Unknown</span>
+            </div>
           </div>
         )}
         {snrStats && (

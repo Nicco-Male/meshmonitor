@@ -352,7 +352,7 @@ describe('decomposeTraceroute', () => {
     expect(returnSegs[1].avgSnr).toBe(6); // 24/4
   });
 
-  it('maps the firmware unknown-SNR sentinel (raw -128) to isMqtt=true and avgSnr=null (#2931)', () => {
+  it('maps the firmware unknown-SNR sentinel (raw -128) to snrUnknown=true without inventing IP/MQTT', () => {
     const tr: TracerouteDecomposeInput = {
       fromNodeNum: 100,
       toNodeNum: 200,
@@ -365,11 +365,12 @@ describe('decomposeTraceroute', () => {
     expect(segments).toHaveLength(2);
     for (const seg of segments) {
       expect(seg.avgSnr).toBeNull();
-      expect(seg.isMqtt).toBe(true);
+      expect(seg.snrUnknown).toBe(true);
+      expect(seg.isMqtt).toBe(false);
     }
   });
 
-  it('distinguishes a missing SNR sample (avgSnr=null, isMqtt=false) from the sentinel (avgSnr=null, isMqtt=true)', () => {
+  it('distinguishes a missing SNR sample from the explicit unknown-SNR sentinel', () => {
     const tr: TracerouteDecomposeInput = {
       fromNodeNum: 100,
       toNodeNum: 200,
@@ -381,6 +382,7 @@ describe('decomposeTraceroute', () => {
     const segments = decomposeTraceroute(tr, { resolvePosition });
     expect(segments).toHaveLength(1);
     expect(segments[0].avgSnr).toBeNull();
+    expect(segments[0].snrUnknown).toBe(false);
     expect(segments[0].isMqtt).toBe(false);
   });
 
@@ -506,7 +508,7 @@ describe('decomposeTraceroute', () => {
     expect(intoUnknown.to[0]).toBeLessThan(17);
     expect(intoUnknown.toHopKey).toContain('trace-7:forward:unknown:1');
     // Arrival SNRs remain attached to their original raw hops.
-    expect(intoUnknown).toMatchObject({ avgSnr: null, isMqtt: true });
+    expect(intoUnknown).toMatchObject({ avgSnr: null, snrUnknown: true, isMqtt: false });
     expect(outOfUnknown).toMatchObject({ avgSnr: 7, isMqtt: false });
   });
 

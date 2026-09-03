@@ -103,6 +103,7 @@ interface DashboardTraceroutePopupAggregate {
   sourceId: string | null;
   usageCount: number;
   snrSamples: Array<{ snr: number; timestamp?: number }>;
+  hasUnknownSnr: boolean;
   hasMqtt: boolean;
   latestTimestamp: number | null;
 }
@@ -119,6 +120,7 @@ interface DashboardTraceroutePopupAccumulator {
   sourceId: string | null;
   traceIds: Set<string>;
   snrSamples: Array<{ snr: number; timestamp?: number }>;
+  hasUnknownSnr: boolean;
   hasMqtt: boolean;
   latestTimestamp: number | null;
 }
@@ -528,6 +530,7 @@ export default function DashboardMap({
             sourceId: traceSourceId,
             traceIds: new Set<string>(),
             snrSamples: [],
+            hasUnknownSnr: false,
             hasMqtt: false,
             latestTimestamp: null,
           };
@@ -541,6 +544,7 @@ export default function DashboardMap({
             timestamp: trTimestamp > 0 ? trTimestamp : undefined,
           });
         }
+        aggregate.hasUnknownSnr ||= seg.snrUnknown === true;
         aggregate.hasMqtt ||= seg.isMqtt;
         if (
           trTimestamp > 0 &&
@@ -565,6 +569,7 @@ export default function DashboardMap({
           sourceId: aggregate?.sourceId ?? null,
           usageCount: aggregate?.traceIds.size ?? 1,
           snrSamples: aggregate?.snrSamples ?? [],
+          hasUnknownSnr: aggregate?.hasUnknownSnr ?? segment.snrUnknown === true,
           hasMqtt: aggregate?.hasMqtt ?? segment.isMqtt,
           latestTimestamp: aggregate?.latestTimestamp ?? null,
         },
@@ -626,6 +631,7 @@ export default function DashboardMap({
         distanceUnit={distanceUnit}
         usageCount={popupAggregate.usageCount}
         snrSamples={popupAggregate.snrSamples}
+        snrUnknown={popupAggregate.hasUnknownSnr}
         isMqtt={popupAggregate.hasMqtt}
         sourceName={popupSourceName}
         lastSeen={popupAggregate.latestTimestamp}
@@ -830,8 +836,8 @@ export default function DashboardMap({
         <AccuracyRegionsLayer regions={accuracyRegions} />
 
         {/* Route segments — thin SNR-colored hop polylines (shared render
-            layer). MQTT/unknown-SNR hops dash and get the distinguishing
-            mqttColor, matching every other traceroute renderer. */}
+            layer). Unknown-SNR hops remain no-data/dashed; only explicit
+            MQTT/IP transport evidence may use the mqttColor. */}
         {showPaths && (
           <TraceroutePathsLayer
             segments={tracerouteRenderSegments}

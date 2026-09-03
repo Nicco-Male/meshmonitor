@@ -194,7 +194,7 @@ describe('analyzeTraceroutes', () => {
     expect(segments[0].avgSnr).toBe(5);
   });
 
-  it('treats the firmware unknown-SNR sentinel (-128 raw) as MQTT/unknown', () => {
+  it('treats the firmware unknown-SNR sentinel (-128 raw) as unknown SNR, not as IP/MQTT', () => {
     const { segments } = analyzeTraceroutes(
       makeParams({
         traceroutes: [directTrace(1, [-128], [-128])],
@@ -205,7 +205,8 @@ describe('analyzeTraceroutes', () => {
     expect(segments.length).toBeGreaterThan(0);
     for (const s of segments) {
       expect(s.avgSnr).toBeNull();
-      expect(s.isMqtt).toBe(true);
+      expect(s.snrUnknown).toBe(true);
+      expect(s.isMqtt).toBe(false);
     }
     // minSnr filtering removes unknown-SNR links.
     const filtered = analyzeTraceroutes(

@@ -305,8 +305,11 @@ export interface TracerouteRenderSegment {
   hopCount?: number;
   leg: 'forward' | 'return' | 'neutral';
   direction?: 'inbound' | 'outbound' | 'neutral'; // MapAnalysis relative-to-selection
-  avgSnr: number | null;               // /4-scaled dB; null = no data
-  isMqtt: boolean;                      // per-hop sentinel (#2931), NOT node.viaMqtt
+  avgSnr: number | null;               // /4-scaled dB; null = no usable RF SNR
+  /** True when firmware supplied the generic unknown-SNR sentinel (-128 raw / -32 dB scaled). */
+  snrUnknown?: boolean;
+  /** True only with explicit IP/MQTT transport evidence. Never inferred from SNR values. */
+  isMqtt: boolean;
   usageCount?: number;                  // weightByUsage
   occurrences?: number;                // weightByOccurrence
   timestamp?: number;                   // temporal fade
@@ -647,8 +650,8 @@ function buildLegSegments(
     // this hop (see HopEntry above).
     const rawSnr = toHop.snr;
     const scaledSnr = rawSnr === undefined ? undefined : rawSnr / 4;
-    const isMqtt = scaledSnr !== undefined && isUnknownSnr(scaledSnr);
-    const avgSnr = scaledSnr === undefined || isMqtt ? null : scaledSnr;
+    const snrUnknown = scaledSnr !== undefined && isUnknownSnr(scaledSnr);
+    const avgSnr = scaledSnr === undefined || snrUnknown ? null : scaledSnr;
 
     segments.push({
       key:
@@ -667,7 +670,10 @@ function buildLegSegments(
       hopCount: hops.length - 1,
       leg,
       avgSnr,
-      isMqtt,
+      snrUnknown,
+      // RouteDiscovery carries SNR/topology, not transport metadata. Do not
+      // turn an unknown SNR sentinel into an IP/MQTT classification.
+      isMqtt: false,
       timestamp,
     });
   }

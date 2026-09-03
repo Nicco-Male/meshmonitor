@@ -203,6 +203,7 @@ export function useTraceroutePaths({
     // shared 0xffffffff placeholder, so unrelated hidden relays cannot merge.
     const segmentTraceIds = new Map<string, Set<number>>();
     const segmentSNRs = new Map<string, Array<{ snr: number; timestamp: number }>>();
+    const segmentHasUnknownSnr = new Map<string, boolean>();
     const segmentHasMqtt = new Map<string, boolean>();
     const segmentLatestTimestamp = new Map<string, number>();
     const segmentsList: TracerouteRenderSegment[] = [];
@@ -269,6 +270,7 @@ export function useTraceroutePaths({
           samples.push({ snr: segment.avgSnr, timestamp });
           segmentSNRs.set(aggregateKey, samples);
         }
+        if (segment.snrUnknown) segmentHasUnknownSnr.set(aggregateKey, true);
         if (segment.isMqtt) segmentHasMqtt.set(aggregateKey, true);
         const existingTimestamp = segmentLatestTimestamp.get(aggregateKey) ?? 0;
         if (timestamp > existingTimestamp) segmentLatestTimestamp.set(aggregateKey, timestamp);
@@ -314,13 +316,10 @@ export function useTraceroutePaths({
     const renderSegments: TracerouteRenderSegment[] = filteredSegments.map(segment => {
       const segmentKey = segmentPairKey(segment);
       const usage = segmentTraceIds.get(segmentKey)?.size ?? 1;
-      // A segment is MQTT/IP only when the firmware reported the unknown-SNR
-      // sentinel for that specific hop (issue #2931). Don't infer from
-      // `node.viaMqtt` — that flag tracks how the node's own NodeInfo last
-      // reached us, not how its radio segments work; a single MQTT/UDP
-      // bridge node would otherwise mark every adjacent segment as IP and
-      // cascade the dashed style across an entire route that's actually
-      // mostly radio.
+      // SNR and transport are separate facts. Unknown SNR is tracked on its
+      // own; IP/MQTT is only carried when some explicit transport evidence is
+      // available. Never infer IP from the -128/-32 SNR sentinel.
+      const snrUnknown = segmentHasUnknownSnr.get(segmentKey) === true;
       const isMqttSegment = segmentHasMqtt.get(segmentKey) === true;
       const snrSamples = segmentSNRs.get(segmentKey) || [];
       const avgSnr = averageNonSentinelSnr(snrSamples);
@@ -333,6 +332,7 @@ export function useTraceroutePaths({
         // way for this layer, per the consumer table).
         leg: 'neutral',
         avgSnr,
+        snrUnknown,
         isMqtt: isMqttSegment,
         usageCount: usage,
         timestamp: latestTimestamp,
@@ -581,7 +581,7 @@ export function useTraceroutePaths({
                   Distance: <strong>{formatDistance(legDistance, distanceUnit)}</strong>
                 </div>
               )}
-              {(seg.avgSnr !== null || seg.isMqtt) && (
+              {(seg.avgSnr !== null || seg.snrUnknown || seg.isMqtt) && (
                 <div className="route-usage" style={{ marginTop: '8px', borderTop: '1px solid var(--ctp-surface0)', paddingTop: '4px' }}>
                   Segment SNR: <strong>{seg.avgSnr !== null ? `${seg.avgSnr.toFixed(1)} dB` : 'Unknown'}</strong>
                   {seg.isMqtt && ' (IP)'}

@@ -57,16 +57,27 @@ afterEach(() => {
 });
 
 describe('RouteSegmentPopup', () => {
-  it('renders a read-only route segment without SNR statistics when no RF samples exist', () => {
-    renderPopup({ isMqtt: true, snrSamples: [{ snr: -32, timestamp: Date.now() }] });
+  it('renders the firmware sentinel as unknown SNR without claiming IP transport', () => {
+    renderPopup({
+      snrUnknown: true,
+      isMqtt: false,
+      snrSamples: [{ snr: -32, timestamp: Date.now() }],
+    });
 
     expect(screen.getByText('TRACEROUTE · Route Segment')).toBeInTheDocument();
     expect(screen.getByText('Alpha')).toBeInTheDocument();
     expect(screen.getByText('Bravo')).toBeInTheDocument();
-    expect(screen.getByText('via IP')).toBeInTheDocument();
+    expect(screen.queryByText('via IP')).not.toBeInTheDocument();
+    expect(screen.getByText('SNR:')).toBeInTheDocument();
+    expect(screen.getByText('Unknown')).toBeInTheDocument();
     expect(screen.queryByText(/SNR Statistics/)).not.toBeInTheDocument();
-    expect(screen.queryByText(/^SNR:$/)).not.toBeInTheDocument();
     expect(screen.getByText('Alpha')).not.toHaveClass('route-node-link');
+  });
+
+  it('keeps the IP badge available for explicit transport evidence', () => {
+    renderPopup({ isMqtt: true });
+
+    expect(screen.getByText('via IP')).toBeInTheDocument();
   });
 
   it('renders a single SNR sample', () => {

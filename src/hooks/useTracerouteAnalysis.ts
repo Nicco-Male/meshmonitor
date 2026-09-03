@@ -77,7 +77,9 @@ export interface AnalyzedSegment {
   avgSnr: number | null;
   /** number of traceroutes that contained this directed hop */
   occurrences: number;
-  /** true if any observation reported an unknown-SNR (sentinel) sample */
+  /** true if the surviving observations include the firmware unknown-SNR sentinel */
+  snrUnknown?: boolean;
+  /** explicit IP/MQTT transport evidence only; this analysis input currently carries none */
   isMqtt: boolean;
 }
 
@@ -177,7 +179,7 @@ interface Accum {
   occurrences: number;
   snrSum: number;
   snrCount: number;
-  hasUnknown: boolean;
+  hasUnknownSnr: boolean;
 }
 
 /**
@@ -251,14 +253,14 @@ export function analyzeTraceroutes(params: AnalyzeParams): AnalyzeResult {
           occurrences: 0,
           snrSum: 0,
           snrCount: 0,
-          hasUnknown: false,
+          hasUnknownSnr: false,
         };
         acc.set(key, a);
       }
       a.occurrences += 1;
-      if (seg.snr === undefined || isUnknownSnr(seg.snr)) {
-        a.hasUnknown = true;
-      } else {
+      if (seg.snr !== undefined && isUnknownSnr(seg.snr)) {
+        a.hasUnknownSnr = true;
+      } else if (seg.snr !== undefined) {
         a.snrSum += seg.snr;
         a.snrCount += 1;
       }
@@ -306,7 +308,9 @@ export function analyzeTraceroutes(params: AnalyzeParams): AnalyzeResult {
       neighborNum,
       avgSnr,
       occurrences: a.occurrences,
-      isMqtt: a.hasUnknown && a.snrCount === 0,
+      snrUnknown: a.hasUnknownSnr && a.snrCount === 0,
+      // Traceroute SNR/topology data does not identify the transport.
+      isMqtt: false,
     });
   }
 
