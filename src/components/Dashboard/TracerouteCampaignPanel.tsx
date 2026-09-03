@@ -21,6 +21,11 @@ interface NodeOption extends TracerouteCampaignTargetInput {
   searchText: string;
 }
 
+interface TraceNodePresentation {
+  label: string;
+  detail: string;
+}
+
 function asRecord(value: unknown): Record<string, unknown> {
   return typeof value === 'object' && value !== null ? value as Record<string, unknown> : {};
 }
@@ -53,6 +58,119 @@ function nodeOption(raw: unknown): NodeOption | null {
 
 function formatTimestamp(timestamp: number): string {
   return new Date(timestamp).toLocaleString();
+}
+
+function parseTraceNumbers(value: string | null): number[] {
+  if (!value) return [];
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed)
+      ? parsed.map(Number).filter((entry) => Number.isFinite(entry))
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+function traceNodePresentation(
+  nodeNum: number,
+  job: TracerouteCampaignJob,
+  nodeByNum: Map<number, NodeOption>,
+): TraceNodePresentation {
+  const nodeId = `!${nodeNum.toString(16).padStart(8, '0')}`;
+  if (nodeNum === 0xffffffff) return { label: 'Sconosciuto', detail: 'Hop anonimo' };
+  if (nodeNum === job.localNodeNum) return { label: job.sourceName, detail: nodeId };
+
+  const node = nodeByNum.get(nodeNum);
+  if (node) {
+    const name = node.name ?? node.nodeId ?? nodeId;
+    return {
+      label: node.shortName && node.shortName !== name ? node.shortName : name,
+      detail: node.shortName && node.shortName !== name ? `${name} · ${node.nodeId ?? nodeId}` : node.nodeId ?? nodeId,
+    };
+  }
+  if (nodeNum === job.target.nodeNum) {
+    return { label: job.target.name ?? job.target.nodeId ?? nodeId, detail: job.target.nodeId ?? nodeId };
+  }
+  return { label: nodeId, detail: nodeId };
+}
+
+function TracePath({
+  nodeNums,
+  snrValues,
+  job,
+  nodeByNum,
+}: {
+  nodeNums: number[];
+  snrValues: number[];
+  job: TracerouteCampaignJob;
+  nodeByNum: Map<number, NodeOption>;
+}) {
+  return (
+    <div className="traceroute-campaign-path">
+      {nodeNums.map((nodeNum, index) => {
+        const node = traceNodePresentation(nodeNum, job, nodeByNum);
+        const rawSnr = index > 0 ? snrValues[index - 1] : undefined;
+        const snr = rawSnr === -128
+          ? 'SNR ?'
+          : rawSnr === undefined ? null : `${(rawSnr / 4).toFixed(1)} dB`;
+        return (
+          <span key={`${nodeNum}-${index}`} className="traceroute-campaign-path-step">
+            {index > 0 && (
+              <span className="traceroute-campaign-path-link">
+                {snr && <small>{snr}</small>}
+                <UiIcon name="forward" size={14} />
+              </span>
+            )}
+            <span className="traceroute-campaign-path-node" title={node.detail}>{node.label}</span>
+          </span>
+        );
+      })}
+    </div>
+  );
+}
+
+function TracerouteJobDetails({
+  job,
+  nodeByNum,
+}: {
+  job: TracerouteCampaignJob;
+  nodeByNum: Map<number, NodeOption>;
+}) {
+  if (!job.result) return null;
+  const route = parseTraceNumbers(job.result.route);
+  const routeBack = parseTraceNumbers(job.result.routeBack);
+  const snrTowards = parseTraceNumbers(job.result.snrTowards);
+  const snrBack = parseTraceNumbers(job.result.snrBack);
+  const hasReturnPath = routeBack.length > 0 || snrBack.length > 0;
+
+  return (
+    <div className="traceroute-campaign-job-details">
+      <div className="traceroute-campaign-leg">
+        <strong>Andata · {route.length + 1} hop</strong>
+        <TracePath
+          nodeNums={[job.localNodeNum, ...route, job.target.nodeNum]}
+          snrValues={snrTowards}
+          job={job}
+          nodeByNum={nodeByNum}
+        />
+      </div>
+      <div className="traceroute-campaign-leg">
+        <strong>Ritorno{hasReturnPath ? ` · ${routeBack.length + 1} hop` : ''}</strong>
+        {hasReturnPath ? (
+          <TracePath
+            nodeNums={[job.target.nodeNum, ...routeBack, job.localNodeNum]}
+            snrValues={snrBack}
+            job={job}
+            nodeByNum={nodeByNum}
+          />
+        ) : (
+          <span className="traceroute-campaign-no-return">Percorso di ritorno non disponibile</span>
+        )}
+      </div>
+      <small className="traceroute-campaign-result-time">Risposta ricevuta: {formatTimestamp(job.result.timestamp)}</small>
+    </div>
+  );
 }
 
 function statusLabel(job: TracerouteCampaignJob): string {
@@ -89,6 +207,7 @@ export default function TracerouteCampaignPanel({
   const [timeoutSeconds, setTimeoutSeconds] = useState(75);
   const [delaySeconds, setDelaySeconds] = useState(5);
   const [campaign, setCampaign] = useState<TracerouteCampaign | null>(null);
+  const [expandedJobIds, setExpandedJobIds] = useState<Set<string>>(new Set());
   const [loading, setLoading] = useState(false);
   const [checkingActive, setCheckingActive] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -163,6 +282,10 @@ export default function TracerouteCampaignPanel({
 
   const filteredNodes = nodeOptions.filter((node) => !search.trim()
     || node.searchText.includes(search.trim().toLocaleLowerCase()));
+  const nodeByNum = useMemo(
+    () => new Map(nodeOptions.map((node) => [node.nodeNum, node])),
+    [nodeOptions],
+  );
   const toggleTarget = (nodeNum: number) => setSelectedTargetNums((current) => {
     const next = new Set(current);
     if (next.has(nodeNum)) next.delete(nodeNum); else next.add(nodeNum);
@@ -171,6 +294,11 @@ export default function TracerouteCampaignPanel({
   const toggleSource = (sourceId: string) => setSelectedSourceIds((current) => {
     const next = new Set(current);
     if (next.has(sourceId)) next.delete(sourceId); else next.add(sourceId);
+    return next;
+  });
+  const toggleJobDetails = (jobId: string) => setExpandedJobIds((current) => {
+    const next = new Set(current);
+    if (next.has(jobId)) next.delete(jobId); else next.add(jobId);
     return next;
   });
 
@@ -348,9 +476,26 @@ export default function TracerouteCampaignPanel({
                         {job.recentSuccessAt && <small title={formatTimestamp(job.recentSuccessAt)}>positivo recente · priorità</small>}
                       </span>
                       <span className="traceroute-campaign-job-status">
-                        <strong>{statusLabel(job)}</strong>
+                        <span className="traceroute-campaign-job-status-line">
+                          <strong>{statusLabel(job)}</strong>
+                          {job.status === 'success' && job.result && (
+                            <button
+                              type="button"
+                              className="traceroute-campaign-info-btn"
+                              aria-label={`Dettagli traceroute ${job.sourceName}`}
+                              aria-expanded={expandedJobIds.has(job.id)}
+                              title="Mostra percorso e SNR"
+                              onClick={() => toggleJobDetails(job.id)}
+                            >
+                              <UiIcon name="info" size={15} />
+                            </button>
+                          )}
+                        </span>
                         {job.error && <small title={job.error}>{job.error}</small>}
                       </span>
+                      {expandedJobIds.has(job.id) && (
+                        <TracerouteJobDetails job={job} nodeByNum={nodeByNum} />
+                      )}
                     </div>
                   ))}
                 </section>

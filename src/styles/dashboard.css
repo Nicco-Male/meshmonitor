@@ -1037,6 +1037,108 @@
 .traceroute-campaign-job-status { text-align: right; }
 .traceroute-campaign-job-status small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
+.traceroute-campaign-job-status-line {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 0.45rem;
+}
+
+.traceroute-campaign-info-btn {
+  width: 28px;
+  height: 28px;
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 1px solid var(--ctp-surface1);
+  border-radius: 50%;
+  background: var(--ctp-surface0);
+  color: var(--ctp-blue);
+  cursor: pointer;
+}
+
+.traceroute-campaign-info-btn:hover,
+.traceroute-campaign-info-btn[aria-expanded='true'] {
+  border-color: var(--ctp-blue);
+  background: color-mix(in srgb, var(--ctp-blue) 16%, transparent);
+}
+
+.traceroute-campaign-job-details {
+  min-width: 0;
+  grid-column: 2 / -1;
+  display: grid;
+  gap: 0.65rem;
+  padding: 0.75rem;
+  border: 1px solid var(--ctp-surface1);
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--ctp-surface0) 72%, transparent);
+}
+
+.traceroute-campaign-leg {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: 105px minmax(0, 1fr);
+  align-items: center;
+  gap: 0.65rem;
+}
+
+.traceroute-campaign-leg > strong {
+  color: var(--ctp-subtext1);
+  font-size: 0.74rem;
+}
+
+.traceroute-campaign-path {
+  min-width: 0;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.3rem 0;
+}
+
+.traceroute-campaign-path-step,
+.traceroute-campaign-path-link {
+  display: inline-flex;
+  align-items: center;
+}
+
+.traceroute-campaign-path-link {
+  gap: 0.22rem;
+  margin: 0 0.32rem;
+  color: var(--ctp-subtext0);
+}
+
+.traceroute-campaign-path-link small {
+  color: var(--ctp-yellow);
+  font-size: 0.68rem;
+  white-space: nowrap;
+}
+
+.traceroute-campaign-path-node {
+  max-width: 220px;
+  overflow: hidden;
+  padding: 0.2rem 0.42rem;
+  border: 1px solid var(--ctp-surface1);
+  border-radius: 5px;
+  background: var(--ctp-base);
+  color: var(--ctp-text);
+  font-family: monospace;
+  font-size: 0.74rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.traceroute-campaign-no-return,
+.traceroute-campaign-result-time {
+  color: var(--ctp-subtext0);
+  font-size: 0.7rem;
+}
+
+.traceroute-campaign-result-time {
+  grid-column: 1 / -1;
+}
+
 @media (max-width: 700px) {
   .traceroute-campaign-page-nav { padding: 0.55rem 0.75rem; }
   .traceroute-campaign-brand span { display: none; }
@@ -1049,6 +1151,9 @@
   .traceroute-campaign-summary { flex-direction: column; }
   .traceroute-campaign-job { grid-template-columns: 22px 1fr; }
   .traceroute-campaign-job-status { grid-column: 2; text-align: left; }
+  .traceroute-campaign-job-status-line { justify-content: flex-start; }
+  .traceroute-campaign-job-details { grid-column: 1 / -1; }
+  .traceroute-campaign-leg { grid-template-columns: 1fr; gap: 0.35rem; }
 }
 
 .dashboard-map-empty {

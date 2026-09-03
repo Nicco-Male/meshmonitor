@@ -80,6 +80,8 @@ A campaign:
 - can either continue through every source or stop attempts for a target node after its first
   success;
 - shows live per-source results and can be cancelled while it is running;
+- lets the operator expand every successful result from its info button to inspect the forward and
+  return paths, intermediate node names/short names, per-hop SNR, and response time;
 - offers **Retry failed** when complete, creating a new sequential campaign containing only the
   source/node pairs that ended in timeout or error. Successful and skipped attempts are not sent
   again.

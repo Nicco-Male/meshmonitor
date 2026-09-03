@@ -75,7 +75,7 @@ describe('TracerouteCampaignPanel', () => {
     }));
   });
 
-  it('retries only the failed attempts from a completed campaign', async () => {
+  it('shows the successful path details and retries only failed attempts', async () => {
     const completed = {
       id: 'campaign-finished',
       ownerId: 1,
@@ -94,6 +94,10 @@ describe('TracerouteCampaignPanel', () => {
         {
           id: 'ok', target: { nodeNum: 42, name: 'Tower Node' }, sourceId: 'a',
           sourceName: 'Source A', localNodeNum: 100, order: 0, recentSuccessAt: null, status: 'success',
+          result: {
+            route: '[77]', routeBack: '[]', snrTowards: '[40,32]', snrBack: '[28]',
+            timestamp: 2_000_000_000_000, hopCount: 2,
+          },
         },
         {
           id: 'timeout', target: { nodeNum: 42, name: 'Tower Node' }, sourceId: 'b',
@@ -111,11 +115,25 @@ describe('TracerouteCampaignPanel', () => {
     render(
       <TracerouteCampaignPanel
         initialTarget={null}
-        nodes={[]}
+        nodes={[
+          { nodeNum: 42, nodeId: '!0000002a', longName: 'Tower Node', shortName: 'TWR' },
+          { nodeNum: 77, nodeId: '!0000004d', longName: 'Relay Node', shortName: 'RLY' },
+        ]}
         sources={[]}
         sourceStatuses={new Map()}
       />,
     );
+
+    const details = await screen.findByRole('button', { name: /Dettagli traceroute Source A/i });
+    expect(screen.queryByText(/Andata · 2 hop/i)).not.toBeInTheDocument();
+    fireEvent.click(details);
+    expect(screen.getByText(/Andata · 2 hop/i)).toBeInTheDocument();
+    expect(screen.getByText(/Ritorno · 1 hop/i)).toBeInTheDocument();
+    expect(screen.getByText('RLY')).toBeInTheDocument();
+    expect(screen.getAllByText('TWR')).toHaveLength(2);
+    expect(screen.getByText('10.0 dB')).toBeInTheDocument();
+    expect(screen.getByText('8.0 dB')).toBeInTheDocument();
+    expect(screen.getByText('7.0 dB')).toBeInTheDocument();
 
     const retry = await screen.findByRole('button', { name: /Riprova falliti \(1\)/i });
     fireEvent.click(retry);
