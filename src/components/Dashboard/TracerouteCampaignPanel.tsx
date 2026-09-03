@@ -17,6 +17,7 @@ interface TracerouteCampaignPanelProps {
 }
 
 interface NodeOption extends TracerouteCampaignTargetInput {
+  shortName?: string;
   searchText: string;
 }
 
@@ -33,18 +34,20 @@ function nodeOption(raw: unknown): NodeOption | null {
   const nodeId = typeof node.nodeId === 'string'
     ? node.nodeId
     : typeof user.id === 'string' ? user.id : `!${nodeNum.toString(16).padStart(8, '0')}`;
+  const shortName = typeof node.shortName === 'string'
+    ? node.shortName
+    : typeof user.shortName === 'string' ? user.shortName : undefined;
   const name = typeof node.longName === 'string'
     ? node.longName
     : typeof user.longName === 'string'
       ? user.longName
-      : typeof node.shortName === 'string'
-        ? node.shortName
-        : typeof user.shortName === 'string' ? user.shortName : nodeId;
+      : shortName ?? nodeId;
   return {
     nodeNum,
     nodeId,
     name,
-    searchText: `${name} ${nodeId} ${nodeNum} ${nodeNum.toString(16)}`.toLocaleLowerCase(),
+    shortName,
+    searchText: `${name} ${shortName ?? ''} ${nodeId} ${nodeNum} ${nodeNum.toString(16)}`.toLocaleLowerCase(),
   };
 }
 
@@ -242,13 +245,21 @@ export default function TracerouteCampaignPanel({
               </div>
               <label className="traceroute-campaign-search">
                 <UiIcon name="search" size={15} />
-                <input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Cerca nome o node ID" />
+                <input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Cerca nome, short name o node ID" />
               </label>
               <div className="traceroute-campaign-scroll-list">
                 {filteredNodes.map((node) => (
                   <label key={node.nodeNum} className="traceroute-campaign-choice">
                     <input type="checkbox" checked={selectedTargetNums.has(node.nodeNum)} onChange={() => toggleTarget(node.nodeNum)} />
-                    <span><strong>{node.name}</strong><small>{node.nodeId}</small></span>
+                    <span>
+                      <span className="traceroute-campaign-node-name">
+                        <strong>{node.name}</strong>
+                        {node.shortName && node.shortName !== node.name && (
+                          <span className="traceroute-campaign-short-name">{node.shortName}</span>
+                        )}
+                      </span>
+                      <small>{node.nodeId}</small>
+                    </span>
                   </label>
                 ))}
                 {filteredNodes.length === 0 && <div className="traceroute-campaign-empty">Nessun nodo corrispondente</div>}

@@ -34,8 +34,8 @@ describe('TracerouteCampaignPanel', () => {
       <TracerouteCampaignPanel
         initialTarget={{ nodeNum: 42, nodeId: '!0000002a', name: 'Tower Node' }}
         nodes={[
-          { nodeNum: 42, nodeId: '!0000002a', longName: 'Tower Node' },
-          { nodeNum: 43, nodeId: '!0000002b', longName: 'Other Node' },
+          { nodeNum: 42, nodeId: '!0000002a', longName: 'Tower Node', shortName: 'TWR' },
+          { nodeNum: 43, nodeId: '!0000002b', longName: 'Other Node', shortName: 'OTH' },
         ]}
         sources={[
           { id: 'a', name: 'Source A', type: 'meshtastic_tcp', enabled: true },
@@ -54,6 +54,11 @@ describe('TracerouteCampaignPanel', () => {
     expect(screen.getByLabelText(/Source A/i)).toBeChecked();
     expect(screen.getByLabelText(/Source B/i)).toBeDisabled();
     expect(screen.queryByLabelText(/MQTT/i)).not.toBeInTheDocument();
+    expect(screen.getByText('TWR')).toBeInTheDocument();
+
+    fireEvent.change(screen.getByPlaceholderText(/short name/i), { target: { value: 'TWR' } });
+    expect(screen.getByLabelText(/Tower Node/i)).toBeInTheDocument();
+    expect(screen.queryByLabelText(/Other Node/i)).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByLabelText(/Ferma il nodo al primo successo/i));
     const start = await screen.findByRole('button', { name: /Avvia in sequenza/i });

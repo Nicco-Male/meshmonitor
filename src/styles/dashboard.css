@@ -869,6 +869,29 @@
   white-space: nowrap;
 }
 
+.traceroute-campaign-node-name {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+}
+
+.traceroute-campaign-node-name strong {
+  min-width: 0;
+}
+
+.traceroute-campaign-short-name {
+  flex: 0 0 auto;
+  padding: 0.08rem 0.38rem;
+  border: 1px solid var(--ctp-surface1);
+  border-radius: 999px;
+  background: var(--ctp-surface0);
+  color: var(--ctp-blue);
+  font-size: 0.67rem;
+  font-weight: 700;
+  line-height: 1.25;
+}
+
 .traceroute-campaign-choice small,
 .traceroute-campaign-options small,
 .traceroute-campaign-job small {
