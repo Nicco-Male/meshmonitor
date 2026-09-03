@@ -14,7 +14,6 @@ import databaseService from '../../../services/database.js';
 import { sourceManagerRegistry } from '../../sourceManagerRegistry.js';
 import { appriseNotificationService } from '../appriseNotificationService.js';
 import { runScript as runUserScript } from '../../utils/scriptRunner.js';
-import { tracerouteCampaignCoordinator } from '../tracerouteCampaignCoordinator.js';
 import type { ActionDeps } from './actionExecutor.js';
 
 interface MeshSendManager {
@@ -26,7 +25,7 @@ interface MeshSendManager {
   // Request/operation senders (#3835).
   sendTelemetryRequest(destination: number, channel?: number, telemetryType?: 'device' | 'environment' | 'airQuality' | 'power'): Promise<unknown>;
   sendPositionRequest(destination: number, channel?: number): Promise<unknown>;
-  sendTraceroute(destination: number, channel?: number): Promise<unknown>;
+  sendTraceroute(destination: number, channel?: number, priority?: 'automation'): Promise<unknown>;
   sendNodeInfoRequest(destination: number, channel?: number): Promise<unknown>;
   sendNeighborInfoRequest(destination: number, channel?: number): Promise<unknown>;
   broadcastNodeInfoToChannel(channel: number): Promise<unknown>;
@@ -133,12 +132,6 @@ export function createMeshActionDeps(): ActionDeps {
 
     async requestData({ sourceId, op, target, channel, telemetryType }) {
       if (!sourceId) throw new Error('automation action requires a target source');
-      if (op === 'traceroute' && tracerouteCampaignCoordinator.isReserved(sourceId)) {
-        return {
-          skipped: true,
-          reason: 'A traceroute campaign is active on this source',
-        };
-      }
       const raw = resolveManager(sourceId) as
         (Partial<MeshSendManager> & Partial<MeshCoreSendManager>) | undefined;
       // Meshtastic: target is a node number.
@@ -150,7 +143,7 @@ export function createMeshActionDeps(): ActionDeps {
         switch (op) {
           case 'telemetry': return raw.sendTelemetryRequest!(dest, channel, telemetryType);
           case 'position': return raw.sendPositionRequest!(dest, channel);
-          case 'traceroute': return raw.sendTraceroute!(dest, channel);
+          case 'traceroute': return raw.sendTraceroute!(dest, channel, 'automation');
           case 'nodeinfo': return raw.sendNodeInfoRequest!(dest, channel);
           case 'neighbors': return raw.sendNeighborInfoRequest!(dest, channel);
           case 'advert': return raw.broadcastNodeInfoToChannel!(channel);

@@ -77,6 +77,7 @@ import { FavoritesService } from './services/favoritesService.js';
 import { DeviceAdminService } from './services/deviceAdminService.js';
 import { RemoteAdminService } from './services/remoteAdminService.js';
 import { tracerouteCampaignCoordinator } from './services/tracerouteCampaignCoordinator.js';
+import { tracerouteRequestScheduler, type TracerouteRequestPriority } from './services/tracerouteRequestScheduler.js';
 import { ConnState, dispatch, type SmContext } from './meshtastic/connectionStateMachine.js';
 import fs from 'fs';
 import path from 'path';
@@ -2237,6 +2238,11 @@ class MeshtasticManager implements ISourceManager {
         return;
       }
 
+      if (tracerouteRequestScheduler.hasPendingForSource(this.sourceId)) {
+        logger.debug('🗺️ Auto-traceroute: Skipping - traceroute already queued or active for this source');
+        return;
+      }
+
       // TX-disabled radios cannot send OTA traceroutes; skip quietly and let the
       // interval keep running so a later TX re-enable resumes automatically (#4294).
       if (!this.isTxEnabled()) {
@@ -2283,7 +2289,7 @@ class MeshtasticManager implements ISourceManager {
             this.pendingTracerouteTimestamps.set(targetNode.nodeNum, Date.now());
 
             this.lastTracerouteSentTime = Date.now();
-            await this.sendTraceroute(targetNode.nodeNum, channel);
+            await this.sendTraceroute(targetNode.nodeNum, channel, 'automatic');
 
             // Check for timed-out traceroutes (> 5 minutes old)
             this.checkTracerouteTimeouts();
@@ -9179,14 +9185,45 @@ class MeshtasticManager implements ISourceManager {
     }
   }
 
-  async sendTraceroute(destination: number, channel: number = 0): Promise<void> {
-    tracerouteCampaignCoordinator.assertAvailable(this.sourceId);
-    await this.sendTraceroutePacket(destination, channel);
+  async sendTraceroute(
+    destination: number,
+    channel: number = 0,
+    priority: TracerouteRequestPriority = 'manual',
+  ): Promise<void> {
+    if (!this.localNodeInfo) {
+      throw new Error('Local node information not available');
+    }
+    await tracerouteRequestScheduler.enqueue({
+      sourceId: this.sourceId,
+      localNodeNum: this.localNodeInfo.nodeNum,
+      destination,
+      channel,
+      priority,
+      send: () => this.sendTraceroutePacket(destination, channel),
+    });
   }
 
-  /** Send a traceroute owned by the active campaign reservation. */
-  async sendCampaignTraceroute(destination: number, channel: number = 0): Promise<void> {
-    await this.sendTraceroutePacket(destination, channel);
+  /** Queue campaign traceroutes through the same global RF scheduler. */
+  async sendCampaignTraceroute(
+    destination: number,
+    channel: number = 0,
+    priority: Extract<TracerouteRequestPriority, 'campaign' | 'retry'> = 'campaign',
+    timeoutMs?: number,
+    shouldDispatch?: () => boolean,
+  ): Promise<void> {
+    if (!this.localNodeInfo) {
+      throw new Error('Local node information not available');
+    }
+    await tracerouteRequestScheduler.enqueue({
+      sourceId: this.sourceId,
+      localNodeNum: this.localNodeInfo.nodeNum,
+      destination,
+      channel,
+      priority,
+      timeoutMs,
+      shouldDispatch,
+      send: () => this.sendTraceroutePacket(destination, channel),
+    });
   }
 
   private async sendTraceroutePacket(destination: number, channel: number): Promise<void> {

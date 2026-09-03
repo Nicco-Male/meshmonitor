@@ -21,7 +21,13 @@ const MAX_SOURCES = 20;
 const MAX_RETAINED_CAMPAIGNS = 20;
 
 interface CampaignManager extends ISourceManager {
-  sendCampaignTraceroute(destination: number, channel?: number): Promise<void>;
+  sendCampaignTraceroute(
+    destination: number,
+    channel?: number,
+    priority?: 'campaign' | 'retry',
+    timeoutMs?: number,
+    shouldDispatch?: () => boolean,
+  ): Promise<void>;
 }
 
 interface CampaignSourceRecord {
@@ -506,11 +512,12 @@ export class TracerouteCampaignService {
 
     job.status = 'running';
     job.startedAt = this.deps.now();
+    const timeoutMs = campaign.config.timeoutSeconds * 1000;
     const waiter = this.waitForTraceroute(
       job.sourceId,
       localNodeNum,
       job.target.nodeNum,
-      campaign.config.timeoutSeconds * 1000,
+      timeoutMs,
     );
     this.cancelCurrentWait = waiter.cancel;
 
@@ -522,7 +529,14 @@ export class TracerouteCampaignService {
         this.finishJob(job, 'cancelled', 'Campaign cancelled');
         return;
       }
-      await manager.sendCampaignTraceroute(job.target.nodeNum, channel);
+      await manager.sendCampaignTraceroute(
+        job.target.nodeNum,
+        channel,
+        campaign.retryOfCampaignId ? 'retry' : 'campaign',
+        timeoutMs,
+        () => String(campaign.status) !== 'cancelled',
+      );
+      waiter.armTimeout();
     } catch (error) {
       waiter.cancel();
       this.cancelCurrentWait = null;
@@ -550,16 +564,17 @@ export class TracerouteCampaignService {
   ): {
     promise: Promise<{ kind: 'success'; trace: Partial<DbTraceroute> } | { kind: 'timeout' } | { kind: 'cancelled' }>;
     cancel: () => void;
+    armTimeout: () => void;
   } {
     let finish: (result: { kind: 'success'; trace: Partial<DbTraceroute> } | { kind: 'timeout' } | { kind: 'cancelled' }) => void;
     let settled = false;
     let unsubscribe = () => {};
-    let timeout: NodeJS.Timeout;
+    let timeout: NodeJS.Timeout | null = null;
     const promise = new Promise<{ kind: 'success'; trace: Partial<DbTraceroute> } | { kind: 'timeout' } | { kind: 'cancelled' }>((resolve) => {
       finish = (result) => {
         if (settled) return;
         settled = true;
-        clearTimeout(timeout);
+        if (timeout) clearTimeout(timeout);
         unsubscribe();
         resolve(result);
       };
@@ -575,9 +590,12 @@ export class TracerouteCampaignService {
           finish({ kind: 'success', trace });
         }
       });
-      timeout = setTimeout(() => finish({ kind: 'timeout' }), timeoutMs);
     });
-    return { promise, cancel: () => finish({ kind: 'cancelled' }) };
+    const armTimeout = () => {
+      if (settled || timeout) return;
+      timeout = setTimeout(() => finish({ kind: 'timeout' }), timeoutMs);
+    };
+    return { promise, cancel: () => finish({ kind: 'cancelled' }), armTimeout };
   }
 
   private waitForDelay(delayMs: number): Promise<void> {
