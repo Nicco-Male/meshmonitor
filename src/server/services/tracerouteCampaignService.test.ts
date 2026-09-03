@@ -30,9 +30,13 @@ function completedTrace(localNodeNum: number, targetNodeNum: number, timestamp: 
   };
 }
 
-function createHarness(recent: Record<string, DbTraceroute[]> = {}) {
+function createHarness(
+  recent: Record<string, DbTraceroute[]> = {},
+  failingSources = new Set<string>(),
+) {
   const listeners = new Set<(event: DataEvent) => void>();
   const sends: Array<{ sourceId: string; target: number; channel: number | undefined }> = [];
+  const reservations = new Map<string, string>();
   let id = 0;
   const localNodes: Record<string, number> = { a: 101, b: 202, c: 303 };
   const managers = new Map(Object.entries(localNodes).map(([sourceId, localNodeNum]) => [sourceId, {
@@ -44,7 +48,10 @@ function createHarness(recent: Record<string, DbTraceroute[]> = {}) {
     stopDistanceDeleteScheduler: vi.fn(),
     getStatus: () => ({ sourceId, sourceName: sourceId, sourceType: 'meshtastic_tcp' as const, connected: true }),
     getLocalNodeInfo: () => ({ nodeNum: localNodeNum, nodeId: `!${localNodeNum.toString(16)}`, longName: sourceId, shortName: sourceId }),
-    sendTraceroute: async (target: number, channel?: number) => { sends.push({ sourceId, target, channel }); },
+    sendCampaignTraceroute: async (target: number, channel?: number) => {
+      sends.push({ sourceId, target, channel });
+      if (failingSources.has(sourceId)) throw new Error(`Send failed on ${sourceId}`);
+    },
   }]));
 
   const deps: TracerouteCampaignDependencies = {
@@ -64,6 +71,14 @@ function createHarness(recent: Record<string, DbTraceroute[]> = {}) {
       listeners.add(listener);
       return () => listeners.delete(listener);
     },
+    reserveSources: (campaignId, sourceIds) => {
+      for (const sourceId of sourceIds) reservations.set(sourceId, campaignId);
+    },
+    releaseSources: (campaignId) => {
+      for (const [sourceId, owner] of reservations) {
+        if (owner === campaignId) reservations.delete(sourceId);
+      }
+    },
   };
   const service = new TracerouteCampaignService(deps);
   const emitSuccess = (sourceId: string, target: number) => {
@@ -72,7 +87,7 @@ function createHarness(recent: Record<string, DbTraceroute[]> = {}) {
       listener({ type: 'traceroute:complete', sourceId, data: trace, timestamp: deps.now() });
     }
   };
-  return { service, sends, emitSuccess };
+  return { service, sends, emitSuccess, reservations };
 }
 
 function input(overrides: Partial<CreateTracerouteCampaignInput> = {}): CreateTracerouteCampaignInput {
@@ -89,10 +104,11 @@ function input(overrides: Partial<CreateTracerouteCampaignInput> = {}): CreateTr
 
 describe('TracerouteCampaignService', () => {
   it('sends only one request at a time and waits for its response', async () => {
-    const { service, sends, emitSuccess } = createHarness();
+    const { service, sends, emitSuccess, reservations } = createHarness();
     const created = await service.create(input(), 7);
 
     await vi.waitFor(() => expect(sends).toEqual([{ sourceId: 'a', target: 999, channel: 3 }]));
+    expect([...reservations.keys()]).toEqual(['a', 'b']);
     expect(service.get(created.id, 7)?.jobs[1].status).toBe('queued');
 
     emitSuccess('a', 999);
@@ -102,6 +118,7 @@ describe('TracerouteCampaignService', () => {
     emitSuccess('b', 999);
     await vi.waitFor(() => expect(service.get(created.id, 7)?.status).toBe('completed'));
     expect(service.get(created.id, 7)?.progress.successful).toBe(2);
+    await vi.waitFor(() => expect(reservations.size).toBe(0));
   });
 
   it('prioritizes the newest recent success and skips remaining sources after success when configured', async () => {
@@ -129,6 +146,28 @@ describe('TracerouteCampaignService', () => {
     await vi.waitFor(() => expect(service.get(created.id, 7)?.status).toBe('cancelled'));
     expect(service.get(created.id, 7)?.jobs.every((job) => job.status === 'cancelled')).toBe(true);
     expect(sends).toHaveLength(1);
+  });
+
+  it('creates a new campaign containing only timeout/error attempts when retried', async () => {
+    const failingSources = new Set(['b']);
+    const { service, sends, emitSuccess } = createHarness({}, failingSources);
+    const original = await service.create(input(), 7);
+
+    await vi.waitFor(() => expect(sends[0]?.sourceId).toBe('a'));
+    emitSuccess('a', 999);
+    await vi.waitFor(() => expect(service.get(original.id, 7)?.status).toBe('completed'));
+    expect(service.get(original.id, 7)?.jobs.map((job) => job.status)).toEqual(['success', 'error']);
+
+    failingSources.delete('b');
+    const retried = await service.retry(original.id, 7);
+    expect(retried?.retryOfCampaignId).toBe(original.id);
+    expect(retried?.jobs).toHaveLength(1);
+    expect(retried?.jobs[0]).toMatchObject({ sourceId: 'b', order: 0 });
+
+    await vi.waitFor(() => expect(sends).toHaveLength(3));
+    emitSuccess('b', 999);
+    await vi.waitFor(() => expect(service.get(retried!.id, 7)?.status).toBe('completed'));
+    expect(service.get(retried!.id, 7)?.progress.successful).toBe(1);
   });
 });
 

@@ -8,6 +8,7 @@ import { resolveDestinationChannel, resolveBroadcastChannel, isValidChannelIndex
 import { PortNum } from '../constants/meshtastic.js';
 import { fail } from '../utils/apiResponse.js';
 import { isTxDisabledError } from '../errors/txDisabledError.js';
+import { isTracerouteCampaignBusyError } from '../services/tracerouteCampaignCoordinator.js';
 
 const router = Router();
 
@@ -39,6 +40,9 @@ router.post('/traceroute', requirePermission('traceroute', 'write'), async (req:
       message: `Traceroute request sent to ${destinationNum.toString(16)} on channel ${channel}`,
     });
   } catch (error: any) {
+    if (isTracerouteCampaignBusyError(error)) {
+      return fail(res, 409, error.code, 'A traceroute campaign is active on this source');
+    }
     if (isTxDisabledError(error)) {
       return fail(res, 409, 'TX_DISABLED', 'Transmit is disabled on this source');
     }

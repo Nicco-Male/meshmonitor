@@ -213,7 +213,22 @@ export default function TracerouteCampaignPanel({
     }
   };
 
+  const retryFailed = async () => {
+    if (!campaign) return;
+    setLoading(true);
+    setError(null);
+    try {
+      setCampaign(await api.post<TracerouteCampaign>(`/api/traceroute-campaigns/${campaign.id}/retry`));
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : 'Impossibile ritentare i traceroute falliti');
+    } finally {
+      setLoading(false);
+    }
+  };
+
   const campaignActive = campaign?.status === 'queued' || campaign?.status === 'running';
+  const failedAttemptCount = campaign?.jobs.filter((job) =>
+    job.status === 'timeout' || job.status === 'error').length ?? 0;
   const progressPercent = campaign && campaign.progress.total > 0
     ? Math.round(campaign.progress.completed / campaign.progress.total * 100)
     : 0;
@@ -350,6 +365,16 @@ export default function TracerouteCampaignPanel({
           ) : campaign ? (
             <button type="button" className="traceroute-campaign-btn" onClick={() => { setCampaign(null); setError(null); }}>Nuova campagna</button>
           ) : <span />}
+          {campaign && !campaignActive && failedAttemptCount > 0 && (
+            <button
+              type="button"
+              className="traceroute-campaign-btn is-primary"
+              onClick={retryFailed}
+              disabled={loading}
+            >
+              <UiIcon name="refresh" size={15} /> {loading ? 'Attendi…' : `Riprova falliti (${failedAttemptCount})`}
+            </button>
+          )}
           {!campaign && (
             <button
               type="button"

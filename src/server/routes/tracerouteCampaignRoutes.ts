@@ -95,6 +95,38 @@ router.get('/:id', async (req: Request, res: Response) => {
   }
 });
 
+router.post('/:id/retry', async (req: Request, res: Response) => {
+  try {
+    const user = await requireCampaignUser(req, res);
+    if (!user) return;
+
+    const original = tracerouteCampaignService.get(req.params.id, user.id, user.isAdmin);
+    if (!original) return res.status(404).json({ error: 'Traceroute campaign not found' });
+    const sourceIds = [...new Set(original.jobs
+      .filter((job) => job.status === 'timeout' || job.status === 'error')
+      .map((job) => job.sourceId))];
+    for (const sourceId of sourceIds) {
+      if (!await hasPermission(user, 'traceroute', 'write', sourceId)) {
+        return res.status(403).json({
+          error: `Insufficient traceroute permission for source ${sourceId}`,
+          code: 'FORBIDDEN',
+          required: { resource: 'traceroute', action: 'write', sourceId },
+        });
+      }
+    }
+
+    const campaign = await tracerouteCampaignService.retry(req.params.id, user.id, user.isAdmin);
+    if (!campaign) return res.status(404).json({ error: 'Traceroute campaign not found' });
+    return res.status(202).json(campaign);
+  } catch (error) {
+    if (error instanceof TracerouteCampaignError) {
+      return res.status(error.status).json({ error: error.message, code: error.code });
+    }
+    logger.error('Error retrying traceroute campaign:', error);
+    return res.status(500).json({ error: 'Failed to retry traceroute campaign' });
+  }
+});
+
 router.post('/:id/cancel', async (req: Request, res: Response) => {
   try {
     const user = await requireCampaignUser(req, res);

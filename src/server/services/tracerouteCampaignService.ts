@@ -14,13 +14,14 @@ import { dataEventEmitter, type DataEvent } from './dataEventEmitter.js';
 import { sourceManagerRegistry, type ISourceManager } from '../sourceManagerRegistry.js';
 import { isMeshtasticManager } from '../sourceManagerTypes.js';
 import { resolveBroadcastChannel } from '../utils/resolveDestinationChannel.js';
+import { tracerouteCampaignCoordinator } from './tracerouteCampaignCoordinator.js';
 
 const MAX_TARGETS = 100;
 const MAX_SOURCES = 20;
 const MAX_RETAINED_CAMPAIGNS = 20;
 
 interface CampaignManager extends ISourceManager {
-  sendTraceroute(destination: number, channel?: number): Promise<void>;
+  sendCampaignTraceroute(destination: number, channel?: number): Promise<void>;
 }
 
 interface CampaignSourceRecord {
@@ -43,6 +44,8 @@ export interface TracerouteCampaignDependencies {
   ): Promise<DbTraceroute[]>;
   resolveChannel(manager: CampaignManager): Promise<number>;
   subscribe(listener: (event: DataEvent) => void): () => void;
+  reserveSources(campaignId: string, sourceIds: string[]): void;
+  releaseSources(campaignId: string): void;
 }
 
 export class TracerouteCampaignError extends Error {
@@ -129,41 +132,16 @@ export class TracerouteCampaignService {
   constructor(private readonly deps: TracerouteCampaignDependencies) {}
 
   async create(input: CreateTracerouteCampaignInput, ownerId: number): Promise<TracerouteCampaign> {
-    if (this.creating || this.activeCampaignId !== null) {
-      throw new TracerouteCampaignError(
-        'Another traceroute campaign is already running',
-        409,
-        'CAMPAIGN_ALREADY_RUNNING',
-      );
-    }
+    this.assertCanStart();
     this.creating = true;
+    let reservedCampaignId: string | null = null;
 
     try {
       const config = this.validateInput(input);
-      const sourceRows = await this.deps.getSources();
-      const sourceById = new Map(sourceRows.map((source) => [source.id, source]));
-      const sources: TracerouteCampaignSource[] = config.sourceIds.map((sourceId) => {
-        const source = sourceById.get(sourceId);
-        if (!source || !source.enabled || source.type !== 'meshtastic_tcp') {
-          throw new TracerouteCampaignError(
-            `Source ${sourceId} is not an enabled Meshtastic TCP source`,
-            400,
-            'INVALID_CAMPAIGN_SOURCE',
-          );
-        }
-
-        const manager = this.deps.getManager(sourceId);
-        const status = manager?.getStatus();
-        const localNodeNum = manager?.getLocalNodeInfo()?.nodeNum;
-        if (!manager || manager.sourceType !== 'meshtastic_tcp' || !status?.connected || !localNodeNum) {
-          throw new TracerouteCampaignError(
-            `Source ${source.name} is not connected or has no local node information`,
-            409,
-            'CAMPAIGN_SOURCE_UNAVAILABLE',
-          );
-        }
-        return { id: source.id, name: source.name, localNodeNum };
-      });
+      const sources = await this.resolveSources(config.sourceIds);
+      const campaignId = this.deps.createId();
+      this.reserveSources(campaignId, config.sourceIds);
+      reservedCampaignId = campaignId;
 
       const cutoff = this.deps.now() - config.recentSuccessHours * 60 * 60 * 1000;
       const jobs: TracerouteCampaignJob[] = [];
@@ -194,7 +172,7 @@ export class TracerouteCampaignService {
       }
 
       const campaign: TracerouteCampaign = {
-        id: this.deps.createId(),
+        id: campaignId,
         ownerId,
         status: 'queued',
         createdAt: this.deps.now(),
@@ -210,15 +188,11 @@ export class TracerouteCampaignService {
         },
       };
 
-      this.campaigns.set(campaign.id, campaign);
-      this.activeCampaignId = campaign.id;
-      this.pruneHistory();
-      void this.run(campaign.id).catch((error) => {
-        logger.error(`Traceroute campaign ${campaign.id} failed unexpectedly:`, error);
-        this.failCampaign(campaign, errorMessage(error));
-      });
+      this.launchReservedCampaign(campaign);
+      reservedCampaignId = null;
       return copyCampaign(campaign);
     } finally {
+      if (reservedCampaignId) this.deps.releaseSources(reservedCampaignId);
       this.creating = false;
     }
   }
@@ -240,6 +214,86 @@ export class TracerouteCampaignService {
     return campaign ? copyCampaign(campaign) : null;
   }
 
+  async retry(id: string, ownerId: number, isAdmin = false): Promise<TracerouteCampaign | null> {
+    const original = this.campaigns.get(id);
+    if (!original || (!isAdmin && original.ownerId !== ownerId)) return null;
+    if (original.status !== 'completed' && original.status !== 'cancelled') {
+      throw new TracerouteCampaignError(
+        'The traceroute campaign is still running',
+        409,
+        'CAMPAIGN_NOT_FINISHED',
+      );
+    }
+
+    const failedJobs = original.jobs.filter((job) => job.status === 'timeout' || job.status === 'error');
+    if (failedJobs.length === 0) {
+      throw new TracerouteCampaignError(
+        'The traceroute campaign has no failed attempts to retry',
+        400,
+        'NO_FAILED_ATTEMPTS',
+      );
+    }
+
+    this.assertCanStart();
+    this.creating = true;
+    let reservedCampaignId: string | null = null;
+
+    try {
+      const sourceIds = [...new Set(failedJobs.map((job) => job.sourceId))];
+      const sources = await this.resolveSources(sourceIds);
+      const sourceById = new Map(sources.map((source) => [source.id, source]));
+      const campaignId = this.deps.createId();
+      this.reserveSources(campaignId, sourceIds);
+      reservedCampaignId = campaignId;
+
+      const targets = [...new Map(failedJobs.map((job) => [
+        job.target.nodeNum,
+        cleanTarget(job.target),
+      ] as const)).values()];
+      const jobs: TracerouteCampaignJob[] = failedJobs.map((job, order) => {
+        const source = sourceById.get(job.sourceId)!;
+        return {
+          id: this.deps.createId(),
+          target: cleanTarget(job.target),
+          sourceId: source.id,
+          sourceName: source.name,
+          localNodeNum: source.localNodeNum,
+          order,
+          recentSuccessAt: job.recentSuccessAt,
+          status: 'queued',
+        };
+      });
+      const campaign: TracerouteCampaign = {
+        id: campaignId,
+        retryOfCampaignId: original.id,
+        ownerId,
+        status: 'queued',
+        createdAt: this.deps.now(),
+        config: {
+          ...original.config,
+          targets,
+          sourceIds,
+        },
+        sources,
+        jobs,
+        progress: {
+          total: jobs.length,
+          completed: 0,
+          successful: 0,
+          failed: 0,
+          skipped: 0,
+        },
+      };
+
+      this.launchReservedCampaign(campaign);
+      reservedCampaignId = null;
+      return copyCampaign(campaign);
+    } finally {
+      if (reservedCampaignId) this.deps.releaseSources(reservedCampaignId);
+      this.creating = false;
+    }
+  }
+
   cancel(id: string, ownerId: number, isAdmin = false): TracerouteCampaign | null {
     const campaign = this.campaigns.get(id);
     if (!campaign || (!isAdmin && campaign.ownerId !== ownerId)) return null;
@@ -259,6 +313,67 @@ export class TracerouteCampaignService {
     this.refreshProgress(campaign);
     this.cancelCurrentWait?.();
     return copyCampaign(campaign);
+  }
+
+  private assertCanStart(): void {
+    if (this.creating || this.activeCampaignId !== null) {
+      throw new TracerouteCampaignError(
+        'Another traceroute campaign is already running',
+        409,
+        'CAMPAIGN_ALREADY_RUNNING',
+      );
+    }
+  }
+
+  private async resolveSources(sourceIds: string[]): Promise<TracerouteCampaignSource[]> {
+    const sourceRows = await this.deps.getSources();
+    const sourceById = new Map(sourceRows.map((source) => [source.id, source]));
+    return sourceIds.map((sourceId) => {
+      const source = sourceById.get(sourceId);
+      if (!source || !source.enabled || source.type !== 'meshtastic_tcp') {
+        throw new TracerouteCampaignError(
+          `Source ${sourceId} is not an enabled Meshtastic TCP source`,
+          400,
+          'INVALID_CAMPAIGN_SOURCE',
+        );
+      }
+
+      const manager = this.deps.getManager(sourceId);
+      const status = manager?.getStatus();
+      const localNodeNum = manager?.getLocalNodeInfo()?.nodeNum;
+      if (!manager || manager.sourceType !== 'meshtastic_tcp' || !status?.connected || !localNodeNum) {
+        throw new TracerouteCampaignError(
+          `Source ${source.name} is not connected or has no local node information`,
+          409,
+          'CAMPAIGN_SOURCE_UNAVAILABLE',
+        );
+      }
+      return { id: source.id, name: source.name, localNodeNum };
+    });
+  }
+
+  private reserveSources(campaignId: string, sourceIds: string[]): void {
+    try {
+      this.deps.reserveSources(campaignId, sourceIds);
+    } catch (error) {
+      throw new TracerouteCampaignError(
+        errorMessage(error),
+        409,
+        'CAMPAIGN_SOURCE_BUSY',
+      );
+    }
+  }
+
+  private launchReservedCampaign(campaign: TracerouteCampaign): void {
+    this.campaigns.set(campaign.id, campaign);
+    this.activeCampaignId = campaign.id;
+    this.pruneHistory();
+    void this.run(campaign.id)
+      .catch((error) => {
+        logger.error(`Traceroute campaign ${campaign.id} failed unexpectedly:`, error);
+        this.failCampaign(campaign, errorMessage(error));
+      })
+      .finally(() => this.deps.releaseSources(campaign.id));
   }
 
   private validateInput(input: CreateTracerouteCampaignInput): CreateTracerouteCampaignInput {
@@ -407,7 +522,7 @@ export class TracerouteCampaignService {
         this.finishJob(job, 'cancelled', 'Campaign cancelled');
         return;
       }
-      await manager.sendTraceroute(job.target.nodeNum, channel);
+      await manager.sendCampaignTraceroute(job.target.nodeNum, channel);
     } catch (error) {
       waiter.cancel();
       this.cancelCurrentWait = null;
@@ -555,6 +670,8 @@ const defaultDependencies: TracerouteCampaignDependencies = {
     dataEventEmitter.on('data', listener);
     return () => dataEventEmitter.off('data', listener);
   },
+  reserveSources: (campaignId, sourceIds) => tracerouteCampaignCoordinator.reserve(campaignId, sourceIds),
+  releaseSources: (campaignId) => tracerouteCampaignCoordinator.release(campaignId),
 };
 
 export const tracerouteCampaignService = new TracerouteCampaignService(defaultDependencies);

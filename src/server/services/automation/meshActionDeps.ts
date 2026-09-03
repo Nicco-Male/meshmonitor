@@ -14,6 +14,7 @@ import databaseService from '../../../services/database.js';
 import { sourceManagerRegistry } from '../../sourceManagerRegistry.js';
 import { appriseNotificationService } from '../appriseNotificationService.js';
 import { runScript as runUserScript } from '../../utils/scriptRunner.js';
+import { tracerouteCampaignCoordinator } from '../tracerouteCampaignCoordinator.js';
 import type { ActionDeps } from './actionExecutor.js';
 
 interface MeshSendManager {
@@ -132,6 +133,12 @@ export function createMeshActionDeps(): ActionDeps {
 
     async requestData({ sourceId, op, target, channel, telemetryType }) {
       if (!sourceId) throw new Error('automation action requires a target source');
+      if (op === 'traceroute' && tracerouteCampaignCoordinator.isReserved(sourceId)) {
+        return {
+          skipped: true,
+          reason: 'A traceroute campaign is active on this source',
+        };
+      }
       const raw = resolveManager(sourceId) as
         (Partial<MeshSendManager> & Partial<MeshCoreSendManager>) | undefined;
       // Meshtastic: target is a node number.

@@ -62,6 +62,7 @@ export interface TracerouteCampaignJob {
 
 export interface TracerouteCampaign {
   id: string;
+  retryOfCampaignId?: string;
   ownerId: number;
   status: TracerouteCampaignStatus;
   createdAt: number;

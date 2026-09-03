@@ -74,4 +74,54 @@ describe('TracerouteCampaignPanel', () => {
       delaySeconds: 5,
     }));
   });
+
+  it('retries only the failed attempts from a completed campaign', async () => {
+    const completed = {
+      id: 'campaign-finished',
+      ownerId: 1,
+      status: 'completed',
+      createdAt: Date.now(),
+      config: {
+        targets: [{ nodeNum: 42, name: 'Tower Node' }],
+        sourceIds: ['a', 'b'],
+        behavior: 'continue',
+        recentSuccessHours: 24,
+        timeoutSeconds: 75,
+        delaySeconds: 5,
+      },
+      sources: [],
+      jobs: [
+        {
+          id: 'ok', target: { nodeNum: 42, name: 'Tower Node' }, sourceId: 'a',
+          sourceName: 'Source A', localNodeNum: 100, order: 0, recentSuccessAt: null, status: 'success',
+        },
+        {
+          id: 'timeout', target: { nodeNum: 42, name: 'Tower Node' }, sourceId: 'b',
+          sourceName: 'Source B', localNodeNum: 200, order: 1, recentSuccessAt: null, status: 'timeout',
+          error: 'No traceroute response within 75 seconds',
+        },
+      ],
+      progress: { total: 2, completed: 2, successful: 1, failed: 1, skipped: 0 },
+    };
+    apiMocks.get
+      .mockResolvedValueOnce({ campaign: null })
+      .mockResolvedValueOnce({ campaign: completed });
+    apiMocks.post.mockResolvedValue({ ...completed, id: 'campaign-retry', status: 'running' });
+
+    render(
+      <TracerouteCampaignPanel
+        initialTarget={null}
+        nodes={[]}
+        sources={[]}
+        sourceStatuses={new Map()}
+      />,
+    );
+
+    const retry = await screen.findByRole('button', { name: /Riprova falliti \(1\)/i });
+    fireEvent.click(retry);
+
+    await waitFor(() => expect(apiMocks.post).toHaveBeenCalledWith(
+      '/api/traceroute-campaigns/campaign-finished/retry',
+    ));
+  });
 });

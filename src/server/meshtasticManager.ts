@@ -76,6 +76,7 @@ import { AdminTransactionService } from './services/adminTransactionService.js';
 import { FavoritesService } from './services/favoritesService.js';
 import { DeviceAdminService } from './services/deviceAdminService.js';
 import { RemoteAdminService } from './services/remoteAdminService.js';
+import { tracerouteCampaignCoordinator } from './services/tracerouteCampaignCoordinator.js';
 import { ConnState, dispatch, type SmContext } from './meshtastic/connectionStateMachine.js';
 import fs from 'fs';
 import path from 'path';
@@ -2228,6 +2229,14 @@ class MeshtasticManager implements ISourceManager {
 
     // The traceroute execution logic
     const executeTraceroute = async () => {
+      // A sequential campaign owns this source for its whole run. Do not let
+      // the automatic scheduler inject an unrelated response into the active
+      // campaign attempt; the next interval will try again normally.
+      if (tracerouteCampaignCoordinator.isReserved(this.sourceId)) {
+        logger.debug('🗺️ Auto-traceroute: Skipping - traceroute campaign active on this source');
+        return;
+      }
+
       // TX-disabled radios cannot send OTA traceroutes; skip quietly and let the
       // interval keep running so a later TX re-enable resumes automatically (#4294).
       if (!this.isTxEnabled()) {
@@ -9171,6 +9180,16 @@ class MeshtasticManager implements ISourceManager {
   }
 
   async sendTraceroute(destination: number, channel: number = 0): Promise<void> {
+    tracerouteCampaignCoordinator.assertAvailable(this.sourceId);
+    await this.sendTraceroutePacket(destination, channel);
+  }
+
+  /** Send a traceroute owned by the active campaign reservation. */
+  async sendCampaignTraceroute(destination: number, channel: number = 0): Promise<void> {
+    await this.sendTraceroutePacket(destination, channel);
+  }
+
+  private async sendTraceroutePacket(destination: number, channel: number): Promise<void> {
     if (!this.isConnected || !this.transport) {
       throw new Error('Not connected to Meshtastic node');
     }

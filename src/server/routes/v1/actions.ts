@@ -19,6 +19,7 @@ import { logger } from '../../../utils/logger.js';
 import { PortNum } from '../../constants/meshtastic.js';
 import { attachSource, resolvedSourceIdFromPath } from './sourceParam.js';
 import { isTxDisabledError } from '../../errors/txDisabledError.js';
+import { isTracerouteCampaignBusyError } from '../../services/tracerouteCampaignCoordinator.js';
 
 const router = express.Router({ mergeParams: true });
 
@@ -102,6 +103,13 @@ router.post('/traceroute', attachSource('traceroute', 'write'), async (req: Requ
       },
     });
   } catch (error) {
+    if (isTracerouteCampaignBusyError(error)) {
+      return res.status(409).json({
+        success: false,
+        error: 'A traceroute campaign is active on this source',
+        code: error.code,
+      });
+    }
     if (isTxDisabledError(error)) {
       return res.status(409).json({ success: false, error: 'Transmit is disabled on this source', code: 'TX_DISABLED' });
     }
