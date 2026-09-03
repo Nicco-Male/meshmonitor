@@ -15,13 +15,18 @@ import { sourceManagerRegistry, type ISourceManager } from '../sourceManagerRegi
 import { isMeshtasticManager } from '../sourceManagerTypes.js';
 import { resolveBroadcastChannel } from '../utils/resolveDestinationChannel.js';
 import { tracerouteCampaignCoordinator } from './tracerouteCampaignCoordinator.js';
+import { tracerouteSchedulerService } from './tracerouteSchedulerService.js';
 
 const MAX_TARGETS = 100;
 const MAX_SOURCES = 20;
 const MAX_RETAINED_CAMPAIGNS = 20;
 
 interface CampaignManager extends ISourceManager {
-  sendCampaignTraceroute(destination: number, channel?: number): Promise<void>;
+  sendCampaignTraceroute(
+    destination: number,
+    channel?: number,
+    scheduling?: { priority?: 'campaign' | 'retry'; timeoutMs?: number; ownerKey?: string },
+  ): Promise<void>;
 }
 
 interface CampaignSourceRecord {
@@ -46,6 +51,7 @@ export interface TracerouteCampaignDependencies {
   subscribe(listener: (event: DataEvent) => void): () => void;
   reserveSources(campaignId: string, sourceIds: string[]): void;
   releaseSources(campaignId: string): void;
+  cancelQueued(campaignId: string): void;
 }
 
 export class TracerouteCampaignError extends Error {
@@ -311,6 +317,7 @@ export class TracerouteCampaignService {
       }
     }
     this.refreshProgress(campaign);
+    this.deps.cancelQueued(campaign.id);
     this.cancelCurrentWait?.();
     return copyCampaign(campaign);
   }
@@ -522,7 +529,12 @@ export class TracerouteCampaignService {
         this.finishJob(job, 'cancelled', 'Campaign cancelled');
         return;
       }
-      await manager.sendCampaignTraceroute(job.target.nodeNum, channel);
+      await manager.sendCampaignTraceroute(job.target.nodeNum, channel, {
+        priority: campaign.retryOfCampaignId ? 'retry' : 'campaign',
+        timeoutMs: campaign.config.timeoutSeconds * 1000,
+        ownerKey: campaign.id,
+      });
+      waiter.startTimeout();
     } catch (error) {
       waiter.cancel();
       this.cancelCurrentWait = null;
@@ -549,17 +561,19 @@ export class TracerouteCampaignService {
     timeoutMs: number,
   ): {
     promise: Promise<{ kind: 'success'; trace: Partial<DbTraceroute> } | { kind: 'timeout' } | { kind: 'cancelled' }>;
+    startTimeout: () => void;
     cancel: () => void;
   } {
     let finish: (result: { kind: 'success'; trace: Partial<DbTraceroute> } | { kind: 'timeout' } | { kind: 'cancelled' }) => void;
     let settled = false;
     let unsubscribe = () => {};
-    let timeout: NodeJS.Timeout;
+    let timeout: NodeJS.Timeout | null = null;
+    let timeoutStarted = false;
     const promise = new Promise<{ kind: 'success'; trace: Partial<DbTraceroute> } | { kind: 'timeout' } | { kind: 'cancelled' }>((resolve) => {
       finish = (result) => {
         if (settled) return;
         settled = true;
-        clearTimeout(timeout);
+        if (timeout) clearTimeout(timeout);
         unsubscribe();
         resolve(result);
       };
@@ -575,9 +589,17 @@ export class TracerouteCampaignService {
           finish({ kind: 'success', trace });
         }
       });
-      timeout = setTimeout(() => finish({ kind: 'timeout' }), timeoutMs);
     });
-    return { promise, cancel: () => finish({ kind: 'cancelled' }) };
+    const startTimeout = () => {
+      if (settled || timeoutStarted) return;
+      timeoutStarted = true;
+      timeout = setTimeout(() => finish({ kind: 'timeout' }), timeoutMs);
+    };
+    return {
+      promise,
+      startTimeout,
+      cancel: () => finish({ kind: 'cancelled' }),
+    };
   }
 
   private waitForDelay(delayMs: number): Promise<void> {
@@ -633,6 +655,7 @@ export class TracerouteCampaignService {
     }
     this.refreshProgress(campaign);
     if (this.activeCampaignId === campaign.id) this.activeCampaignId = null;
+    this.deps.cancelQueued(campaign.id);
     this.cancelCurrentWait?.();
     this.cancelCurrentWait = null;
   }
@@ -672,6 +695,9 @@ const defaultDependencies: TracerouteCampaignDependencies = {
   },
   reserveSources: (campaignId, sourceIds) => tracerouteCampaignCoordinator.reserve(campaignId, sourceIds),
   releaseSources: (campaignId) => tracerouteCampaignCoordinator.release(campaignId),
+  cancelQueued: (campaignId) => {
+    tracerouteSchedulerService.cancelQueuedByOwner(campaignId);
+  },
 };
 
 export const tracerouteCampaignService = new TracerouteCampaignService(defaultDependencies);
