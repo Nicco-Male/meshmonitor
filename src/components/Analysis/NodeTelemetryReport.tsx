@@ -12,6 +12,7 @@ import api from '../../services/api';
 import { useAuth } from '../../contexts/AuthContext';
 import { useSettings } from '../../contexts/SettingsContext';
 import { useCsrfFetch } from '../../hooks/useCsrfFetch';
+import { buildTelemetrySourceScope } from '../../hooks/useTelemetry';
 import {
   buildPowerMetricLabelOverrides,
   getPowerChannelNumbers,
@@ -34,15 +35,22 @@ interface UnifiedTelemetryEntry {
   nodeShortName?: string | null;
 }
 
+interface ReportSource {
+  id: string;
+  name: string;
+}
+
 interface ReportNode {
+  /** Logical node key: deliberately independent from the receiving source. */
   key: string;
   nodeId: string;
-  sourceId: string;
-  sourceName: string;
   nodeLongName?: string | null;
   nodeShortName?: string | null;
   displayName: string;
   telemetryTypes: string[];
+  sources: ReportSource[];
+  /** Old source-specific keys used only as a read fallback for saved labels. */
+  legacyLabelKeys: string[];
 }
 
 interface SettingsPayload {
@@ -51,24 +59,53 @@ interface SettingsPayload {
 
 const MAX_VISIBLE_NODE_RESULTS = 50;
 
+function logicalNodeKey(nodeId: string): string {
+  return `node:${encodeURIComponent(nodeId.toLowerCase())}`;
+}
+
 function formatNodeLabel(node: ReportNode): string {
   return `${node.displayName} · ${node.nodeId}`;
+}
+
+function getNodeLabels(
+  labels: TelemetryChannelLabels,
+  node: ReportNode | null,
+): Record<string, string> {
+  if (!node) return {};
+  if (labels[node.key]) return labels[node.key];
+
+  for (const legacyKey of node.legacyLabelKeys) {
+    if (labels[legacyKey]) return labels[legacyKey];
+  }
+
+  return {};
 }
 
 function buildReportNodes(entries: UnifiedTelemetryEntry[]): ReportNode[] {
   const nodes = new Map<
     string,
-    Omit<ReportNode, 'displayName' | 'telemetryTypes'> & {
+    {
+      key: string;
+      nodeId: string;
+      nodeLongName?: string | null;
+      nodeShortName?: string | null;
       telemetryTypes: Set<string>;
+      sources: Map<string, string>;
     }
   >();
 
   for (const entry of entries) {
     if (!entry.nodeId || !entry.sourceId || !entry.telemetryType) continue;
-    const key = telemetryChannelLabelKey(entry.sourceId, entry.nodeId);
+
+    const key = logicalNodeKey(entry.nodeId);
+    const sourceName = entry.sourceName || entry.sourceId;
     const existing = nodes.get(key);
+
     if (existing) {
       existing.telemetryTypes.add(entry.telemetryType);
+      if (!existing.sources.has(entry.sourceId)) {
+        existing.sources.set(entry.sourceId, sourceName);
+      }
       existing.nodeLongName ||= entry.nodeLongName?.trim() || null;
       existing.nodeShortName ||= entry.nodeShortName?.trim() || null;
       continue;
@@ -77,24 +114,35 @@ function buildReportNodes(entries: UnifiedTelemetryEntry[]): ReportNode[] {
     nodes.set(key, {
       key,
       nodeId: entry.nodeId,
-      sourceId: entry.sourceId,
-      sourceName: entry.sourceName || entry.sourceId,
       nodeLongName: entry.nodeLongName?.trim() || null,
       nodeShortName: entry.nodeShortName?.trim() || null,
       telemetryTypes: new Set([entry.telemetryType]),
+      sources: new Map([[entry.sourceId, sourceName]]),
     });
   }
 
   return [...nodes.values()]
-    .map((node) => ({
-      ...node,
-      displayName: node.nodeLongName || node.nodeShortName || node.nodeId,
-      telemetryTypes: [...node.telemetryTypes],
-    }))
+    .map((node) => {
+      const sources = [...node.sources.entries()]
+        .map(([id, name]) => ({ id, name }))
+        .sort((a, b) => a.name.localeCompare(b.name) || a.id.localeCompare(b.id));
+
+      return {
+        key: node.key,
+        nodeId: node.nodeId,
+        nodeLongName: node.nodeLongName,
+        nodeShortName: node.nodeShortName,
+        displayName: node.nodeLongName || node.nodeShortName || node.nodeId,
+        telemetryTypes: [...node.telemetryTypes],
+        sources,
+        legacyLabelKeys: sources.map((source) =>
+          telemetryChannelLabelKey(source.id, node.nodeId),
+        ),
+      };
+    })
     .sort(
       (a, b) =>
-        a.sourceName.localeCompare(b.sourceName) ||
-        a.displayName.localeCompare(b.displayName),
+        a.displayName.localeCompare(b.displayName) || a.nodeId.localeCompare(b.nodeId),
     );
 }
 
@@ -105,6 +153,8 @@ export default function NodeTelemetryReport() {
   const { temperatureUnit } = useSettings();
   const canEditLabels = hasPermission('settings', 'write');
 
+  // The source is a secondary filter for the selected logical node. Empty means
+  // merge all sources that observed the node.
   const [sourceFilter, setSourceFilter] = useState('');
   const [search, setSearch] = useState('');
   const [selectedNodeKey, setSelectedNodeKey] = useState('');
@@ -142,16 +192,6 @@ export default function NodeTelemetryReport() {
     [nodesQuery.data],
   );
 
-  const sources = useMemo(() => {
-    const names = new Map<string, string>();
-    for (const node of reportNodes) {
-      if (!names.has(node.sourceId)) names.set(node.sourceId, node.sourceName);
-    }
-    return [...names.entries()]
-      .map(([id, name]) => ({ id, name }))
-      .sort((a, b) => a.name.localeCompare(b.name));
-  }, [reportNodes]);
-
   const filteredNodes = useMemo(() => {
     const searchTerms = search
       .trim()
@@ -159,8 +199,8 @@ export default function NodeTelemetryReport() {
       .replaceAll('·', ' ')
       .split(/\s+/)
       .filter(Boolean);
+
     return reportNodes.filter((node) => {
-      if (sourceFilter && node.sourceId !== sourceFilter) return false;
       if (searchTerms.length === 0) return true;
       const searchableNode = [
         node.nodeLongName,
@@ -172,19 +212,37 @@ export default function NodeTelemetryReport() {
         .toLowerCase();
       return searchTerms.every((term) => searchableNode.includes(term));
     });
-  }, [reportNodes, search, sourceFilter]);
-  const visibleNodes = filteredNodes.slice(0, MAX_VISIBLE_NODE_RESULTS);
+  }, [reportNodes, search]);
 
-  const selectedNode = reportNodes.find((node) => node.key === selectedNodeKey) ?? null;
+  const visibleNodes = filteredNodes.slice(0, MAX_VISIBLE_NODE_RESULTS);
+  const selectedNode =
+    reportNodes.find((node) => node.key === selectedNodeKey) ?? null;
+
+  useEffect(() => {
+    if (
+      selectedNode &&
+      sourceFilter &&
+      !selectedNode.sources.some((source) => source.id === sourceFilter)
+    ) {
+      setSourceFilter('');
+    }
+  }, [selectedNode, sourceFilter]);
+
+  const selectedSource = selectedNode?.sources.find(
+    (source) => source.id === sourceFilter,
+  );
+  const telemetrySourceScope = selectedNode
+    ? buildTelemetrySourceScope(
+        sourceFilter
+          ? [sourceFilter]
+          : selectedNode.sources.map((source) => source.id),
+      )
+    : null;
   const powerChannels = selectedNode
     ? getPowerChannelNumbers(selectedNode.telemetryTypes)
     : [];
-  const selectedDraftLabels = selectedNode
-    ? draftLabels[selectedNode.key] ?? {}
-    : {};
-  const selectedStoredLabels = selectedNode
-    ? storedLabels[selectedNode.key] ?? {}
-    : {};
+  const selectedDraftLabels = getNodeLabels(draftLabels, selectedNode);
+  const selectedStoredLabels = getNodeLabels(storedLabels, selectedNode);
   const labelOverrides = buildPowerMetricLabelOverrides(selectedDraftLabels);
   const labelsDirty =
     JSON.stringify(parseTelemetryChannelLabels({ node: selectedDraftLabels }).node ?? {}) !==
@@ -227,7 +285,7 @@ export default function NodeTelemetryReport() {
     setDraftLabels((current) => ({
       ...current,
       [selectedNode.key]: {
-        ...(current[selectedNode.key] ?? {}),
+        ...getNodeLabels(current, selectedNode),
         [String(channel)]: value,
       },
     }));
@@ -248,9 +306,18 @@ export default function NodeTelemetryReport() {
 
   const selectNode = (node: ReportNode) => {
     setSelectedNodeKey(node.key);
+    setSourceFilter('');
     setSearch(formatNodeLabel(node));
     setNodePickerOpen(false);
     setSaveMessage('');
+  };
+
+  const clearNode = () => {
+    setSearch('');
+    setSelectedNodeKey('');
+    setSourceFilter('');
+    setSaveMessage('');
+    setNodePickerOpen(true);
   };
 
   const handlePickerKeyDown = (event: KeyboardEvent<HTMLInputElement>) => {
@@ -299,6 +366,17 @@ export default function NodeTelemetryReport() {
     }
   };
 
+  const sourceBadgeLabel = selectedNode
+    ? sourceFilter
+      ? selectedSource?.name || sourceFilter
+      : selectedNode.sources.length === 1
+        ? selectedNode.sources[0].name
+        : t('analysis.node_telemetry.all_sources_count', {
+            defaultValue: 'All sources · {{count}}',
+            count: selectedNode.sources.length,
+          })
+    : '';
+
   return (
     <div className={styles.report}>
       <div>
@@ -316,28 +394,6 @@ export default function NodeTelemetryReport() {
 
       <section className={`reports-panel ${styles.controlsPanel}`}>
         <div className={styles.controlsGrid}>
-          <label className={styles.field}>
-            <span>{t('analysis.node_telemetry.source', 'Source')}</span>
-            <select
-              value={sourceFilter}
-              onChange={(event) => {
-                setSourceFilter(event.target.value);
-                setSelectedNodeKey('');
-                setSearch('');
-                setNodePickerOpen(false);
-              }}
-            >
-              <option value="">
-                {t('analysis.node_telemetry.all_sources', 'All sources')}
-              </option>
-              {sources.map((source) => (
-                <option key={source.id} value={source.id}>
-                  {source.name}
-                </option>
-              ))}
-            </select>
-          </label>
-
           <div
             className={`${styles.field} ${styles.nodeField}`}
             onBlur={(event) => {
@@ -365,6 +421,7 @@ export default function NodeTelemetryReport() {
                 onChange={(event) => {
                   setSearch(event.target.value);
                   setSelectedNodeKey('');
+                  setSourceFilter('');
                   setSaveMessage('');
                   setNodePickerOpen(true);
                 }}
@@ -387,10 +444,7 @@ export default function NodeTelemetryReport() {
                     'Clear node search',
                   )}
                   onClick={() => {
-                    setSearch('');
-                    setSelectedNodeKey('');
-                    setSaveMessage('');
-                    setNodePickerOpen(true);
+                    clearNode();
                     pickerInputRef.current?.focus();
                   }}
                 >
@@ -432,7 +486,14 @@ export default function NodeTelemetryReport() {
                       <span className={styles.nodeResultName}>{node.displayName}</span>
                       <span className={styles.nodeResultMeta}>
                         <span>{node.nodeId}</span>
-                        <span>{node.sourceName}</span>
+                        <span>
+                          {node.sources.length === 1
+                            ? node.sources[0].name
+                            : t('analysis.node_telemetry.source_count', {
+                                defaultValue: '{{count}} sources',
+                                count: node.sources.length,
+                              })}
+                        </span>
                       </span>
                     </button>
                   ))
@@ -449,7 +510,27 @@ export default function NodeTelemetryReport() {
               </div>
             )}
           </div>
+
+          {selectedNode && selectedNode.sources.length > 1 && (
+            <label className={styles.field}>
+              <span>{t('analysis.node_telemetry.source', 'Source')}</span>
+              <select
+                value={sourceFilter}
+                onChange={(event) => setSourceFilter(event.target.value)}
+              >
+                <option value="">
+                  {t('analysis.node_telemetry.all_sources', 'All sources')}
+                </option>
+                {selectedNode.sources.map((source) => (
+                  <option key={source.id} value={source.id}>
+                    {source.name}
+                  </option>
+                ))}
+              </select>
+            </label>
+          )}
         </div>
+
         {!nodesQuery.isLoading && (
           <div className={styles.resultCount}>
             {t('analysis.node_telemetry.nodes_found', {
@@ -488,7 +569,7 @@ export default function NodeTelemetryReport() {
               <strong>{selectedNode.displayName}</strong>
               <span>{selectedNode.nodeId}</span>
             </div>
-            <span className={styles.sourceBadge}>{selectedNode.sourceName}</span>
+            <span className={styles.sourceBadge}>{sourceBadgeLabel}</span>
           </section>
 
           <section className={`reports-panel ${styles.labelsPanel}`}>
@@ -602,7 +683,7 @@ export default function NodeTelemetryReport() {
 
           <TelemetryGraphs
             nodeId={selectedNode.nodeId}
-            sourceId={selectedNode.sourceId}
+            sourceId={telemetrySourceScope}
             temperatureUnit={temperatureUnit}
             telemetryHours={24}
             showTimeRangeSelector
