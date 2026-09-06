@@ -1,0 +1,61 @@
+name: Fork Upstream Sync Helper
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize]
+
+permissions:
+  contents: write
+
+jobs:
+  prepare-sync-branch:
+    if: >-
+      github.event.pull_request.number == 22 &&
+      github.event.pull_request.base.ref == 'main' &&
+      github.event.pull_request.head.repo.full_name == 'Yeraze/meshmonitor' &&
+      github.event.pull_request.head.ref == 'main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Merge upstream and preserve fork side on true conflicts
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/Yeraze/meshmonitor.git || true
+          git fetch upstream main
+          git checkout -B sync/upstream-4.16.0-rc4 main
+
+          set +e
+          git merge --no-ff --no-commit upstream/main
+          merge_rc=$?
+          set -e
+
+          if [ "$merge_rc" -ne 0 ]; then
+            echo "Merge reported conflicts. Preserving the fork version only for conflicted paths."
+            git diff --name-only --diff-filter=U | tee /tmp/conflicts.txt
+            while IFS= read -r f; do
+              [ -z "$f" ] && continue
+              if git ls-files -u -- "$f" | grep -q $'\t'"$f" | grep -q '^.* 2\t'; then
+                git checkout --ours -- "$f" || true
+                git add -- "$f" || true
+              else
+                git rm -f -- "$f" || true
+              fi
+            done < /tmp/conflicts.txt
+            git add -A
+          fi
+
+          if git diff --cached --quiet; then
+            echo "Nothing to commit."
+          else
+            git commit -m "chore: merge Yeraze/main 4.16.0-rc4 into fork"
+          fi
+
+          git push --force-with-lease origin sync/upstream-4.16.0-rc4
