@@ -25,6 +25,7 @@ import {
 import { useMeshCoreNeighbors } from '../hooks/useMapAnalysisData';
 import { useMaxNodeAgeHoursAcross, useMaxInfraNodeAgeHoursAcross } from '../hooks/useNodeDisplaySettings';
 import type { DashboardSource } from '../hooks/useDashboardData';
+import type { TracerouteCampaignTargetInput } from '../types/tracerouteCampaign';
 import DashboardSidebar from '../components/Dashboard/DashboardSidebar';
 import DashboardMap from '../components/Dashboard/DashboardMap';
 import type { NodeSourceRef } from '../components/Dashboard/DashboardNodePopup';
@@ -75,6 +76,18 @@ function DashboardInner() {
   const { mapTileset, customTilesets, defaultMapCenterLat, defaultMapCenterLon, defaultLandingPage } = useSettings();
   const navigate = useNavigate();
   const location = useLocation();
+
+  const openTracerouteCampaign = (initialTarget: TracerouteCampaignTargetInput | null) => {
+    const params = new URLSearchParams();
+    if (initialTarget) {
+      params.set('nodeNum', String(initialTarget.nodeNum));
+      if (initialTarget.nodeId) params.set('nodeId', initialTarget.nodeId);
+      if (initialTarget.name) params.set('name', initialTarget.name);
+    }
+    const query = params.toString();
+    const url = `${appBasename}/unified/traceroute-campaign${query ? `?${query}` : ''}`;
+    window.open(url, '_blank', 'noopener,noreferrer');
+  };
 
   /**
    * Invalidate the source list cache after a mutation so the sidebar
@@ -1301,6 +1314,7 @@ function DashboardInner() {
           maxNodeAgeHours={maxNodeAgeHours}
           maxInfraNodeAgeHours={maxInfraNodeAgeHours}
           onNodeSourceSelect={handleNodeSourceSelect}
+          onTracerouteCampaign={openTracerouteCampaign}
           isLoading={sourceData.isLoading}
         />
       </div>

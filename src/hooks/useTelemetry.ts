@@ -10,6 +10,29 @@
 import { useQuery, useQueries, keepPreviousData } from '@tanstack/react-query';
 import { useResolvedSourceId } from './useResolvedSourceId';
 
+const MULTI_SOURCE_PREFIX = '__meshmonitor_multi_source__:';
+
+/**
+ * Build a source scope that useTelemetry can resolve to one or more concrete
+ * sources. Existing callers can keep passing a normal sourceId unchanged.
+ */
+export function buildTelemetrySourceScope(sourceIds: string[]): string | null {
+  const uniqueSourceIds = [...new Set(sourceIds.filter(Boolean))];
+  if (uniqueSourceIds.length === 0) return null;
+  if (uniqueSourceIds.length === 1) return uniqueSourceIds[0];
+  return `${MULTI_SOURCE_PREFIX}${uniqueSourceIds.map(encodeURIComponent).join(',')}`;
+}
+
+function parseTelemetrySourceScope(sourceId: string): string[] {
+  if (!sourceId.startsWith(MULTI_SOURCE_PREFIX)) return [sourceId];
+
+  return sourceId
+    .slice(MULTI_SOURCE_PREFIX.length)
+    .split(',')
+    .filter(Boolean)
+    .map((value) => decodeURIComponent(value));
+}
+
 /**
  * Telemetry data point from the backend
  */
@@ -30,6 +53,35 @@ export interface TelemetryData {
   unit?: string;
   /** Record creation timestamp */
   createdAt: number;
+  /** Original packet timestamp, when available */
+  packetTimestamp?: number;
+  /** Meshtastic packet id, when available */
+  packetId?: number;
+}
+
+/**
+ * Merge telemetry received by multiple MeshMonitor sources without turning one
+ * radio packet into multiple graph samples. Packet id is preferred; when the
+ * API returns averaged rows (which intentionally omit packet metadata), the
+ * metric + bucket timestamp identifies the one logical sample. This keeps one
+ * source's value instead of summing or averaging source copies together.
+ */
+function mergeTelemetrySources(rows: TelemetryData[][]): TelemetryData[] {
+  const merged = rows
+    .flat()
+    .sort((a, b) => a.timestamp - b.timestamp || a.createdAt - b.createdAt);
+  const seen = new Set<string>();
+
+  return merged.filter((row) => {
+    const sampleTimestamp = row.packetTimestamp ?? row.timestamp;
+    const key = row.packetId != null
+      ? `packet:${row.nodeId}:${row.packetId}:${row.telemetryType}`
+      : `sample:${row.nodeId}:${row.telemetryType}:${sampleTimestamp}`;
+
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }
 
 /**
@@ -74,6 +126,9 @@ interface UseTelemetryOptions {
  * - Automatic background refetching every 30 seconds
  * - Loading and error states
  *
+ * A source scope produced by buildTelemetrySourceScope() is resolved client-side
+ * into parallel per-source requests, then merged into one logical series.
+ *
  * @param options - Configuration options
  * @returns TanStack Query result with telemetry data
  *
@@ -86,21 +141,30 @@ interface UseTelemetryOptions {
  * ```
  */
 export function useTelemetry({ nodeId, hours = 24, baseUrl = '', sourceId, enabled = true }: UseTelemetryOptions) {
-  // The endpoint now requires a sourceId; fall back to the primary source when
-  // the caller didn't supply one (legacy/single-source views).
+  // The endpoint requires a concrete sourceId. Legacy/single-source callers
+  // still fall back to the resolved primary source; report views may pass a
+  // synthetic multi-source scope which is expanded before any request is sent.
   const fallbackSourceId = useResolvedSourceId();
   const effectiveSourceId = sourceId ?? fallbackSourceId;
+
   return useQuery({
     queryKey: ['telemetry', nodeId, hours, effectiveSourceId],
     queryFn: async (): Promise<TelemetryData[]> => {
-      const url = `${baseUrl}/api/telemetry/${nodeId}?hours=${hours}&sourceId=${encodeURIComponent(effectiveSourceId!)}`;
-      const response = await fetch(url);
+      const sourceIds = parseTelemetrySourceScope(effectiveSourceId!);
+      const responses = await Promise.all(
+        sourceIds.map(async (concreteSourceId) => {
+          const url = `${baseUrl}/api/telemetry/${nodeId}?hours=${hours}&sourceId=${encodeURIComponent(concreteSourceId)}`;
+          const response = await fetch(url);
 
-      if (!response.ok) {
-        throw new Error(`Failed to fetch telemetry: ${response.status} ${response.statusText}`);
-      }
+          if (!response.ok) {
+            throw new Error(`Failed to fetch telemetry: ${response.status} ${response.statusText}`);
+          }
 
-      return response.json();
+          return response.json() as Promise<TelemetryData[]>;
+        }),
+      );
+
+      return sourceIds.length === 1 ? responses[0] : mergeTelemetrySources(responses);
     },
     // Defer until a sourceId is available (required by the endpoint).
     enabled: enabled && !!nodeId && !!effectiveSourceId,
@@ -231,7 +295,7 @@ export function useSolarEstimatesLatest({
       return estimatesMap;
     },
     enabled,
-    refetchInterval: 300000, // Refetch every 5 minutes (solar data changes slowly)
+    refetchInterval: 300000, // Refetch every 5 minutes
     staleTime: 290000, // Data considered fresh for ~5 minutes
     gcTime: 10 * 60 * 1000, // Keep in cache for 10 minutes
     refetchOnWindowFocus: false,

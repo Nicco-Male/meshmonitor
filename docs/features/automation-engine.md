@@ -413,6 +413,13 @@ Asks a node to report data — the automation equivalent of the manual request b
 - **Channel #** *(advanced; Meshtastic only)* — which channel to send the request on (e.g. a private
   sensor channel); ignored by MeshCore.
 
+> Multi-source request actions send to the chosen sources in order, but the action completes when
+> each request has been transmitted; it does not wait for a traceroute response before sending the
+> next request. For result-aware, strictly sequential execution, recent-success prioritization,
+> and stop-on-first-success behavior, use the [Unified traceroute campaign](/features/multi-source#sequential-traceroute-campaigns).
+> When a traceroute campaign has reserved a selected Meshtastic source, traceroute request actions
+> on that source are reported as skipped so they cannot interfere with the campaign response.
+
 ### Send a notification (Apprise)
 
 Dispatches an out-of-band notification through [Apprise](/features/notifications) with a `Title`,

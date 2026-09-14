@@ -120,7 +120,7 @@ export default function NodeMarkersLayer() {
     // returns identical data doesn't churn the marker and collapse an active
     // spiderfy fan. Selection IS part of the signature, so highlighting the
     // chosen node still re-renders just that marker.
-    const iconSig = `${hops}|${isSelected ? 1 : 0}|${isRouter ? 1 : 0}|${roleCategory}|${n.isUnmessagable ? 1 : 0}|${n.shortName ?? ''}|${mapPinStyle}`;
+    const iconSig = `${hops}|${isSelected ? 1 : 0}|${isRouter ? 1 : 0}|${roleCategory}|${n.mobile === 1 || n.isMobile === true ? 1 : 0}|${n.isUnmessagable ? 1 : 0}|${n.shortName ?? ''}|${mapPinStyle}|${config.layers.hopShading.enabled ? 'hop-shading' : 'semantic-role-v1'}`;
     // A missing lastHeard sits at the floor here (treated as "oldest
     // visible"), intentionally diverging from DashboardMap where a missing
     // timestamp stays fully opaque — that surface age-gates upstream, this
@@ -148,6 +148,8 @@ export default function NodeMarkersLayer() {
           isSelected,
           isRouter,
           roleCategory,
+          semanticRoleColor: !config.layers.hopShading.enabled,
+          isMobile: n.mobile === 1 || n.isMobile === true,
           isUnmessagable: !!n.isUnmessagable,
           shortName: n.shortName ?? undefined,
           showLabel: true,

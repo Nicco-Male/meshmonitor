@@ -43,7 +43,7 @@ interface MeshSendManager {
   // Request/operation senders (#3835).
   sendTelemetryRequest(destination: number, channel?: number, telemetryType?: 'device' | 'environment' | 'airQuality' | 'power'): Promise<unknown>;
   sendPositionRequest(destination: number, channel?: number): Promise<unknown>;
-  sendTraceroute(destination: number, channel?: number): Promise<unknown>;
+  sendTraceroute(destination: number, channel?: number, priority?: 'automation'): Promise<unknown>;
   sendNodeInfoRequest(destination: number, channel?: number): Promise<unknown>;
   sendNeighborInfoRequest(destination: number, channel?: number): Promise<unknown>;
   broadcastNodeInfoToChannel(channel: number): Promise<unknown>;
@@ -185,7 +185,7 @@ export function createMeshActionDeps(): ActionDeps {
         switch (op) {
           case 'telemetry': return raw.sendTelemetryRequest!(dest, channel, telemetryType);
           case 'position': return raw.sendPositionRequest!(dest, channel);
-          case 'traceroute': return raw.sendTraceroute!(dest, channel);
+          case 'traceroute': return raw.sendTraceroute!(dest, channel, 'automation');
           case 'nodeinfo': return raw.sendNodeInfoRequest!(dest, channel);
           case 'neighbors': return raw.sendNeighborInfoRequest!(dest, channel);
           case 'advert': return raw.broadcastNodeInfoToChannel!(channel);

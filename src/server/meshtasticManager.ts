@@ -89,6 +89,8 @@ import { AdminTransactionService } from './services/adminTransactionService.js';
 import { FavoritesService } from './services/favoritesService.js';
 import { DeviceAdminService } from './services/deviceAdminService.js';
 import { RemoteAdminService } from './services/remoteAdminService.js';
+import { tracerouteCampaignCoordinator } from './services/tracerouteCampaignCoordinator.js';
+import { tracerouteRequestScheduler, type TracerouteRequestPriority } from './services/tracerouteRequestScheduler.js';
 import { ConnState, dispatch, type SmContext } from './meshtastic/connectionStateMachine.js';
 import fs from 'fs';
 import path from 'path';
@@ -2589,6 +2591,19 @@ class MeshtasticManager implements ISourceManager {
 
     // The traceroute execution logic
     const executeTraceroute = async () => {
+      // A sequential campaign owns this source for its whole run. Do not let
+      // the automatic scheduler inject an unrelated response into the active
+      // campaign attempt; the next interval will try again normally.
+      if (tracerouteCampaignCoordinator.isReserved(this.sourceId)) {
+        logger.debug('🗺️ Auto-traceroute: Skipping - traceroute campaign active on this source');
+        return;
+      }
+
+      if (tracerouteRequestScheduler.hasPendingForSource(this.sourceId)) {
+        logger.debug('🗺️ Auto-traceroute: Skipping - traceroute already queued or active for this source');
+        return;
+      }
+
       // TX-disabled radios cannot send OTA traceroutes; skip quietly and let the
       // interval keep running so a later TX re-enable resumes automatically (#4294).
       if (!this.canTransmit()) {
@@ -2638,7 +2653,7 @@ class MeshtasticManager implements ISourceManager {
             this.pendingTracerouteTimestamps.set(targetNode.nodeNum, Date.now());
 
             this.lastTracerouteSentTime = Date.now();
-            await this.sendTraceroute(targetNode.nodeNum, channel);
+            await this.sendTraceroute(targetNode.nodeNum, channel, 'automatic');
 
             // Check for timed-out traceroutes (> 5 minutes old)
             this.checkTracerouteTimeouts();
@@ -10125,7 +10140,48 @@ class MeshtasticManager implements ISourceManager {
     }
   }
 
-  async sendTraceroute(destination: number, channel: number = 0): Promise<void> {
+  async sendTraceroute(
+    destination: number,
+    channel: number = 0,
+    priority: TracerouteRequestPriority = 'manual',
+  ): Promise<void> {
+    if (!this.localNodeInfo) {
+      throw new Error('Local node information not available');
+    }
+    await tracerouteRequestScheduler.enqueue({
+      sourceId: this.sourceId,
+      localNodeNum: this.localNodeInfo.nodeNum,
+      destination,
+      channel,
+      priority,
+      send: () => this.sendTraceroutePacket(destination, channel),
+    });
+  }
+
+  /** Queue campaign traceroutes through the same global RF scheduler. */
+  async sendCampaignTraceroute(
+    destination: number,
+    channel: number = 0,
+    priority: Extract<TracerouteRequestPriority, 'campaign' | 'retry'> = 'campaign',
+    timeoutMs?: number,
+    shouldDispatch?: () => boolean,
+  ): Promise<void> {
+    if (!this.localNodeInfo) {
+      throw new Error('Local node information not available');
+    }
+    await tracerouteRequestScheduler.enqueue({
+      sourceId: this.sourceId,
+      localNodeNum: this.localNodeInfo.nodeNum,
+      destination,
+      channel,
+      priority,
+      timeoutMs,
+      shouldDispatch,
+      send: () => this.sendTraceroutePacket(destination, channel),
+    });
+  }
+
+  private async sendTraceroutePacket(destination: number, channel: number): Promise<void> {
     if (!this.isConnected || !this.transport) {
       throw new Error('Not connected to Meshtastic node');
     }
