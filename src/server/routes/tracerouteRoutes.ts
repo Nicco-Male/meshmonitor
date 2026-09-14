@@ -8,8 +8,13 @@ import { ok, fail } from '../utils/apiResponse.js';
 import { maskTraceroutesByChannel } from '../utils/nodeEnhancer.js';
 import { hasRouteData, parseHopArray } from '../../utils/tracerouteSegments.js';
 import { getMaxNodeAgeHours } from '../services/nodeDisplaySettings.js';
+import { tracerouteRequestScheduler } from '../services/tracerouteRequestScheduler.js';
 
 const router = Router();
+
+router.get('/scheduler/status', (_req: Request, res: Response) => {
+  res.json(tracerouteRequestScheduler.getStatus());
+});
 
 router.get('/recent', async (req: Request, res: Response) => {
   try {

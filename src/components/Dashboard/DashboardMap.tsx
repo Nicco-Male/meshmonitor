@@ -80,6 +80,7 @@ import {
   decomposeTraceroute,
   type TracerouteRenderSegment,
 } from '../../utils/tracerouteSegments';
+import type { TracerouteCampaignTargetInput } from '../../types/tracerouteCampaign';
 
 export interface DashboardMapProps {
   nodes: any[];
@@ -106,6 +107,8 @@ export interface DashboardMapProps {
    * page can navigate to that source's Node Details view for the node.
    */
   onNodeSourceSelect?: (source: NodeSourceRef, nodeId: string | undefined) => void;
+  /** Opens the standalone sequential traceroute page, optionally preselecting a node. */
+  onTracerouteCampaign?: (target: TracerouteCampaignTargetInput | null) => void;
   /**
    * True while the FIRST fetch of `nodes` for the current selection is still
    * in flight (from `useDashboardSourceData`/`useDashboardUnifiedData`'s
@@ -204,6 +207,7 @@ export default function DashboardMap({
   maxNodeAgeHours,
   maxInfraNodeAgeHours,
   onNodeSourceSelect,
+  onTracerouteCampaign,
   isLoading = false,
 }: DashboardMapProps) {
   const {
@@ -690,7 +694,7 @@ export default function DashboardMap({
     return {
       key: markerKey,
       position: [pos.lat, pos.lng],
-      iconSig: `${hops}|${shortName ?? ''}|${isRouter ? 1 : 0}|${roleCategory}|${node.isUnmessagable ? 1 : 0}|${mapPinStyle}`,
+      iconSig: `${hops}|${shortName ?? ''}|${isRouter ? 1 : 0}|${roleCategory}|${node.mobile === 1 || node.isMobile === true ? 1 : 0}|${node.isUnmessagable ? 1 : 0}|${mapPinStyle}|semantic-role-v1`,
       buildIcon: () =>
         createNodeIcon({
           variant: 'meshtastic',
@@ -698,6 +702,8 @@ export default function DashboardMap({
           isSelected: false,
           isRouter,
           roleCategory,
+          semanticRoleColor: true,
+          isMobile: node.mobile === 1 || node.isMobile === true,
           isUnmessagable: !!node.isUnmessagable,
           shortName,
           showLabel: true,
@@ -707,7 +713,14 @@ export default function DashboardMap({
       opacity: ageOpacity,
       children: (
         <Popup>
-          <DashboardNodePopup node={node} pos={pos} onSourceSelect={onNodeSourceSelect} />
+          <DashboardNodePopup
+            node={node}
+            pos={pos}
+            onSourceSelect={onNodeSourceSelect}
+            onTracerouteCampaign={isUnified && onTracerouteCampaign
+              ? (target) => onTracerouteCampaign(target)
+              : undefined}
+          />
         </Popup>
       ),
     };
@@ -948,6 +961,16 @@ export default function DashboardMap({
             </button>
           </div>
           <>
+          {isUnified && onTracerouteCampaign && (
+            <button
+              type="button"
+              className="map-control-item dashboard-campaign-launch"
+              onClick={() => onTracerouteCampaign?.(null)}
+            >
+              <UiIcon name="route" size={15} />
+              <span>Campagna traceroute</span>
+            </button>
+          )}
           {/* #3636: node-to-node LOS distance measurement toggle. Needs at least
               two positioned nodes to be meaningful. */}
           <label className="map-control-item" title={unavailableIn3DTitle ?? 'Measure straight-line distance between two nodes'}>
@@ -1152,7 +1175,7 @@ export default function DashboardMap({
           </>
         </div>
         {/* Hops legend + tileset picker now live in the same sidebar (#4909). */}
-        {!effective3D && showLegend && <MapLegend embedded />}
+        {!effective3D && showLegend && <MapLegend embedded showSemanticNodeStyles />}
         {showTileSelector && (
           <TilesetSelector selectedTilesetId={tilesetId} onTilesetChange={setMapTileset} embedded />
         )}
@@ -1168,6 +1191,7 @@ export default function DashboardMap({
           </div>
         </div>
       )}
+
     </div>
   );
 }

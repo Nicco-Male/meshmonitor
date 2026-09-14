@@ -1688,7 +1688,7 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
       return {
         key: markerKey,
         position,
-        iconSig: `${node.nodeNum}-${hops}-${isSelected}-${node.user?.role}-${node.isUnmessagable ? 1 : 0}-${node.user?.shortName}-${showLabel}-${shouldAnimate}-${showRoute && isSelected}-${mapPinStyle}`,
+        iconSig: `${node.nodeNum}-${hops}-${isSelected}-${node.user?.role}-${node.mobile === 1 || node.isMobile === true ? 1 : 0}-${node.isUnmessagable ? 1 : 0}-${node.user?.shortName}-${showLabel}-${shouldAnimate}-${showRoute && isSelected}-${mapPinStyle}-semantic-role-v1`,
         buildIcon: () =>
           createNodeIcon({
             variant: 'meshtastic',
@@ -1696,6 +1696,8 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
             isSelected,
             isRouter,
             roleCategory,
+            semanticRoleColor: true,
+            isMobile: node.mobile === 1 || node.isMobile === true,
             isUnmessagable: !!node.isUnmessagable,
             shortName: node.user?.shortName,
             showLabel: showLabel || shouldAnimate,
@@ -2883,6 +2885,7 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
                 <MapLegend
                   positionHistory={positionHistoryLegendData}
                   unmappedCount={unmappedCount}
+                  showSemanticNodeStyles
                   embedded
                 />
               )}

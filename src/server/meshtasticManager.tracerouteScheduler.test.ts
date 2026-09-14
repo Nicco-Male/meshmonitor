@@ -1,6 +1,21 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 // Mock dependencies before any imports
+vi.mock('re2', () => ({
+  default: class MockRe2 {
+    private readonly expression: RegExp;
+
+    constructor(pattern: string, flags?: string) {
+      this.expression = new RegExp(pattern, flags);
+    }
+
+    test(value: string) { return this.expression.test(value); }
+    exec(value: string) { return this.expression.exec(value); }
+    get source() { return this.expression.source; }
+    get flags() { return this.expression.flags; }
+  },
+}));
+
 const mockGetSetting = vi.fn();
 const mockSetSetting = vi.fn();
 const mockGetNodeNeedingTracerouteAsync = vi.fn();
@@ -195,6 +210,8 @@ vi.mock('../utils/nodeHelpers.js', () => ({
   isNodeComplete: vi.fn(),
 }));
 
+import { tracerouteCampaignCoordinator } from './services/tracerouteCampaignCoordinator.js';
+
 const mockTargetNode = {
   nodeNum: 99999,
   nodeId: '!00099999',
@@ -238,6 +255,7 @@ describe('MeshtasticManager - Traceroute Scheduler', () => {
   });
 
   afterEach(() => {
+    tracerouteCampaignCoordinator.release('scheduler-test');
     // Clean up timers
     manager.tracerouteIntervalMinutes = 0;
     if (manager.tracerouteJitterTimeout) {
@@ -260,6 +278,16 @@ describe('MeshtasticManager - Traceroute Scheduler', () => {
     const fn = manager['startTracerouteScheduler'].bind(manager);
     fn();
   }
+
+  it('skips automatic traceroutes while a campaign owns this source', async () => {
+    tracerouteCampaignCoordinator.reserve('scheduler-test', [manager.sourceId]);
+
+    startScheduler(1);
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(manager.sendTraceroute).not.toHaveBeenCalled();
+    expect(mockGetNodeNeedingTracerouteAsync).not.toHaveBeenCalled();
+  });
 
   describe('Timer leak prevention', () => {
     it('should clear pending jitter timeout when scheduler is restarted', async () => {

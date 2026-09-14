@@ -87,6 +87,60 @@ Nearly every top-level view has a **source picker** in the header. It controls w
 
 Your picker choice persists per view and per user.
 
+## Sequential traceroute campaigns
+
+The **Unified** dashboard can run a traceroute campaign against manually selected Meshtastic
+nodes from a dedicated page. Open **Map Features → Traceroute campaign**, or open a node marker
+and choose **Traceroute multi-source** to open the page in a new browser tab with that node already
+selected. The Unified map remains available in the original tab while the campaign runs.
+
+A campaign:
+
+- uses only enabled, connected `meshtastic_tcp` sources selected on the page; MQTT and MeshCore
+  sources are read-only or use a different path model and are not offered;
+- sends exactly one traceroute at a time and waits for its response or timeout before using the
+  next source;
+- moves source/node pairs with a successful traceroute inside the configured recent-history
+  window to the front, newest success first;
+- can either continue through every source or stop attempts for a target node after its first
+  success;
+- shows live per-source results and can be cancelled while it is running;
+- lets the operator expand every successful result from its info button to inspect the forward and
+  return paths, intermediate node names/short names, per-hop SNR, and response time;
+- offers **Retry failed** when complete, creating a new sequential campaign containing only the
+  source/node pairs that ended in timeout or error. Successful and skipped attempts are not sent
+  again.
+
+The default recent-history window is 24 hours, the response timeout is 75 seconds, and the pause
+between attempts is 5 seconds. All three values can be changed before starting. When a selected
+target is the local node of one source, only that source/target attempt is skipped.
+
+Campaigns run in the server process and remain active when the operator returns to the map or
+navigates elsewhere. Reopening the page resumes its live status. Only one campaign can run at a
+time, preventing two operators from interleaving bursts across the same radios. The most recent
+campaign state is kept in memory for live UI inspection; it is not retained across a MeshMonitor
+restart.
+
+For the lifetime of a campaign, each selected source is reserved for its campaign traceroutes.
+Automatic traceroutes and Automation Engine traceroute actions on those sources skip their turn;
+manual traceroute API requests receive HTTP `409` with code `TRACEROUTE_CAMPAIGN_ACTIVE`. Other
+packet types and unselected sources continue to work normally. Reservations are released after
+completion or cancellation.
+
+The session API used by the Unified UI is:
+
+```text
+POST /api/traceroute-campaigns
+GET  /api/traceroute-campaigns/active
+GET  /api/traceroute-campaigns/latest
+GET  /api/traceroute-campaigns/{campaignId}
+POST /api/traceroute-campaigns/{campaignId}/retry
+POST /api/traceroute-campaigns/{campaignId}/cancel
+```
+
+Starting a campaign requires `traceroute:write` permission on every selected source.
+Retrying requires the same permission on every source represented by a failed attempt.
+
 ## Virtual Node
 
 Virtual Node is a MeshMonitor feature that lets mobile Meshtastic apps connect *through* MeshMonitor instead of directly to the node. In 4.0 it is **per-source**.
