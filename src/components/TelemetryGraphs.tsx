@@ -1091,12 +1091,6 @@ const TelemetryGraphs: React.FC<TelemetryGraphsProps> = React.memo(
       sectionedData.push({ category: cat, entries });
     }
 
-    // Sub-hour windows (e.g. the 15-minute preset) read awkwardly as
-    // fractional hours, so render those with a minutes-based title instead.
-    const titleText = effectiveHours < 1
-      ? t('telemetry.title_minutes', { count: Math.round(effectiveHours * 60) })
-      : t('telemetry.title', { count: effectiveHours });
-
     return (
       <div className="telemetry-graphs">
         <div className="telemetry-graphs-header">

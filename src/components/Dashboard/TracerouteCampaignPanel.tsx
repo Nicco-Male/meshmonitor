@@ -461,7 +461,7 @@ export default function TracerouteCampaignPanel({
                         <span className="traceroute-campaign-job-icon"><UiIcon name="timer" size={15} /></span>
                         <span className="traceroute-campaign-job-source">
                           <strong>{label.sourceName}</strong>
-                          <small>→ {label.targetName}</small>
+                          <small>{label.targetName}</small>
                         </span>
                         <span className="traceroute-campaign-job-status">
                           <strong>#{index + 1} · {schedulerPriorityLabel(entry.priority)}</strong>
