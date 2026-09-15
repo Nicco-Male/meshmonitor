@@ -1,6 +1,6 @@
 # Inventario custom MeshMonitor — blocco 1
 
-Verifica del 15 settembre 2026. Nessuna patch applicata al codice in questo blocco.
+Inventario storico fissato nel blocco 1 il 15 settembre 2026. Stato del porting aggiornato al blocco 2; le classificazioni descrivono il confronto iniziale, non il tree corrente.
 
 | Riferimento | SHA |
 | --- | --- |
@@ -43,14 +43,14 @@ Per ogni percorso, confrontare i blob delle tre revisioni con `git ls-tree` e il
 
 | ID | File | Decisione | Blocchi | Sovrapposizioni testuali | Azione |
 | --- | --- | --- | --- | ---: | --- |
-| C001 | `docs/features/automation-engine.md` | ADATTARE | 2 | 0 | Documentare coda, priorità e serializzazione senza perdere le nuove funzionalità del motore upstream. |
-| C054 | `src/server/meshtasticManager.tracerouteScheduler.test.ts` | PORTARE | 2, 3 | — | Estendere i test upstream dell’autotrace con le esclusioni per coda occupata e campagne. |
-| C055 | `src/server/meshtasticManager.ts` | ADATTARE | 2, 3 | 0 | Portare solo gli agganci scheduler/campagne. Conservare getConfiguredHopLimit, servizi Admin, macchina a stati e gli aggiornamenti upstream. |
-| C064 | `src/server/routes/tracerouteRoutes.ts` | ADATTARE | 2 | 1 | Aggiungere stato della coda preservando route di partecipazione, permessi e filtri di canale upstream; riesaminare lo scope dei dati restituiti. |
-| C067 | `src/server/services/automation/meshActionDeps.test.ts` | ADATTARE | 2 | 0 | Passare la priorità automation allo scheduler preservando adattatore e comportamento delle altre azioni. |
-| C068 | `src/server/services/automation/meshActionDeps.ts` | ADATTARE | 2 | 0 | Passare la priorità automation allo scheduler preservando adattatore e comportamento delle altre azioni. |
-| C078 | `src/server/services/tracerouteRequestScheduler.test.ts` | PORTARE | 2 | — | Aggiungere coda globale, deduplica, priorità, cooldown e rilascio su risposta/timeout. Il vecchio codice serializza tutte le sorgenti insieme; non dispone ancora di domini RF separati. |
-| C079 | `src/server/services/tracerouteRequestScheduler.ts` | PORTARE | 2 | — | Aggiungere coda globale, deduplica, priorità, cooldown e rilascio su risposta/timeout. Il vecchio codice serializza tutte le sorgenti insieme; non dispone ancora di domini RF separati. |
+| C001 | `docs/features/automation-engine.md` | ADATTARE | 2 | 0 | **Blocco 2 completato.** Documentare coda, priorità e serializzazione senza perdere le nuove funzionalità del motore upstream. |
+| C054 | `src/server/meshtasticManager.tracerouteScheduler.test.ts` | PORTARE | 2, 3 | — | **Blocco 2 completato; agganci campagne al blocco 3.** Estendere i test upstream dell’autotrace con le esclusioni per coda occupata e campagne. |
+| C055 | `src/server/meshtasticManager.ts` | ADATTARE | 2, 3 | 0 | **Blocco 2 completato; agganci campagne al blocco 3.** Portare solo gli agganci scheduler/campagne. Conservare getConfiguredHopLimit, servizi Admin, macchina a stati e gli aggiornamenti upstream. |
+| C064 | `src/server/routes/tracerouteRoutes.ts` | ADATTARE | 2 | 1 | **Blocco 2 completato.** Aggiungere stato della coda preservando route di partecipazione, permessi e filtri di canale upstream; riesaminare lo scope dei dati restituiti. |
+| C067 | `src/server/services/automation/meshActionDeps.test.ts` | ADATTARE | 2 | 0 | **Blocco 2 completato.** Passare la priorità automation allo scheduler preservando adattatore e comportamento delle altre azioni. |
+| C068 | `src/server/services/automation/meshActionDeps.ts` | ADATTARE | 2 | 0 | **Blocco 2 completato.** Passare la priorità automation allo scheduler preservando adattatore e comportamento delle altre azioni. |
+| C078 | `src/server/services/tracerouteRequestScheduler.test.ts` | PORTARE | 2 | — | **Blocco 2 completato.** Aggiungere coda globale, deduplica, priorità, cooldown e rilascio su risposta/timeout. Il vecchio codice serializza tutte le sorgenti insieme; non dispone ancora di domini RF separati. |
+| C079 | `src/server/services/tracerouteRequestScheduler.ts` | PORTARE | 2 | — | **Blocco 2 completato.** Aggiungere coda globale, deduplica, priorità, cooldown e rilascio su risposta/timeout. Il vecchio codice serializza tutte le sorgenti insieme; non dispone ancora di domini RF separati. |
 
 ## Blocco 3 — Campagne backend e dati necessari (11 file)
 
@@ -161,3 +161,9 @@ Per ogni percorso, confrontare i blob delle tre revisioni con `git ls-tree` e il
 | C072 | `src/server/services/nodeInfoEnrichment.hwModelUnset.test.ts` | COPERTO | 8 | 1 | La correzione hwModel=0/HardwareModel.UNSET è inclusa in upstream #5198 (b8cf622d). Mantenere anche verifica di persistenza e canale del target; validare con la suite upstream. |
 | C073 | `src/server/services/nodeInfoEnrichmentService.ts` | COPERTO | 8 | 2 | La correzione hwModel=0/HardwareModel.UNSET è inclusa in upstream #5198 (b8cf622d). Mantenere anche verifica di persistenza e canale del target; validare con la suite upstream. |
 | C080 | `src/services/database.ts` | ADATTARE | 8 | 1 | Uniformare inserimento/aggiornamento/pruning delle risposte in orientamento requester→responder senza perdere routePositions, scope e refactoring della facade upstream. |
+
+## Aggiunte e adattamenti del blocco 2
+
+Gli otto file del blocco 2 sono reintegrati per la parte scheduler; C054/C055 conservano lavoro per le campagne nel blocco 3. Aggiunto `src/server/routes/tracerouteRoutes.scheduler.perSource.test.ts` per verificare auth reale, scope e visibilità dei canali. Il test custom duplicato dell'adattatore automation non è stato copiato: l'asserzione già presente verifica il terzo argomento `automation`, e i test del manager verificano la serializzazione effettiva tra sorgenti.
+
+Rispetto al backup, il nuovo endpoint stato richiede una sorgente e usa l'envelope upstream; l'autoresponder avvia il timeout dopo l'invio. [Rapporto del blocco 2](custom-integration-block2.md).

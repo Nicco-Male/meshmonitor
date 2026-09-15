@@ -32,6 +32,7 @@ import { channelDecryptionService } from './services/channelDecryptionService.js
 import { pkiDecryptionService } from './services/pkiDecryptionService.js';
 import { getSourcePkiKeyStore, isPkiDmDecryptionGloballyEnabled } from './services/sourcePkiKeyStore.js';
 import { dataEventEmitter } from './services/dataEventEmitter.js';
+import { tracerouteRequestScheduler, type TracerouteRequestPriority } from './services/tracerouteRequestScheduler.js';
 import {
   ToastThrottle,
   shouldSuppressToast,
@@ -946,7 +947,7 @@ class MeshtasticManager implements ISourceManager {
     isDM: boolean;
     replyChannel: number;
     packetId?: number;
-    timeoutHandle: NodeJS.Timeout;
+    timeoutHandle?: NodeJS.Timeout;
   }> = new Map(); // Track user-initiated traceroutes from the autoresponder
   private pendingTracerouteTimestamps: Map<number, number> = new Map(); // Track when traceroutes were initiated for timeout detection
 
@@ -2227,6 +2228,7 @@ class MeshtasticManager implements ISourceManager {
 
   private async handleDisconnected(): Promise<void> {
     logger.debug('TCP connection lost');
+    tracerouteRequestScheduler.cancelPendingForSource(this.sourceId);
 
     // Losing the link mid-sync means the whole NodeDB stream restarts from
     // scratch on reconnect, so on a large mesh it can loop forever without ever
@@ -2477,6 +2479,7 @@ class MeshtasticManager implements ISourceManager {
 
   disconnect(): void {
     this.isConnected = false;
+    tracerouteRequestScheduler.cancelPendingForSource(this.sourceId);
     // Cancel any pending config-complete fallback timer (#3962 Phase 4.2b C2
     // leak fix) — this method isn't routed through dispatch(), but it's
     // still an exit from ConfigSync/Connected and must not leave a stale
@@ -2589,6 +2592,11 @@ class MeshtasticManager implements ISourceManager {
 
     // The traceroute execution logic
     const executeTraceroute = async () => {
+      if (tracerouteRequestScheduler.hasPendingForSource(this.sourceId)) {
+        logger.debug('🗺️ Auto-traceroute: Skipping - this source already has an active or queued traceroute');
+        return;
+      }
+
       // TX-disabled radios cannot send OTA traceroutes; skip quietly and let the
       // interval keep running so a later TX re-enable resumes automatically (#4294).
       if (!this.canTransmit()) {
@@ -2635,10 +2643,19 @@ class MeshtasticManager implements ISourceManager {
             // Log the auto-traceroute attempt to database
             await databaseService.logAutoTracerouteAttemptAsync(targetNode.nodeNum, targetName, this.sourceId);
             this.pendingAutoTraceroutes.add(targetNode.nodeNum);
-            this.pendingTracerouteTimestamps.set(targetNode.nodeNum, Date.now());
-
+            try {
+              await this.sendTraceroute(targetNode.nodeNum, channel, 'automatic');
+            } catch (error) {
+              this.pendingAutoTraceroutes.delete(targetNode.nodeNum);
+              this.pendingTracerouteTimestamps.delete(targetNode.nodeNum);
+              throw error;
+            }
             this.lastTracerouteSentTime = Date.now();
-            await this.sendTraceroute(targetNode.nodeNum, channel);
+            // Time spent queued behind other sources is not response time.
+            // A very fast response may already have cleared the pending entry.
+            if (this.pendingAutoTraceroutes.has(targetNode.nodeNum)) {
+              this.pendingTracerouteTimestamps.set(targetNode.nodeNum, Date.now());
+            }
 
             // Check for timed-out traceroutes (> 5 minutes old)
             this.checkTracerouteTimeouts();
@@ -10125,7 +10142,39 @@ class MeshtasticManager implements ISourceManager {
     }
   }
 
-  async sendTraceroute(destination: number, channel: number = 0): Promise<void> {
+  async sendTraceroute(
+    destination: number,
+    channel: number = 0,
+    priority: TracerouteRequestPriority = 'manual',
+  ): Promise<void> {
+    // Fail immediately for an unavailable source, and recheck at dispatch
+    // below because connectivity and TX configuration can change in the queue.
+    if (!this.isConnected || !this.transport) {
+      throw new Error('Not connected to Meshtastic node');
+    }
+    if (!this.canTransmit()) {
+      throw new TxDisabledError();
+    }
+    if (!this.localNodeInfo) {
+      throw new Error('Local node information not available');
+    }
+
+    const localNodeNum = this.localNodeInfo.nodeNum;
+    const transport = this.transport;
+    await tracerouteRequestScheduler.enqueue({
+      sourceId: this.sourceId,
+      localNodeNum,
+      destination,
+      channel,
+      priority,
+      shouldDispatch: () => this.isConnected
+        && this.transport === transport
+        && this.localNodeInfo?.nodeNum === localNodeNum,
+      send: () => this.sendTraceroutePacket(destination, channel),
+    });
+  }
+
+  private async sendTraceroutePacket(destination: number, channel: number): Promise<void> {
     if (!this.isConnected || !this.transport) {
       throw new Error('Not connected to Meshtastic node');
     }
@@ -12084,11 +12133,25 @@ class MeshtasticManager implements ISourceManager {
               1
             );
 
-            // Set up 75-second timeout to reply if no response arrives
-            const TRACEROUTE_TIMEOUT_MS = 75000;
-            const timeoutHandle = setTimeout(() => {
+            // Register before enqueueing so duplicates and very fast responses
+            // are handled, but start the response timeout only after dispatch.
+            const pendingTrace: {
+              replyToNodeNum: number;
+              isDM: boolean;
+              replyChannel: number;
+              packetId?: number;
+              timeoutHandle?: NodeJS.Timeout;
+            } = {
+              replyToNodeNum: message.fromNodeNum,
+              isDM: isDirectMessage,
+              replyChannel: isDirectMessage ? -1 : (message.channel as number),
+              packetId,
+            };
+            this.pendingAutoresponderTraceroutes.set(targetNodeNum, pendingTrace);
+
+            const onTraceTimeout = () => {
               const pending = this.pendingAutoresponderTraceroutes.get(targetNodeNum);
-              if (!pending) return;
+              if (pending !== pendingTrace) return;
               this.pendingAutoresponderTraceroutes.delete(targetNodeNum);
               const timeoutMsg = `${targetName.substring(0, 15)} did not respond within timeout`;
               this.messageQueue.enqueue(
@@ -12100,16 +12163,7 @@ class MeshtasticManager implements ISourceManager {
                 pending.isDM ? undefined : pending.replyChannel,
                 1
               );
-            }, TRACEROUTE_TIMEOUT_MS);
-
-            // Register the pending traceroute so the result handler can reply
-            this.pendingAutoresponderTraceroutes.set(targetNodeNum, {
-              replyToNodeNum: message.fromNodeNum,
-              isDM: isDirectMessage,
-              replyChannel: isDirectMessage ? -1 : (message.channel as number),
-              packetId,
-              timeoutHandle,
-            });
+            };
 
             // Send the actual traceroute packet
             try {
@@ -12117,7 +12171,10 @@ class MeshtasticManager implements ISourceManager {
               // decrypt and relay, rather than the target's raw stored channel
               // (which may be a private secondary) — issues #3696, #4691.
               const channel = await resolveBroadcastChannel(this, databaseService);
-              await this.sendTraceroute(targetNodeNum, channel);
+              await this.sendTraceroute(targetNodeNum, channel, 'automation');
+              if (this.pendingAutoresponderTraceroutes.get(targetNodeNum) === pendingTrace) {
+                pendingTrace.timeoutHandle = setTimeout(onTraceTimeout, 75_000);
+              }
               logger.debug(`🔍 Auto-responder traceroute to ${targetName} (${targetNode.nodeId}) initiated by ${nodeId}`);
 
               // Record cooldown timestamp
@@ -12127,7 +12184,7 @@ class MeshtasticManager implements ISourceManager {
               }
             } catch (error: any) {
               logger.error(`❌ Auto-responder traceroute to ${targetName} failed: ${error.message}`);
-              clearTimeout(timeoutHandle);
+              clearTimeout(pendingTrace.timeoutHandle);
               this.pendingAutoresponderTraceroutes.delete(targetNodeNum);
               const errMsg = `Failed to traceroute: ${error.message?.substring(0, 30)}`;
               this.messageQueue.enqueue(

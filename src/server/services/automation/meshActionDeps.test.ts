@@ -232,7 +232,7 @@ describe('createMeshActionDeps requestData — node operations (#3835)', () => {
     expect(m.sendPositionRequest).toHaveBeenCalledWith(123, 0);
 
     await deps.requestData({ sourceId: 'mt', op: 'traceroute', target: '123', channel: 1 });
-    expect(m.sendTraceroute).toHaveBeenCalledWith(123, 1);
+    expect(m.sendTraceroute).toHaveBeenCalledWith(123, 1, 'automation');
 
     await deps.requestData({ sourceId: 'mt', op: 'nodeinfo', target: '123', channel: 0 });
     expect(m.sendNodeInfoRequest).toHaveBeenCalledWith(123, 0);

@@ -413,6 +413,18 @@ Asks a node to report data — the automation equivalent of the manual request b
 - **Channel #** *(advanced; Meshtastic only)* — which channel to send the request on (e.g. a private
   sensor channel); ignored by MeshCore.
 
+Meshtastic traceroutes from manual requests, the Automation Engine, legacy Auto Responder,
+and automatic tracing share one queue across all sources. Only one traceroute is active at
+a time; the next waits for its response or a 75-second timeout, followed by a 5-second pause.
+Manual requests take priority over queued automation requests, which take priority over
+automatic tracing. Requests at the same priority keep their arrival order; duplicate requests
+for the same source, local node, destination and channel share one transmission.
+
+A request action completes once its request has been transmitted, so completion does not
+mean that a route was found. Time spent waiting in the queue can delay the action. Automatic
+tracing skips a source that already has a queued or active traceroute. Disconnecting a source
+cancels its unsent requests; a transmitted request keeps the shared slot until response or timeout.
+
 ### Send a notification (Apprise)
 
 Dispatches an out-of-band notification through [Apprise](/features/notifications) with a `Title`,

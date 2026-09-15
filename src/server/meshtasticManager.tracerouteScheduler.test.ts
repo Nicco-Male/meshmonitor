@@ -20,6 +20,7 @@ vi.mock('../services/database.js', () => ({
     logAutoTracerouteAttemptAsync: mockLogAutoTracerouteAttemptAsync,
     updateAutoTracerouteResultByNodeAsync: mockUpdateAutoTracerouteResultByNodeAsync,
     recordTracerouteRequest: mockRecordTracerouteRequest,
+    recordTracerouteRequestAsync: mockRecordTracerouteRequest,
     findUserByIdAsync: mockFindUserByIdAsync,
     findUserByUsernameAsync: mockFindUserByUsernameAsync,
     checkPermissionAsync: mockCheckPermissionAsync,
@@ -93,6 +94,7 @@ vi.mock('./meshtasticProtobufService.js', () => ({
   default: {
     initialize: vi.fn(),
     createMeshPacket: vi.fn(),
+    createTracerouteMessage: vi.fn(() => new Uint8Array([1, 2, 3])),
   },
 }));
 
@@ -137,6 +139,7 @@ vi.mock('./services/serverEventNotificationService.js', () => ({
 vi.mock('./services/packetLogService.js', () => ({
   default: {
     logPacket: vi.fn(),
+    isEnabled: vi.fn().mockResolvedValue(false),
   },
 }));
 
@@ -188,17 +191,24 @@ vi.mock('./config/environment.js', () => ({
 }));
 
 vi.mock('../utils/autoResponderUtils.js', () => ({
-  normalizeTriggerPatterns: vi.fn(),
+  normalizeTriggerPatterns: vi.fn((trigger: string) => [trigger]),
+  normalizeTriggerChannels: vi.fn(() => [0]),
 }));
 
 vi.mock('../utils/nodeHelpers.js', () => ({
   isNodeComplete: vi.fn(),
 }));
 
+import { tracerouteRequestScheduler } from './services/tracerouteRequestScheduler.js';
+
 const mockTargetNode = {
   nodeNum: 99999,
   nodeId: '!00099999',
   longName: 'Target Node',
+  shortName: 'TARG',
+  hwModel: 0,
+  createdAt: 0,
+  updatedAt: 0,
   channel: 0,
 };
 
@@ -227,6 +237,11 @@ describe('MeshtasticManager - Traceroute Scheduler', () => {
 
     // Reset rate limiting timestamp
     manager.lastTracerouteSentTime = 0;
+    manager.pendingAutoTraceroutes.clear();
+    manager.pendingTracerouteTimestamps.clear();
+    manager.pendingAutoresponderTraceroutes.clear();
+    manager.autoResponderProcessedPackets.clear();
+    mockGetSetting.mockResolvedValue(null);
 
     // Mock sendTraceroute to avoid actually sending
     manager.sendTraceroute = vi.fn().mockResolvedValue(undefined);
@@ -260,6 +275,65 @@ describe('MeshtasticManager - Traceroute Scheduler', () => {
     const fn = manager['startTracerouteScheduler'].bind(manager);
     fn();
   }
+
+  it('skips an automatic trace when the shared arbiter already has work for this source', async () => {
+    vi.spyOn(tracerouteRequestScheduler, 'hasPendingForSource').mockReturnValue(true);
+    startScheduler(1);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(manager.sendTraceroute).not.toHaveBeenCalled();
+    expect(mockGetNodeNeedingTracerouteAsync).not.toHaveBeenCalled();
+  });
+
+  it('submits automatic priority and starts response/rate-limit clocks only after dispatch', async () => {
+    let dispatched!: () => void;
+    manager.sendTraceroute.mockImplementation(() => new Promise<void>(resolve => { dispatched = resolve; }));
+    startScheduler(1);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(manager.sendTraceroute).toHaveBeenCalledWith(mockTargetNode.nodeNum, 0, 'automatic');
+    expect(manager.lastTracerouteSentTime).toBe(0);
+    expect(manager.pendingTracerouteTimestamps.has(mockTargetNode.nodeNum)).toBe(false);
+    // Stop periodic submissions while this mocked dispatch remains queued.
+    startScheduler(0);
+    await vi.advanceTimersByTimeAsync(120_000);
+    dispatched();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(manager.lastTracerouteSentTime).toBe(Date.now());
+    expect(manager.pendingTracerouteTimestamps.get(mockTargetNode.nodeNum)).toBe(Date.now());
+  });
+
+  it('removes automatic timeout tracking if a queued send fails or is cancelled', async () => {
+    manager.sendTraceroute.mockRejectedValue(new Error('source disconnected'));
+    startScheduler(1);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(manager.pendingAutoTraceroutes.has(mockTargetNode.nodeNum)).toBe(false);
+    expect(manager.pendingTracerouteTimestamps.has(mockTargetNode.nodeNum)).toBe(false);
+    expect(manager.lastTracerouteSentTime).toBe(0);
+  });
+
+  it('gives a legacy Auto Responder its full 75 seconds after queued dispatch', async () => {
+    const database = (await import('../services/database.js')).default;
+    vi.mocked(database.nodes.getAllNodes).mockResolvedValue([mockTargetNode]);
+    const settings: Record<string, string> = {
+      autoResponderEnabled: 'true',
+      autoResponderTriggers: JSON.stringify([{ trigger: 'trace', responseType: 'traceroute', response: '99999', channel: 0 }]),
+    };
+    mockGetSetting.mockImplementation((key: string) => Promise.resolve(settings[key] ?? null));
+    manager.actualDeviceConfig = { lora: { txEnabled: true } };
+    let dispatched!: () => void;
+    manager.sendTraceroute.mockImplementation(() => new Promise<void>(resolve => { dispatched = resolve; }));
+    const run = manager.checkAutoResponder({ text: 'trace', fromNodeNum: 99, channel: 0 }, false, 444);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(manager.sendTraceroute).toHaveBeenCalledWith(mockTargetNode.nodeNum, 0, 'automation');
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(manager.pendingAutoresponderTraceroutes.has(mockTargetNode.nodeNum)).toBe(true);
+    expect(manager.pendingAutoresponderTraceroutes.get(mockTargetNode.nodeNum).timeoutHandle).toBeUndefined();
+    dispatched();
+    await run;
+    await vi.advanceTimersByTimeAsync(74_999);
+    expect(manager.pendingAutoresponderTraceroutes.has(mockTargetNode.nodeNum)).toBe(true);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(manager.pendingAutoresponderTraceroutes.has(mockTargetNode.nodeNum)).toBe(false);
+  });
 
   describe('Timer leak prevention', () => {
     it('should clear pending jitter timeout when scheduler is restarted', async () => {
@@ -459,5 +533,115 @@ describe('MeshtasticManager - Traceroute Scheduler', () => {
       expect(manager.sendTraceroute).not.toHaveBeenCalled();
       expect(logger.error).not.toHaveBeenCalled();
     });
+  });
+});
+
+describe('MeshtasticManager — shared dispatch across sources', () => {
+  type Manager = import('./meshtasticManager.js').MeshtasticManager;
+  type State = {
+    isConnected: boolean;
+    actualDeviceConfig: { lora: { txEnabled: boolean } };
+    localNodeInfo: { nodeNum: number; nodeId: string };
+    transport: { send: ReturnType<typeof vi.fn>; disconnect: ReturnType<typeof vi.fn> };
+    startTracerouteScheduler: () => void;
+    tracerouteIntervalMinutes: number;
+  };
+  let first: Manager;
+  let second: Manager;
+  let firstState: State;
+  let secondState: State;
+
+  beforeEach(async () => {
+    vi.useFakeTimers();
+    vi.clearAllMocks();
+    mockGetSetting.mockResolvedValue(null);
+    const { MeshtasticManager } = await import('./meshtasticManager.js');
+    first = new MeshtasticManager('source-a', { host: '127.0.0.1', port: 4403 });
+    second = new MeshtasticManager('source-b', { host: '127.0.0.1', port: 4403 });
+    firstState = first as unknown as State;
+    secondState = second as unknown as State;
+    for (const [state, nodeNum] of [[firstState, 1], [secondState, 2]] as const) {
+      state.isConnected = true;
+      state.localNodeInfo = { nodeNum, nodeId: `!${nodeNum}` };
+      state.actualDeviceConfig = { lora: { txEnabled: true } };
+      state.transport = { send: vi.fn().mockResolvedValue(undefined), disconnect: vi.fn() };
+    }
+  });
+
+  function completeActive() {
+    const active = tracerouteRequestScheduler.getStatus().active;
+    if (active) {
+      tracerouteRequestScheduler.handleDataEvent({
+        type: 'traceroute:complete', sourceId: active.sourceId, timestamp: Date.now(),
+        data: { fromNodeNum: active.destination, toNodeNum: active.localNodeNum, channel: active.channel },
+      });
+    }
+  }
+
+  afterEach(async () => {
+    completeActive();
+    await vi.advanceTimersByTimeAsync(5_000);
+    vi.clearAllTimers();
+    vi.restoreAllMocks();
+    vi.useRealTimers();
+  });
+
+  it('serializes real manager send paths, deduplicates and preserves source-scoped recording', async () => {
+    await first.sendTraceroute(10, 0);
+    const pending = second.sendTraceroute(20, 1, 'automation');
+    const duplicate = second.sendTraceroute(20, 1, 'automation');
+    expect(firstState.transport.send).toHaveBeenCalledTimes(1);
+    expect(secondState.transport.send).not.toHaveBeenCalled();
+    expect(tracerouteRequestScheduler.getStatus()).toMatchObject({
+      active: { sourceId: 'source-a', priority: 'manual' },
+      queue: [{ sourceId: 'source-b', priority: 'automation' }],
+    });
+    completeActive();
+    await vi.advanceTimersByTimeAsync(4_999);
+    expect(secondState.transport.send).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    await Promise.all([pending, duplicate]);
+    expect(secondState.transport.send).toHaveBeenCalledTimes(1);
+    expect(mockRecordTracerouteRequest).toHaveBeenCalledWith(1, 10, 'source-a');
+    expect(mockRecordTracerouteRequest).toHaveBeenCalledWith(2, 20, 'source-b');
+  });
+
+  it('rechecks TX permission when a waiting trace reaches dispatch', async () => {
+    await first.sendTraceroute(10);
+    const pending = expect(second.sendTraceroute(20)).rejects.toMatchObject({ code: 'TX_DISABLED' });
+    secondState.actualDeviceConfig.lora.txEnabled = false;
+    completeActive();
+    await vi.advanceTimersByTimeAsync(5_000);
+    await pending;
+    expect(secondState.transport.send).not.toHaveBeenCalled();
+    expect(tracerouteRequestScheduler.getStatus().active).toBeNull();
+  });
+
+  it('cancels queued work on disconnect without releasing another source or replaying it on reconnect', async () => {
+    await first.sendTraceroute(10);
+    const send = secondState.transport.send;
+    const pending = expect(second.sendTraceroute(20)).rejects.toMatchObject({ code: 'TRACEROUTE_REQUEST_CANCELLED' });
+    second.disconnect();
+    await pending;
+    expect(tracerouteRequestScheduler.getStatus().active?.sourceId).toBe('source-a');
+    expect(tracerouteRequestScheduler.hasPendingForSource('source-b')).toBe(false);
+    secondState.isConnected = true;
+    completeActive();
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it('does not reset an active RF slot when automatic tracing is restarted or disabled', async () => {
+    await first.sendTraceroute(10);
+    const pending = second.sendTraceroute(20);
+    firstState.tracerouteIntervalMinutes = 1;
+    firstState.startTracerouteScheduler();
+    firstState.tracerouteIntervalMinutes = 0;
+    firstState.startTracerouteScheduler();
+    await vi.advanceTimersByTimeAsync(74_999);
+    expect(secondState.transport.send).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(5_001);
+    await pending;
+    expect(secondState.transport.send).toHaveBeenCalledTimes(1);
   });
 });

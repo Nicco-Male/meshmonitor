@@ -8,8 +8,32 @@ import { ok, fail } from '../utils/apiResponse.js';
 import { maskTraceroutesByChannel } from '../utils/nodeEnhancer.js';
 import { hasRouteData, parseHopArray } from '../../utils/tracerouteSegments.js';
 import { getMaxNodeAgeHours } from '../services/nodeDisplaySettings.js';
+import { tracerouteRequestScheduler } from '../services/tracerouteRequestScheduler.js';
 
 const router = Router();
+
+// The arbiter is global, but queue details follow the same per-source and
+// channel visibility rules as stored traceroutes. No implicit all-source view.
+router.get('/scheduler/status', requirePermission('traceroute', 'read', { sourceIdFrom: 'query' }), async (req: Request, res: Response) => {
+  const sourceId = typeof req.query.sourceId === 'string' ? req.query.sourceId.trim() : '';
+  if (!sourceId) {
+    return fail(res, 400, 'MISSING_SOURCE_ID', 'sourceId query parameter is required');
+  }
+  try {
+    const status = tracerouteRequestScheduler.getStatus(sourceId);
+    const visible = await maskTraceroutesByChannel(
+      [...(status.active ? [status.active] : []), ...status.queue], req.user, sourceId,
+    );
+    return ok(res, {
+      ...status,
+      active: status.active && visible.includes(status.active) ? status.active : null,
+      queue: status.queue.filter(entry => visible.includes(entry)),
+    });
+  } catch (error) {
+    logger.error('Error fetching traceroute scheduler status:', error);
+    return fail(res, 500, 'TRACEROUTE_SCHEDULER_STATUS_FAILED', 'Failed to fetch traceroute scheduler status');
+  }
+});
 
 router.get('/recent', async (req: Request, res: Response) => {
   try {
