@@ -259,4 +259,36 @@ describe('TracerouteRequestScheduler', () => {
     await pending;
     expect(scheduler.hasPendingForSource('source-a')).toBe(false);
   });
+  it('aborts only the owning queued job, even with an ordinary request for the same target', async () => {
+    const scheduler = new TracerouteRequestScheduler(0, 75_000);
+    await scheduler.enqueue(request(10));
+    const controller = new AbortController();
+    const campaign = request(20);
+    const aborted = expect(scheduler.enqueue({ ...campaign, priority: 'campaign', signal: controller.signal }))
+      .rejects.toMatchObject({ code: 'TRACEROUTE_REQUEST_CANCELLED' });
+    const ordinary = request(20);
+    const pending = scheduler.enqueue(ordinary);
+    controller.abort();
+    await aborted;
+    expect(scheduler.getStatus()).toMatchObject({ active: { destination: 10 }, queue: [{ destination: 20, priority: 'manual' }] });
+    complete(scheduler, 10);
+    await pending;
+    expect(ordinary.send).toHaveBeenCalledOnce();
+    expect(campaign.send).not.toHaveBeenCalled();
+  });
+
+  it('keeps an already sent request active after abort and rejects pre-aborted work', async () => {
+    const scheduler = new TracerouteRequestScheduler(0, 75_000);
+    const controller = new AbortController();
+    await scheduler.enqueue({ ...request(10), signal: controller.signal });
+    controller.abort();
+    expect(scheduler.getStatus().active?.destination).toBe(10);
+    const cancelled = request(20);
+    await expect(scheduler.enqueue({ ...cancelled, signal: controller.signal }))
+      .rejects.toMatchObject({ code: 'TRACEROUTE_REQUEST_CANCELLED' });
+    expect(cancelled.send).not.toHaveBeenCalled();
+    complete(scheduler, 10);
+    expect(scheduler.getStatus().active).toBeNull();
+  });
+
 });

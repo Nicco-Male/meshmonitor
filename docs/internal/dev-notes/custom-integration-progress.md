@@ -1,8 +1,8 @@
-# MeshMonitor custom integration — checkpoint del blocco 2
+# MeshMonitor custom integration — checkpoint del blocco 3
 
-Aggiornato il 15 settembre 2026. **Blocchi 1–2 completati; blocchi 3–9 da eseguire.**
+Aggiornato il 16 settembre 2026. **Blocchi 1–3 completati; blocchi 4–9 da eseguire.**
 
-L'utente ha richiesto una sessione per blocco, in base ai token disponibili. Il blocco 2 reintegra lo scheduler centrale sulla base preparata nel blocco 1. Le campagne arrivano nei blocchi 3–4; `main` sarà aggiornato soltanto nel blocco 9.
+L'utente ha richiesto una sessione per blocco, in base ai token disponibili. Il blocco 3 aggiunge il backend delle campagne allo scheduler del blocco 2. La UI arriva nel blocco 4; `main` sarà aggiornato soltanto nel blocco 9.
 
 ## Riferimenti fissati
 
@@ -37,7 +37,11 @@ git log --diff-filter=A --format=%H -- docs/internal/dev-notes/custom-integratio
 
 ## Blocco 2 completato
 
-Scheduler condiviso, agganci nel manager, priorità manual/automation/automatic, cancellazione delle richieste non inviate alla disconnessione e API dello stato con permessi per sorgente/canale. I tipi campaign/retry sono pronti; il coordinator e le campagne non sono ancora reintegrati. [Dettagli, verifiche e contratto API](custom-integration-block2.md).
+Scheduler condiviso, agganci nel manager, priorità manual/automation/automatic, cancellazione delle richieste non inviate alla disconnessione e API dello stato con permessi per sorgente/canale. Il checkpoint pubblicato del blocco 2 è `2a4ef391098dc96e682768465b0f186064be1169`; il successivo blocco 3 integra coordinator e backend campagne. [Dettagli, verifiche e contratto API](custom-integration-block2.md).
+
+## Blocco 3 completato
+
+Servizio e API campagne, sequenza multi-source, ordinamento per successi recenti, stop per target, retry fallimenti, riserve sorgenti, cancellazione della coda e integrazione con automazioni. Query con scope sorgente/canale e permessi rivalutati anche al dispatch. **496 test superati**, build client/server, lint e tipi dei file interessati verificati; servizi Remote Admin preservati. [Dettagli, API per la UI e limiti](custom-integration-block3.md).
 
 ## Stato dei blocchi
 
@@ -45,8 +49,8 @@ Scheduler condiviso, agganci nel manager, priorità manual/automation/automatic,
 | --- | --- | --- |
 | 1 | Base, inventario e baseline | Completato |
 | 2 | Scheduler centrale e agganci trace | Completato |
-| 3 | Campagne backend e query necessarie | Da eseguire — prossimo |
-| 4 | UI campagne e nuova scheda | Da eseguire |
+| 3 | Campagne backend e query necessarie | Completato |
+| 4 | UI campagne e nuova scheda | Da eseguire — prossimo |
 | 5 | Percorsi, snapshot, movimento, TTL e popup | Da eseguire |
 | 6 | Ruoli, marker mobili/fissi e mappe di base | Da eseguire |
 | 7 | Report telemetria, filtri, refresh, etichette | Da eseguire |
@@ -61,20 +65,20 @@ Scheduler condiviso, agganci nel manager, priorità manual/automation/automatic,
 4. Concludere ogni blocco con verifiche pertinenti, commit e checkpoint pubblicato sul ramo di integrazione. Registrare problemi preesistenti, copertura effettiva e prossimo passo; non allargare il lint baseline per nascondere nuovi errori.
 5. Promuovere a `main` soltanto il risultato completo e validato del blocco 9. Se il main remoto avanza, riesaminare lo stato; nessun force push/reset distruttivo senza conferma dell'utente.
 
-## Prossima sessione: blocco 3
+## Prossima sessione: blocco 4
 
-**Obiettivo:** recuperare il backend delle campagne sullo scheduler già reintegrato.
+**Obiettivo:** recuperare la pagina campagne e l'accesso dal dashboard, usando il backend già verificato.
 
 | Ordine | Operazione |
 | --- | --- |
-| A | Verificare HEAD remoto del ramo di integrazione, checkout pulito, questo registro, rapporto del blocco 2 e inventario. Conservare la base upstream fissata. |
-| B | Portare tipi, coordinator e service delle campagne dal delta storico; integrare la query `getLatestSuccessfulTracerouteByNodes` con scope sorgente nel repository traceroutes. |
-| C | Aggiungere riserva/rilascio delle sorgenti e `sendCampaignTraceroute` usando lo scheduler centrale, con guardia di cancellazione e timeout per richiesta. Non bypassare i controlli di connessione/TX già reintegrati. |
-| D | Integrare router campagne, mount in server e trattamento degli errori campaign-busy nei due ingressi manuali; testare permessi, sequenze multi-source, retry, stop e coesistenza con autotrace/automazioni. |
-| E | Verificare build/test/lint, aggiornare registro e inventario e pubblicare il checkpoint sullo stesso ramo. Pagina campagne e nuova scheda appartengono al blocco 4. |
+| A | Verificare HEAD remoto del ramo di integrazione, checkout pulito, questo registro, rapporto del blocco 3 e inventario. Conservare la base upstream fissata. |
+| B | Portare panel/pagina e test dal delta storico; selezione manuale, ricerca long/short name, ordinamento target, sorgenti e impostazioni della campagna. |
+| C | Integrare route frontend, accesso dal dashboard e apertura in nuova scheda, mantenendo i componenti e gli stili upstream. |
+| D | Adattare letture API a `{ success: true, data }`, polling di campagna e scheduler con sourceId, retry, stop e dettagli hop. Aggiornare i fixture per `sources[].channel`; verificare permessi ed errori 401/403/409. |
+| E | Verificare test/build/lint, aggiornare registro e inventario e pubblicare il checkpoint sullo stesso ramo. Fermarsi prima dei lavori mappa del blocco 5. |
 
-Il limite effettivo resta **un solo traceroute globale attivo tra tutte le sorgenti**, cooldown di 5 s e timeout predefinito di 75 s. Non esistono domini RF configurabili.
+Il limite effettivo resta **un solo traceroute globale attivo tra tutte le sorgenti**, cooldown di 5 s e timeout predefinito di 75 s (configurabile 5–300 s nelle campagne). Non esistono domini RF configurabili. Le campagne sono in memoria: un riavvio ne perde lo stato.
 
-**Contratto da rispettare nel blocco 4:** `GET /api/traceroutes/scheduler/status?sourceId=...` richiede la sorgente, controlla `traceroute:read` e visibilità del canale e restituisce `{ success: true, data: status }`. La vecchia UI che leggeva uno stato globale senza query va adattata; uno stato sorgente con `active: null` non certifica che il globale sia libero.
+**Contratto da rispettare nel blocco 4:** tutte le API campagne sono documentate nel [rapporto del blocco 3](custom-integration-block3.md). La vecchia UI del backup leggeva payload senza envelope; ora deve leggere `data`. `GET /api/traceroutes/scheduler/status?sourceId=...` richiede sorgente e visibilità del canale: uno stato filtrato con `active: null` non certifica che il globale sia libero.
 
-**Verifiche da riprendere correttamente:** usare il controllo import compatibile descritto nella baseline (il gate upstream visita solo un modulo). Il rapporto del blocco 2 documenta anche il controllo dei tipi dei test e i limiti della verifica; non presentare i test mirati come intera suite o collaudo con radio reali.
+**Verifiche da riprendere correttamente:** usare il controllo import compatibile descritto nella baseline (il gate upstream visita solo un modulo). I rapporti dei blocchi 2–3 documentano il controllo dei tipi e i limiti della verifica; non presentare i test mirati come intera suite o collaudo con radio reali.

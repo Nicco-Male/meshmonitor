@@ -18,6 +18,8 @@ import { resolveSourceManager } from '../../utils/resolveSourceManager.js';
 import { logger } from '../../../utils/logger.js';
 import { PortNum } from '../../constants/meshtastic.js';
 import { attachSource, resolvedSourceIdFromPath } from './sourceParam.js';
+import { isTracerouteCampaignBusyError } from '../../services/tracerouteCampaignCoordinator.js';
+import { ok, fail } from '../../utils/apiResponse.js';
 import { isTxDisabledError } from '../../errors/txDisabledError.js';
 import { resolveBroadcastChannel, isValidChannelIndex } from '../../utils/resolveDestinationChannel.js';
 
@@ -83,7 +85,7 @@ router.post('/traceroute', attachSource('traceroute', 'write'), async (req: Requ
     const sourceId = resolvedSourceIdFromPath(req) as string;
     const destinationNum = resolveDestination(req.body);
     if (destinationNum === null) {
-      return res.status(400).json({ success: false, error: 'Destination node is required (destination, nodeId, or nodeNum)' });
+      return fail(res, 400, 'INVALID_DESTINATION', 'Destination node is required (destination, nodeId, or nodeNum)');
     }
 
     const manager = resolveSourceManager(sourceId);
@@ -98,20 +100,20 @@ router.post('/traceroute', attachSource('traceroute', 'write'), async (req: Requ
 
     await manager.sendTraceroute(destinationNum, channel);
 
-    res.json({
-      success: true,
-      data: {
-        destination: `!${destinationNum.toString(16).padStart(8, '0')}`,
-        channel,
-        message: 'Traceroute request sent',
-      },
+    return ok(res, {
+      destination: `!${destinationNum.toString(16).padStart(8, '0')}`,
+      channel,
+      message: 'Traceroute request sent',
     });
   } catch (error) {
+    if (isTracerouteCampaignBusyError(error)) {
+      return fail(res, 409, error.code, error.message);
+    }
     if (isTxDisabledError(error)) {
-      return res.status(409).json({ success: false, error: 'Transmit is disabled on this source', code: 'TX_DISABLED' });
+      return fail(res, 409, 'TX_DISABLED', 'Transmit is disabled on this source');
     }
     logger.error('[v1/actions] Error sending traceroute:', error);
-    res.status(500).json({ success: false, error: 'Failed to send traceroute' });
+    return fail(res, 500, 'TRACEROUTE_SEND_FAILED', 'Failed to send traceroute');
   }
 });
 

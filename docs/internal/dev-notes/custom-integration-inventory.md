@@ -1,6 +1,6 @@
 # Inventario custom MeshMonitor — blocco 1
 
-Inventario storico fissato nel blocco 1 il 15 settembre 2026. Stato del porting aggiornato al blocco 2; le classificazioni descrivono il confronto iniziale, non il tree corrente.
+Inventario storico fissato nel blocco 1 il 15 settembre 2026. Stato del porting aggiornato al blocco 3; le classificazioni descrivono il confronto iniziale, non il tree corrente.
 
 | Riferimento | SHA |
 | --- | --- |
@@ -44,8 +44,8 @@ Per ogni percorso, confrontare i blob delle tre revisioni con `git ls-tree` e il
 | ID | File | Decisione | Blocchi | Sovrapposizioni testuali | Azione |
 | --- | --- | --- | --- | ---: | --- |
 | C001 | `docs/features/automation-engine.md` | ADATTARE | 2 | 0 | **Blocco 2 completato.** Documentare coda, priorità e serializzazione senza perdere le nuove funzionalità del motore upstream. |
-| C054 | `src/server/meshtasticManager.tracerouteScheduler.test.ts` | PORTARE | 2, 3 | — | **Blocco 2 completato; agganci campagne al blocco 3.** Estendere i test upstream dell’autotrace con le esclusioni per coda occupata e campagne. |
-| C055 | `src/server/meshtasticManager.ts` | ADATTARE | 2, 3 | 0 | **Blocco 2 completato; agganci campagne al blocco 3.** Portare solo gli agganci scheduler/campagne. Conservare getConfiguredHopLimit, servizi Admin, macchina a stati e gli aggiornamenti upstream. |
+| C054 | `src/server/meshtasticManager.tracerouteScheduler.test.ts` | PORTARE | 2, 3 | — | **Blocchi 2–3 completati.** Estendere i test upstream dell’autotrace con le esclusioni per coda occupata e campagne. |
+| C055 | `src/server/meshtasticManager.ts` | ADATTARE | 2, 3 | 0 | **Blocchi 2–3 completati.** Portare solo gli agganci scheduler/campagne. Conservare getConfiguredHopLimit, servizi Admin, macchina a stati e gli aggiornamenti upstream. |
 | C064 | `src/server/routes/tracerouteRoutes.ts` | ADATTARE | 2 | 1 | **Blocco 2 completato.** Aggiungere stato della coda preservando route di partecipazione, permessi e filtri di canale upstream; riesaminare lo scope dei dati restituiti. |
 | C067 | `src/server/services/automation/meshActionDeps.test.ts` | ADATTARE | 2 | 0 | **Blocco 2 completato.** Passare la priorità automation allo scheduler preservando adattatore e comportamento delle altre azioni. |
 | C068 | `src/server/services/automation/meshActionDeps.ts` | ADATTARE | 2 | 0 | **Blocco 2 completato.** Passare la priorità automation allo scheduler preservando adattatore e comportamento delle altre azioni. |
@@ -56,17 +56,19 @@ Per ogni percorso, confrontare i blob delle tre revisioni con `git ls-tree` e il
 
 | ID | File | Decisione | Blocchi | Sovrapposizioni testuali | Azione |
 | --- | --- | --- | --- | ---: | --- |
-| C040 | `src/db/repositories/traceroutes.test.ts` | ADATTARE | 3, 8 | 0 | Blocco 3: query dell’ultimo trace riuscito per le campagne. Blocco 8: orientamento canonico risposta e persistenza; conservare routePositions, query di partecipazione e supporto ai tre DB. |
-| C041 | `src/db/repositories/traceroutes.ts` | ADATTARE | 3, 8 | 3 | Blocco 3: query dell’ultimo trace riuscito per le campagne. Blocco 8: orientamento canonico risposta e persistenza; conservare routePositions, query di partecipazione e supporto ai tre DB. |
-| C061 | `src/server/routes/meshRequestRoutes.ts` | PORTARE | 3 | — | Delta custom: trattamento degli errori di sorgente riservata da una campagna. Preservare gli errori e gli helper API upstream. |
-| C063 | `src/server/routes/tracerouteCampaignRoutes.ts` | PORTARE | 3 | — | Aggiungere tipi/coordinamento/service/routes delle campagne, sequenza multi-source, retry finali, criteri di successo e dettagli hop; adeguare API e permessi. |
-| C065 | `src/server/routes/v1/actions.ts` | ADATTARE | 3 | 1 | Delta custom: trattamento degli errori di sorgente riservata da una campagna. Preservare gli errori e gli helper API upstream. |
-| C066 | `src/server/server.ts` | ADATTARE | 3 | 0 | Montare il router campagne rispettando ordine del middleware e autenticazione upstream. |
-| C074 | `src/server/services/tracerouteCampaignCoordinator.test.ts` | PORTARE | 3 | — | Aggiungere tipi/coordinamento/service/routes delle campagne, sequenza multi-source, retry finali, criteri di successo e dettagli hop; adeguare API e permessi. |
-| C075 | `src/server/services/tracerouteCampaignCoordinator.ts` | PORTARE | 3 | — | Aggiungere tipi/coordinamento/service/routes delle campagne, sequenza multi-source, retry finali, criteri di successo e dettagli hop; adeguare API e permessi. |
-| C076 | `src/server/services/tracerouteCampaignService.test.ts` | PORTARE | 3 | — | Aggiungere tipi/coordinamento/service/routes delle campagne, sequenza multi-source, retry finali, criteri di successo e dettagli hop; adeguare API e permessi. |
-| C077 | `src/server/services/tracerouteCampaignService.ts` | PORTARE | 3 | — | Aggiungere tipi/coordinamento/service/routes delle campagne, sequenza multi-source, retry finali, criteri di successo e dettagli hop; adeguare API e permessi. |
-| C082 | `src/types/tracerouteCampaign.ts` | PORTARE | 3 | — | Aggiungere tipi/coordinamento/service/routes delle campagne, sequenza multi-source, retry finali, criteri di successo e dettagli hop; adeguare API e permessi. |
+| C040 | `src/db/repositories/traceroutes.test.ts` | ADATTARE | 3, 8 | 0 | **Blocco 3 completato:** query dell’ultimo trace riuscito per sorgente/canale. Blocco 8: orientamento canonico risposta e persistenza; conservare routePositions, query di partecipazione e supporto ai tre DB. |
+| C041 | `src/db/repositories/traceroutes.ts` | ADATTARE | 3, 8 | 3 | **Blocco 3 completato:** query dell’ultimo trace riuscito per sorgente/canale. Blocco 8: orientamento canonico risposta e persistenza; conservare routePositions, query di partecipazione e supporto ai tre DB. |
+| C061 | `src/server/routes/meshRequestRoutes.ts` | PORTARE | 3 | — | **Blocco 3 completato.** Delta custom: trattamento degli errori di sorgente riservata da una campagna. Preservare gli errori e gli helper API upstream. |
+| C063 | `src/server/routes/tracerouteCampaignRoutes.ts` | PORTARE | 3 | — | **Blocco 3 completato.** Aggiungere tipi/coordinamento/service/routes delle campagne, sequenza multi-source, retry finali, criteri di successo e dettagli hop; adeguare API e permessi. |
+| C065 | `src/server/routes/v1/actions.ts` | ADATTARE | 3 | 1 | **Blocco 3 completato.** Delta custom: trattamento degli errori di sorgente riservata da una campagna. Preservare gli errori e gli helper API upstream. |
+| C066 | `src/server/server.ts` | ADATTARE | 3 | 0 | **Blocco 3 completato.** Montare il router campagne rispettando ordine del middleware e autenticazione upstream. |
+| C074 | `src/server/services/tracerouteCampaignCoordinator.test.ts` | PORTARE | 3 | — | **Blocco 3 completato.** Aggiungere tipi/coordinamento/service/routes delle campagne, sequenza multi-source, retry finali, criteri di successo e dettagli hop; adeguare API e permessi. |
+| C075 | `src/server/services/tracerouteCampaignCoordinator.ts` | PORTARE | 3 | — | **Blocco 3 completato.** Aggiungere tipi/coordinamento/service/routes delle campagne, sequenza multi-source, retry finali, criteri di successo e dettagli hop; adeguare API e permessi. |
+| C076 | `src/server/services/tracerouteCampaignService.test.ts` | PORTARE | 3 | — | **Blocco 3 completato.** Aggiungere tipi/coordinamento/service/routes delle campagne, sequenza multi-source, retry finali, criteri di successo e dettagli hop; adeguare API e permessi. |
+| C077 | `src/server/services/tracerouteCampaignService.ts` | PORTARE | 3 | — | **Blocco 3 completato.** Aggiungere tipi/coordinamento/service/routes delle campagne, sequenza multi-source, retry finali, criteri di successo e dettagli hop; adeguare API e permessi. |
+| C082 | `src/types/tracerouteCampaign.ts` | PORTARE | 3 | — | **Blocco 3 completato.** Aggiungere tipi/coordinamento/service/routes delle campagne, sequenza multi-source, retry finali, criteri di successo e dettagli hop; adeguare API e permessi. |
+
+Adattamenti aggiuntivi del blocco 3, esterni all'inventario storico di 88 file: test API con middleware reale in `tracerouteCampaignRoutes.perSource.test.ts` e `meshRequestRoutes.campaign.perSource.test.ts`; gestione dello skip campaign-busy e test in `services/automation/actionExecutor.ts` e `.test.ts`. I file scheduler del blocco 2 ricevono cancellazione per tentativo e protezione della deduplica tra proprietari diversi. [Rapporto del blocco 3](custom-integration-block3.md).
 
 ## Blocco 4 — UI campagne (8 file)
 

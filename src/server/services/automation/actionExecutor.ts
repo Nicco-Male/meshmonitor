@@ -8,6 +8,7 @@
  */
 import { type AutomationNode, AUTOMATION_DELAY_MAX_SECONDS, parseSendMaxAttempts } from '../../../types/automation.js';
 import { type EngineEvalContext, interpolateAsync, resolveOperand } from './engineContext.js';
+import { isTracerouteCampaignBusyError } from '../tracerouteCampaignCoordinator.js';
 import { isTxDisabledError } from '../../errors/txDisabledError.js';
 import { hopCountEmoji } from '../../../utils/hopEmoji.js';
 import { tokenizeArgv } from '../../utils/argvTokenizer.js';
@@ -144,14 +145,15 @@ async function isMeshCoreSource(ctx: EngineEvalContext, sourceId: string | null)
  * `TxDisabledError` from a TX-disabled Meshtastic source (#4294) is caught and
  * converted into the file's existing skip shape — mirroring the MeshCore-
  * unsupported skips above — so the run stays `status: 'completed'` instead of
- * failing. Any other error rethrows, preserving existing failure behavior.
+ * failing. A campaign reservation likewise skips a traceroute on that source.
+ * Any other error rethrows, preserving existing failure behavior.
  */
 async function pushOrSkipTxDisabled<T>(results: unknown[], fn: () => Promise<T>): Promise<void> {
   try {
     results.push(await fn());
   } catch (error) {
-    if (isTxDisabledError(error)) {
-      results.push({ skipped: true, reason: 'TX_DISABLED' });
+    if (isTxDisabledError(error) || isTracerouteCampaignBusyError(error)) {
+      results.push({ skipped: true, reason: error.code });
       return;
     }
     throw error;

@@ -199,6 +199,7 @@ vi.mock('../utils/nodeHelpers.js', () => ({
   isNodeComplete: vi.fn(),
 }));
 
+import { tracerouteCampaignCoordinator } from './services/tracerouteCampaignCoordinator.js';
 import { tracerouteRequestScheduler } from './services/tracerouteRequestScheduler.js';
 
 const mockTargetNode = {
@@ -275,6 +276,18 @@ describe('MeshtasticManager - Traceroute Scheduler', () => {
     const fn = manager['startTracerouteScheduler'].bind(manager);
     fn();
   }
+
+  it('skips automatic selection while a campaign reserves this source', async () => {
+    tracerouteCampaignCoordinator.reserve('auto-test-campaign', [manager.sourceId]);
+    try {
+      startScheduler(1);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(manager.sendTraceroute).not.toHaveBeenCalled();
+      expect(mockGetNodeNeedingTracerouteAsync).not.toHaveBeenCalled();
+    } finally {
+      tracerouteCampaignCoordinator.release('auto-test-campaign');
+    }
+  });
 
   it('skips an automatic trace when the shared arbiter already has work for this source', async () => {
     vi.spyOn(tracerouteRequestScheduler, 'hasPendingForSource').mockReturnValue(true);
@@ -579,6 +592,7 @@ describe('MeshtasticManager — shared dispatch across sources', () => {
   }
 
   afterEach(async () => {
+    tracerouteCampaignCoordinator.release('manager-test-campaign');
     completeActive();
     await vi.advanceTimersByTimeAsync(5_000);
     vi.clearAllTimers();
@@ -644,4 +658,57 @@ describe('MeshtasticManager — shared dispatch across sources', () => {
     await pending;
     expect(secondState.transport.send).toHaveBeenCalledTimes(1);
   });
+  it('blocks ordinary requests on reserved sources while campaign requests use the shared scheduler', async () => {
+    tracerouteCampaignCoordinator.reserve('manager-test-campaign', ['source-b']);
+    await expect(second.sendTraceroute(20)).rejects.toMatchObject({ code: 'TRACEROUTE_CAMPAIGN_ACTIVE' });
+    await expect(second.sendTraceroute(20, 0, 'automation')).rejects.toMatchObject({ code: 'TRACEROUTE_CAMPAIGN_ACTIVE' });
+    await first.sendTraceroute(10);
+    const onDispatch = vi.fn();
+    const pending = second.sendCampaignTraceroute(20, 1, 'campaign', 10_000, () => true, { onDispatch });
+    expect(onDispatch).not.toHaveBeenCalled();
+    completeActive();
+    await vi.advanceTimersByTimeAsync(5_000);
+    await pending;
+    expect(onDispatch).toHaveBeenCalledOnce();
+    expect(secondState.transport.send).toHaveBeenCalledOnce();
+    expect(tracerouteRequestScheduler.getStatus().active).toMatchObject({ sourceId: 'source-b', priority: 'campaign' });
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(tracerouteRequestScheduler.getStatus().active).toBeNull();
+  });
+
+  it('rechecks campaign reservations for ordinary work queued before the campaign began', async () => {
+    await first.sendTraceroute(10);
+    const pending = expect(second.sendTraceroute(20)).rejects.toMatchObject({ code: 'TRACEROUTE_CAMPAIGN_ACTIVE' });
+    tracerouteCampaignCoordinator.reserve('manager-test-campaign', ['source-b']);
+    completeActive();
+    await vi.advanceTimersByTimeAsync(5_000);
+    await pending;
+    expect(secondState.transport.send).not.toHaveBeenCalled();
+  });
+
+  it('removes an aborted campaign from the queue without affecting the active source', async () => {
+    await first.sendTraceroute(10);
+    const controller = new AbortController();
+    const pending = expect(second.sendCampaignTraceroute(20, 0, 'retry', 5_000, () => true, { signal: controller.signal }))
+      .rejects.toMatchObject({ code: 'TRACEROUTE_REQUEST_CANCELLED' });
+    controller.abort();
+    await pending;
+    expect(secondState.transport.send).not.toHaveBeenCalled();
+    expect(tracerouteRequestScheduler.getStatus()).toMatchObject({ active: { sourceId: 'source-a' }, queue: [] });
+  });
+
+  it('does not transmit a campaign cancelled during its asynchronous dispatch check', async () => {
+    const controller = new AbortController();
+    let authorize!: () => void;
+    const pending = expect(second.sendCampaignTraceroute(20, 0, 'campaign', 5_000, () => true, {
+      signal: controller.signal,
+      onDispatch: () => new Promise<void>(resolve => { authorize = resolve; }),
+    })).rejects.toMatchObject({ code: 'TRACEROUTE_REQUEST_CANCELLED' });
+    controller.abort();
+    authorize();
+    await pending;
+    expect(secondState.transport.send).not.toHaveBeenCalled();
+    expect(tracerouteRequestScheduler.getStatus().active).toBeNull();
+  });
+
 });

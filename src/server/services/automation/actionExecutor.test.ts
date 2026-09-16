@@ -4,6 +4,7 @@ import type { EngineEvalContext } from './engineContext.js';
 import type { TriggerContext } from './triggerContext.js';
 import type { AutomationNode } from '../../../types/automation.js';
 import type { VariableResolver } from './variableResolver.js';
+import { TracerouteCampaignBusyError } from '../tracerouteCampaignCoordinator.js';
 import { TxDisabledError } from '../../errors/txDisabledError.js';
 
 function recorder() {
@@ -549,7 +550,7 @@ describe('executeAction', () => {
     // source(s) the user selected in the builder (multi-select), NOT the null
     // trigger source. This is the core #3995 use case (daily scheduled reboot).
     const scheduleCtx: EngineEvalContext = {
-      trigger: { triggerType: 'trigger.schedule', sourceId: null, timestamp: 1000, fields: {} },
+      trigger: { triggerType: 'trigger.schedule', sourceId: null, subjectNodeNum: null, timestamp: 1000, fields: {} },
       vars: { getValue: async () => null } as unknown as VariableResolver,
       data: { getNode: async () => null, getTelemetry: async () => null },
       varCtx: { sourceId: null, nodeNum: undefined },
@@ -610,7 +611,7 @@ describe('executeAction', () => {
     // recorded no-op (like tapback/nodeManage) — NOT a hard failure that starves
     // the remaining Meshtastic sources of their reboot.
     const mixedCtx: EngineEvalContext = {
-      trigger: { triggerType: 'trigger.schedule', sourceId: null, timestamp: 1000, fields: {} },
+      trigger: { triggerType: 'trigger.schedule', sourceId: null, subjectNodeNum: null, timestamp: 1000, fields: {} },
       vars: { getValue: async () => null } as unknown as VariableResolver,
       data: {
         getNode: async () => null,
@@ -1106,4 +1107,19 @@ describe('executeAction', () => {
       )).rejects.toThrow('boom');
     });
   });
+  it('skips a campaign-reserved traceroute source and continues on the other selected source', async () => {
+    const { calls, deps } = recorder();
+    const send = deps.requestData;
+    deps.requestData = async args => {
+      if (args.sourceId === 'busy') throw new TracerouteCampaignBusyError('busy');
+      return send(args);
+    };
+    const result = await executeAction(
+      node('action.requestData', { op: 'traceroute', to: '12345', sourceIds: ['busy', 'free'] }),
+      ctx({ from: 5, channel: 0 }), deps,
+    );
+    expect(result).toEqual([{ skipped: true, reason: 'TRACEROUTE_CAMPAIGN_ACTIVE' }, 5]);
+    expect(calls.map(c => c.args.sourceId)).toEqual(['free']);
+  });
+
 });

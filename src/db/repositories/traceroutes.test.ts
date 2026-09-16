@@ -146,6 +146,26 @@ function runTraceroutesTests(getBackend: () => TestBackend) {
     repo = new TraceroutesRepository(backend.drizzleDb, backend.dbType);
   });
 
+  it('finds the latest completed pair in either direction on the requested source and channel', async () => {
+    if (!getBackend().available) return;
+    await repo.insertTraceroute(makeTraceroute({ timestamp: 100, route: '[]', channel: 3 }), 'src-a');
+    await repo.insertTraceroute(makeTraceroute({ timestamp: 200, fromNodeNum: 2002, toNodeNum: 1001, routeBack: '[]', channel: 3 }), 'src-a');
+    await repo.insertTraceroute(makeTraceroute({ timestamp: 300, channel: 3 }), 'src-a'); // pending
+    await repo.insertTraceroute(makeTraceroute({ timestamp: 400, route: '[42]', channel: 3 }), 'src-b');
+    await repo.insertTraceroute(makeTraceroute({ timestamp: 500, route: '[55]', channel: 2 }), 'src-a');
+    await repo.insertTraceroute(makeTraceroute({ timestamp: 600, toNodeNum: 9999, route: '[]', channel: 3 }), 'src-a');
+    expect(await repo.getLatestSuccessfulTracerouteByNodes(1001, 2002, 100, 'src-a', 3))
+      .toMatchObject({ timestamp: 200, routeBack: '[]', sourceId: 'src-a', channel: 3 });
+    expect(await repo.getLatestSuccessfulTracerouteByNodes(2002, 1001, 200, 'src-a', 3)).toMatchObject({ timestamp: 200 });
+    expect(await repo.getLatestSuccessfulTracerouteByNodes(1001, 2002, 201, 'src-a', 3)).toBeNull();
+    expect(await repo.getLatestSuccessfulTracerouteByNodes(1001, 2002, 0, 'src-a')).toMatchObject({ timestamp: 500 });
+  });
+
+  it('requires a source scope for the campaign success lookup', async () => {
+    if (!getBackend().available) return;
+    await expect(repo.getLatestSuccessfulTracerouteByNodes(1, 2, 0, '')).rejects.toThrow('sourceId is required');
+  });
+
   // ============ SOURCE-SCOPE GUARD (#5088) ============
 
   /*
@@ -179,7 +199,7 @@ function runTraceroutesTests(getBackend: () => TestBackend) {
     await repo.deleteAllTraceroutes('src-a');
 
     const remaining = await repo.getAllTraceroutes(100, ALL_SOURCES);
-    expect(remaining.every(r => r.sourceId === 'src-b')).toBe(true);
+    for (const trace of remaining) expect(trace).toMatchObject({ sourceId: 'src-b' });
     expect(remaining.length).toBeGreaterThan(0);
   });
 

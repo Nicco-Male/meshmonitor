@@ -419,11 +419,23 @@ a time; the next waits for its response or a 75-second timeout, followed by a 5-
 Manual requests take priority over queued automation requests, which take priority over
 automatic tracing. Requests at the same priority keep their arrival order; duplicate requests
 for the same source, local node, destination and channel share one transmission.
+Campaign attempts have their own cancellation scope and do not share an ordinary request.
 
 A request action completes once its request has been transmitted, so completion does not
 mean that a route was found. Time spent waiting in the queue can delay the action. Automatic
 tracing skips a source that already has a queued or active traceroute. Disconnecting a source
 cancels its unsent requests; a transmitted request keeps the shared slot until response or timeout.
+
+A traceroute campaign reserves its selected sources until it finishes or is cancelled.
+During that time, manual requests on those sources return `409 TRACEROUTE_CAMPAIGN_ACTIVE`,
+automatic tracing skips them, and an Automation Engine request records a skipped result with
+that reason and continues on the other selected sources. Requests on other sources still
+use the shared queue. Campaign attempts follow manual requests and precede automation;
+explicit retries of failed campaign attempts go to the lowest priority.
+
+Campaign response timeouts are configurable (5–300 seconds) and start after dispatch,
+not while waiting in the shared queue. Cancelling removes unsent campaign work immediately;
+an already transmitted trace retains its RF slot until response or timeout.
 
 ### Send a notification (Apprise)
 

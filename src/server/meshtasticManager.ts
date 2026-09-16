@@ -32,7 +32,8 @@ import { channelDecryptionService } from './services/channelDecryptionService.js
 import { pkiDecryptionService } from './services/pkiDecryptionService.js';
 import { getSourcePkiKeyStore, isPkiDmDecryptionGloballyEnabled } from './services/sourcePkiKeyStore.js';
 import { dataEventEmitter } from './services/dataEventEmitter.js';
-import { tracerouteRequestScheduler, type TracerouteRequestPriority } from './services/tracerouteRequestScheduler.js';
+import { tracerouteRequestScheduler, TracerouteRequestCancelledError, type TracerouteRequestPriority } from './services/tracerouteRequestScheduler.js';
+import { tracerouteCampaignCoordinator } from './services/tracerouteCampaignCoordinator.js';
 import {
   ToastThrottle,
   shouldSuppressToast,
@@ -2592,6 +2593,10 @@ class MeshtasticManager implements ISourceManager {
 
     // The traceroute execution logic
     const executeTraceroute = async () => {
+      if (tracerouteCampaignCoordinator.isReserved(this.sourceId)) {
+        logger.debug('Auto-traceroute: Skipping - traceroute campaign active on this source');
+        return;
+      }
       if (tracerouteRequestScheduler.hasPendingForSource(this.sourceId)) {
         logger.debug('🗺️ Auto-traceroute: Skipping - this source already has an active or queued traceroute');
         return;
@@ -10147,6 +10152,34 @@ class MeshtasticManager implements ISourceManager {
     channel: number = 0,
     priority: TracerouteRequestPriority = 'manual',
   ): Promise<void> {
+    tracerouteCampaignCoordinator.assertAvailable(this.sourceId);
+    return this.queueTraceroute(destination, channel, priority, {
+      shouldDispatch: () => {
+        // The campaign may have reserved the source while this request waited.
+        tracerouteCampaignCoordinator.assertAvailable(this.sourceId);
+        return true;
+      },
+    });
+  }
+
+  /** Campaigns use the same RF slot and connection/TX checks as manual work. */
+  async sendCampaignTraceroute(
+    destination: number,
+    channel: number = 0,
+    priority: Extract<TracerouteRequestPriority, 'campaign' | 'retry'> = 'campaign',
+    timeoutMs?: number,
+    shouldDispatch?: () => boolean,
+    lifecycle?: { signal?: AbortSignal; onDispatch?: () => void | Promise<void> },
+  ): Promise<void> {
+    return this.queueTraceroute(destination, channel, priority, { timeoutMs, shouldDispatch, ...lifecycle });
+  }
+
+  private async queueTraceroute(
+    destination: number,
+    channel: number,
+    priority: TracerouteRequestPriority,
+    options: { timeoutMs?: number; shouldDispatch?: () => boolean; signal?: AbortSignal; onDispatch?: () => void | Promise<void> } = {},
+  ): Promise<void> {
     // Fail immediately for an unavailable source, and recheck at dispatch
     // below because connectivity and TX configuration can change in the queue.
     if (!this.isConnected || !this.transport) {
@@ -10167,10 +10200,24 @@ class MeshtasticManager implements ISourceManager {
       destination,
       channel,
       priority,
+      timeoutMs: options.timeoutMs,
+      signal: options.signal,
       shouldDispatch: () => this.isConnected
         && this.transport === transport
-        && this.localNodeInfo?.nodeNum === localNodeNum,
-      send: () => this.sendTraceroutePacket(destination, channel),
+        && this.localNodeInfo?.nodeNum === localNodeNum
+        && (options.shouldDispatch?.() ?? true),
+      send: async () => {
+        if (options.onDispatch) {
+          await options.onDispatch();
+          // A campaign's asynchronous permission check must not send through
+          // a changed transport, or revive work cancelled during that check.
+          if (options.signal?.aborted || !this.isConnected || this.transport !== transport
+            || this.localNodeInfo?.nodeNum !== localNodeNum || !(options.shouldDispatch?.() ?? true)) {
+            throw new TracerouteRequestCancelledError();
+          }
+        }
+        return this.sendTraceroutePacket(destination, channel);
+      },
     });
   }
 

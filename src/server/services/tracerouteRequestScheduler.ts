@@ -25,6 +25,7 @@ export interface TracerouteSchedulerRequest {
   timeoutMs?: number;
   send: () => Promise<void>;
   shouldDispatch?: () => boolean;
+  signal?: AbortSignal;
 }
 
 interface PendingTraceroute extends TracerouteSchedulerRequest {
@@ -86,6 +87,7 @@ export class TracerouteRequestScheduler {
   ) {}
 
   enqueue(request: TracerouteSchedulerRequest): Promise<void> {
+    if (request.signal?.aborted) return Promise.reject(new TracerouteRequestCancelledError());
     const priority = request.priority ?? 'manual';
     const existing = this.findDuplicate(request);
     if (existing) {
@@ -113,6 +115,19 @@ export class TracerouteRequestScheduler {
     };
     this.queue.push(job);
     this.sortQueue();
+
+    // Cancelling a campaign removes only its unsent job, never a different
+    // caller's duplicate or an already transmitted request's RF reservation.
+    const onAbort = () => {
+      const index = this.queue.findIndex(candidate => candidate.id === job.id);
+      if (index >= 0) {
+        this.queue.splice(index, 1);
+        job.rejectDispatch(new TracerouteRequestCancelledError());
+      }
+    };
+    request.signal?.addEventListener('abort', onAbort, { once: true });
+    const detach = () => request.signal?.removeEventListener('abort', onAbort);
+    void dispatchPromise.then(detach, detach);
 
     logger.debug(
       `[TraceScheduler] queued #${job.id} ${job.sourceId} -> ${job.destination} ch${job.channel} (${job.priority}); depth=${this.queue.length}`,
@@ -177,6 +192,7 @@ export class TracerouteRequestScheduler {
     const matches = (job: PendingTraceroute) =>
       job.sourceId === request.sourceId
       && job.localNodeNum === request.localNodeNum
+      && job.signal === request.signal
       && job.destination === request.destination
       && job.channel === request.channel;
     if (this.active && matches(this.active)) return this.active;
@@ -196,7 +212,7 @@ export class TracerouteRequestScheduler {
     while (this.queue.length > 0) {
       const job = this.queue.shift()!;
       try {
-        if (job.shouldDispatch && !job.shouldDispatch()) {
+        if (job.signal?.aborted || (job.shouldDispatch && !job.shouldDispatch())) {
           throw new TracerouteRequestCancelledError();
         }
       } catch (error) {
