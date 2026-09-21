@@ -7,6 +7,7 @@
 import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import SolarMonitoringReport from './SolarMonitoringReport';
+import NodeTelemetryReport from './NodeTelemetryReport';
 import NodeInfoEnrichmentReport from './NodeInfoEnrichmentReport';
 import MqttViolationsReport from './MqttViolationsReport';
 import MeshIssuesReport from './MeshIssuesReport';
@@ -14,6 +15,7 @@ import { UiIcon, type UiIconName } from '../icons';
 
 type AnalysisType =
   | 'solar-monitoring'
+  | 'node-telemetry'
   | 'nodeinfo-enrichment'
   | 'mqtt-oktomqtt-violations'
   | 'mesh-issues'
@@ -39,6 +41,15 @@ const AnalysisTab: React.FC = () => {
         'Identify solar-powered nodes by analyzing battery and voltage patterns that show daytime charging and nighttime discharge.',
       ),
       icon: 'sun',
+    },
+    {
+      id: 'node-telemetry',
+      title: t('analysis.node_telemetry.title', 'Node Telemetry'),
+      description: t(
+        'analysis.node_telemetry.description',
+        'Inspect telemetry history for one node and assign names to its current and voltage sensor channels.',
+      ),
+      icon: 'telemetry',
     },
     {
       id: 'nodeinfo-enrichment',
@@ -80,6 +91,21 @@ const AnalysisTab: React.FC = () => {
           <UiIcon name="back" size={16} /> {t('analysis.back_to_reports', 'Back to reports')}
         </button>
         <SolarMonitoringReport />
+      </div>
+    );
+  }
+
+  if (selected === 'node-telemetry') {
+    return (
+      <div className="reports-section">
+        <button
+          type="button"
+          className="reports-section__back"
+          onClick={() => setSelected(null)}
+        >
+          <UiIcon name="back" size={16} /> {t('analysis.back_to_reports', 'Back to reports')}
+        </button>
+        <NodeTelemetryReport />
       </div>
     );
   }

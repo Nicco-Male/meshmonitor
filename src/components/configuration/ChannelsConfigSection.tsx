@@ -1,6 +1,7 @@
 import React, { useState, useRef, useMemo, useCallback, useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
 import { UiIcon } from '../icons';
+import { DRAG_HANDLE_TOUCH_STYLE } from '../dragHandleStyle';
 import {
   DndContext,
   closestCenter,
@@ -111,6 +112,7 @@ const SortableChannelCard: React.FC<{
         <div
           ref={setActivatorNodeRef}
           {...listeners}
+          data-testid="channel-drag-handle"
           style={{
             display: 'flex',
             alignItems: 'center',
@@ -121,15 +123,17 @@ const SortableChannelCard: React.FC<{
             backgroundColor: isDragging ? 'var(--color-surface-active)' : 'var(--color-surface)',
             borderRadius: '8px 0 0 8px',
             borderRight: '1px solid var(--color-surface-hover)',
-            fontSize: '1.4rem',
             color: isDragging ? 'var(--color-accent)' : 'var(--color-text-disabled)',
-            userSelect: 'none',
             flexShrink: 0,
             transition: 'background-color 0.15s, color 0.15s',
+            // #5233 — this handle was the one reorder activator in the app
+            // missing these, so it was the only one that would not drag on a
+            // phone. See DRAG_HANDLE_TOUCH_STYLE for why each property matters.
+            ...DRAG_HANDLE_TOUCH_STYLE,
           }}
           title="Drag to reorder"
         >
-          ⠿
+          <UiIcon name="dragHandle" size={20} />
         </div>
         <div style={{ flex: 1 }}>
           {children}
@@ -345,8 +349,15 @@ const ChannelsConfigSection: React.FC<ChannelsConfigSectionProps> = ({
 
 
   const handleExportChannel = async (channelId: number) => {
+    if (!sourceId) {
+      showToast(t('channels_config.toast_export_failed'), 'error');
+      return;
+    }
+
     try {
-      await apiService.exportChannel(channelId);
+      await apiService.download(`/api/channels/${channelId}/export?sourceId=${encodeURIComponent(sourceId)}`, {
+        defaultName: `channel-${channelId}-${Date.now()}.json`,
+      });
       showToast(t('channels_config.toast_channel_exported', { slot: channelId }), 'success');
     } catch (error) {
       logger.error('Error exporting channel:', error);
