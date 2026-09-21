@@ -1,6 +1,21 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeAll, beforeEach, afterEach } from 'vitest';
 
 // Mock dependencies before any imports
+vi.mock('re2', () => ({
+  default: class MockRe2 {
+    private readonly expression: RegExp;
+
+    constructor(pattern: string, flags?: string) {
+      this.expression = new RegExp(pattern, flags);
+    }
+
+    test(value: string) { return this.expression.test(value); }
+    exec(value: string) { return this.expression.exec(value); }
+    get source() { return this.expression.source; }
+    get flags() { return this.expression.flags; }
+  },
+}));
+
 const mockGetSetting = vi.fn();
 const mockSetSetting = vi.fn();
 const mockGetNodeNeedingTracerouteAsync = vi.fn();
@@ -195,6 +210,8 @@ vi.mock('../utils/nodeHelpers.js', () => ({
   isNodeComplete: vi.fn(),
 }));
 
+import { tracerouteCampaignCoordinator } from './services/tracerouteCampaignCoordinator.js';
+
 const mockTargetNode = {
   nodeNum: 99999,
   nodeId: '!00099999',
@@ -204,6 +221,14 @@ const mockTargetNode = {
 
 describe('MeshtasticManager - Traceroute Scheduler', () => {
   let manager: any;
+  let managerModule: typeof import('./meshtasticManager.js');
+
+  beforeAll(async () => {
+    // Import with real timers. Current upstream performs asynchronous startup
+    // work while evaluating this module, which cannot complete under the fake
+    // timers used to exercise scheduler intervals below.
+    managerModule = await import('./meshtasticManager.js');
+  });
 
   beforeEach(async () => {
     vi.useFakeTimers();
@@ -212,9 +237,7 @@ describe('MeshtasticManager - Traceroute Scheduler', () => {
     // Make jitter deterministic: 0 jitter means immediate execution
     vi.spyOn(Math, 'random').mockReturnValue(0);
 
-    // Dynamic import to get fresh module instance with mocks applied
-    const module = await import('./meshtasticManager.js');
-    manager = module.fallbackManager;
+    manager = managerModule.fallbackManager;
 
     // Set up the manager to think it's connected with local node info
     manager.isConnected = true;
@@ -238,6 +261,7 @@ describe('MeshtasticManager - Traceroute Scheduler', () => {
   });
 
   afterEach(() => {
+    tracerouteCampaignCoordinator.release('scheduler-test');
     // Clean up timers
     manager.tracerouteIntervalMinutes = 0;
     if (manager.tracerouteJitterTimeout) {
@@ -260,6 +284,16 @@ describe('MeshtasticManager - Traceroute Scheduler', () => {
     const fn = manager['startTracerouteScheduler'].bind(manager);
     fn();
   }
+
+  it('skips automatic traceroutes while a campaign owns this source', async () => {
+    tracerouteCampaignCoordinator.reserve('scheduler-test', [manager.sourceId]);
+
+    startScheduler(1);
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(manager.sendTraceroute).not.toHaveBeenCalled();
+    expect(mockGetNodeNeedingTracerouteAsync).not.toHaveBeenCalled();
+  });
 
   describe('Timer leak prevention', () => {
     it('should clear pending jitter timeout when scheduler is restarted', async () => {

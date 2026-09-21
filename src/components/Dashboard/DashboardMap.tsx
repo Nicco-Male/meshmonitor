@@ -44,7 +44,7 @@ import {
 } from '../../hooks/useDashboardData';
 import { getSourceColor, resolveSourceColor } from '../../utils/sourceColors';
 import { getOwnNodePositions } from '../../utils/ownNodePositions';
-import { nodePassesTransportFilter } from '../../utils/nodeTransport';
+import { nodePassesTransportFilter, isMqttOnlySourceType } from '../../utils/nodeTransport';
 import {
   hopTransportClass,
   segmentPassesTransportFilter,
@@ -80,6 +80,7 @@ import {
   decomposeTraceroute,
   type TracerouteRenderSegment,
 } from '../../utils/tracerouteSegments';
+import type { TracerouteCampaignTargetInput } from '../../types/tracerouteCampaign';
 
 export interface DashboardMapProps {
   nodes: any[];
@@ -106,6 +107,8 @@ export interface DashboardMapProps {
    * page can navigate to that source's Node Details view for the node.
    */
   onNodeSourceSelect?: (source: NodeSourceRef, nodeId: string | undefined) => void;
+  /** Opens the standalone sequential traceroute page, optionally preselecting a node. */
+  onTracerouteCampaign?: (target: TracerouteCampaignTargetInput | null) => void;
   /**
    * True while the FIRST fetch of `nodes` for the current selection is still
    * in flight (from `useDashboardSourceData`/`useDashboardUnifiedData`'s
@@ -204,10 +207,12 @@ export default function DashboardMap({
   maxNodeAgeHours,
   maxInfraNodeAgeHours,
   onNodeSourceSelect,
+  onTracerouteCampaign,
   isLoading = false,
 }: DashboardMapProps) {
   const {
     mapPinStyle,
+    mapPinColorMode,
     setMapTileset,
     cartoApiKey,
     overlayColors,
@@ -239,6 +244,14 @@ export default function DashboardMap({
   const isUnified = sourceId === UNIFIED_SOURCE_ID;
   const polarSourceIds = isUnified ? allSourceIds : sourceId ? [sourceId] : [];
   const sourceStatuses = useSourceStatuses(polarSourceIds);
+  // mqtt_bridge/mqtt_broker sources have no RF path — every node on them
+  // arrived over MQTT, so the RF/UDP/MQTT toggles (and their saved
+  // preferences) have no meaning and can only blank the map. Resolved from
+  // `allSources` (not SourceContext — the Dashboard route renders outside any
+  // SourceProvider, so `useSource()` would never see the selected source's
+  // type here). Never true on the Unified map, which mixes sources by design.
+  const selectedDashboardSource = allSources.find((s: DashboardSource) => s.id === sourceId);
+  const isMqttOnlySource = !isUnified && isMqttOnlySourceType(selectedDashboardSource?.type);
 
   // Tile selector + legend overlays — hidden by default, toggled from the Map
   // Features panel. Persisted under the same localStorage keys the NodesTab map
@@ -290,11 +303,11 @@ export default function DashboardMap({
     setShowRoute,
     showAccuracyRegions,
     setShowAccuracyRegions,
-    showRfNodes,
+    showRfNodes: rawShowRfNodes,
     setShowRfNodes,
-    showUdpNodes,
+    showUdpNodes: rawShowUdpNodes,
     setShowUdpNodes,
-    showMqttNodes,
+    showMqttNodes: rawShowMqttNodes,
     setShowMqttNodes,
     showNeighborInfo,
     setShowNeighborInfo,
@@ -309,6 +322,9 @@ export default function DashboardMap({
     spreadNodes,
     setSpreadNodes,
   } = useMapContext();
+  const showRfNodes = isMqttOnlySource ? true : rawShowRfNodes;
+  const showUdpNodes = isMqttOnlySource ? true : rawShowUdpNodes;
+  const showMqttNodes = isMqttOnlySource ? true : rawShowMqttNodes;
 
   // Effective map age cap from the Map Features age slider (#3322), clamped to
   // [1, maxNodeAgeHours]. null = follow the setting, so default is unchanged.
@@ -690,7 +706,7 @@ export default function DashboardMap({
     return {
       key: markerKey,
       position: [pos.lat, pos.lng],
-      iconSig: `${hops}|${shortName ?? ''}|${isRouter ? 1 : 0}|${roleCategory}|${node.isUnmessagable ? 1 : 0}|${mapPinStyle}`,
+      iconSig: `${hops}|${shortName ?? ''}|${isRouter ? 1 : 0}|${roleCategory}|${node.mobile === 1 || node.isMobile === true ? 1 : 0}|${node.isUnmessagable ? 1 : 0}|${mapPinStyle}|${mapPinColorMode}|semantic-role-v1`,
       buildIcon: () =>
         createNodeIcon({
           variant: 'meshtastic',
@@ -698,16 +714,26 @@ export default function DashboardMap({
           isSelected: false,
           isRouter,
           roleCategory,
+          semanticRoleColor: true,
+          isMobile: node.mobile === 1 || node.isMobile === true,
           isUnmessagable: !!node.isUnmessagable,
           shortName,
           showLabel: true,
           pinStyle: mapPinStyle,
+          colorMode: mapPinColorMode,
           nodeNum: Number.isFinite(Number(node.nodeNum)) ? Number(node.nodeNum) : undefined,
         }),
       opacity: ageOpacity,
       children: (
         <Popup>
-          <DashboardNodePopup node={node} pos={pos} onSourceSelect={onNodeSourceSelect} />
+          <DashboardNodePopup
+            node={node}
+            pos={pos}
+            onSourceSelect={onNodeSourceSelect}
+            onTracerouteCampaign={isUnified && onTracerouteCampaign
+              ? (target) => onTracerouteCampaign(target)
+              : undefined}
+          />
         </Popup>
       ),
     };
@@ -948,6 +974,16 @@ export default function DashboardMap({
             </button>
           </div>
           <>
+          {isUnified && onTracerouteCampaign && (
+            <button
+              type="button"
+              className="map-control-item dashboard-campaign-launch"
+              onClick={() => onTracerouteCampaign?.(null)}
+            >
+              <UiIcon name="route" size={15} />
+              <span>Campagna traceroute</span>
+            </button>
+          )}
           {/* #3636: node-to-node LOS distance measurement toggle. Needs at least
               two positioned nodes to be meaningful. */}
           <label className="map-control-item" title={unavailableIn3DTitle ?? 'Measure straight-line distance between two nodes'}>
@@ -1061,30 +1097,39 @@ export default function DashboardMap({
             />
             <span>Spread Nodes</span>
           </label>
-          <label className="map-control-item">
-            <input
-              type="checkbox"
-              checked={showRfNodes}
-              onChange={(e) => setShowRfNodes(e.target.checked)}
-            />
-            <span>Show RF</span>
-          </label>
-          <label className="map-control-item">
-            <input
-              type="checkbox"
-              checked={showUdpNodes}
-              onChange={(e) => setShowUdpNodes(e.target.checked)}
-            />
-            <span>Show UDP</span>
-          </label>
-          <label className="map-control-item">
-            <input
-              type="checkbox"
-              checked={showMqttNodes}
-              onChange={(e) => setShowMqttNodes(e.target.checked)}
-            />
-            <span>Show MQTT</span>
-          </label>
+          {/* RF/UDP/MQTT transport toggles have no meaning on an MQTT-only
+              source (mqtt_bridge/mqtt_broker) — every node there arrived
+              over MQTT, so the filter is skipped outright above and the
+              controls are hidden rather than offering a toggle that can
+              only blank the map (#5283 review). */}
+          {!isMqttOnlySource && (
+            <>
+              <label className="map-control-item">
+                <input
+                  type="checkbox"
+                  checked={showRfNodes}
+                  onChange={(e) => setShowRfNodes(e.target.checked)}
+                />
+                <span>Show RF</span>
+              </label>
+              <label className="map-control-item">
+                <input
+                  type="checkbox"
+                  checked={showUdpNodes}
+                  onChange={(e) => setShowUdpNodes(e.target.checked)}
+                />
+                <span>Show UDP</span>
+              </label>
+              <label className="map-control-item">
+                <input
+                  type="checkbox"
+                  checked={showMqttNodes}
+                  onChange={(e) => setShowMqttNodes(e.target.checked)}
+                />
+                <span>Show MQTT</span>
+              </label>
+            </>
+          )}
           <label className="map-control-item" title={unavailableIn3DTitle}>
             <input
               type="checkbox"
@@ -1152,7 +1197,7 @@ export default function DashboardMap({
           </>
         </div>
         {/* Hops legend + tileset picker now live in the same sidebar (#4909). */}
-        {!effective3D && showLegend && <MapLegend embedded />}
+        {!effective3D && showLegend && <MapLegend embedded showSemanticNodeStyles />}
         {showTileSelector && (
           <TilesetSelector selectedTilesetId={tilesetId} onTilesetChange={setMapTileset} embedded />
         )}
@@ -1168,6 +1213,7 @@ export default function DashboardMap({
           </div>
         </div>
       )}
+
     </div>
   );
 }

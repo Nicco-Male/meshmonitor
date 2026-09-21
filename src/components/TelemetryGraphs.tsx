@@ -62,6 +62,12 @@ interface TelemetryGraphsProps {
   temperatureUnit?: TemperatureUnit;
   telemetryHours?: number;
   baseUrl?: string;
+  /** Explicit source for global/report views that do not have SourceContext. */
+  sourceId?: string | null;
+  /** Consumer-provided display names keyed by exact telemetry type. */
+  labelOverrides?: Record<string, string>;
+  /** Hide mutation and display-mode controls in analytical reports. */
+  readOnly?: boolean;
   /**
    * When true, render a row of time-range buttons (15m … 7d) above the graphs
    * that let the user choose how much history to load. The chosen range is
@@ -173,6 +179,7 @@ interface TelemetryGraphWidgetProps {
   hours: number;
   t: (key: string, opts?: Record<string, unknown>) => string;
   canEditSettings: boolean;
+  readOnly: boolean;
 }
 
 const TelemetryGraphWidget: React.FC<TelemetryGraphWidgetProps> = ({
@@ -203,9 +210,11 @@ const TelemetryGraphWidget: React.FC<TelemetryGraphWidgetProps> = ({
   hours,
   t,
   canEditSettings,
+  readOnly,
 }) => {
   const [mode, setMode] = useWidgetMode(nodeId, type, baseUrl);
   const [range, setRange] = useWidgetRange(nodeId, type, baseUrl);
+  const displayMode = readOnly ? 'chart' : mode;
 
   /*
    * #5196: marker size has to answer to how much room each point actually gets,
@@ -316,7 +325,7 @@ const TelemetryGraphWidget: React.FC<TelemetryGraphWidgetProps> = ({
           {label} {unit && `(${unit})`}
         </h4>
         <div className="graph-actions">
-          {canEditSettings && (
+          {canEditSettings && !readOnly && (
             <div className="mode-toggle-group" role="group" aria-label="Display mode">
               <button
                 className={`mode-toggle-btn ${mode === 'chart' ? 'active' : ''}`}
@@ -363,39 +372,43 @@ const TelemetryGraphWidget: React.FC<TelemetryGraphWidgetProps> = ({
           >
             <UiIcon name="downloadData" size={15} />
           </button>
-          <button
-            className={`favorite-btn ${favorites.has(type) ? 'favorited' : ''}`}
-            onClick={createToggleFavorite(type)}
-            aria-label={favorites.has(type) ? t('telemetry.remove_favorite') : t('telemetry.add_favorite')}
-          >
-            <UiIcon name={favorites.has(type) ? 'favorite' : 'favoriteOff'} size={15} />
-          </button>
-          <button
-            className="graph-menu-btn"
-            onClick={e => handleMenuClick(e, type)}
-            aria-label={t('telemetry.more_options')}
-          >
-            ⋯
-          </button>
-          {openMenu === type && menuPosition && (
-            <div
-              className="telemetry-context-menu"
-              style={{
-                position: 'fixed',
-                top: `${menuPosition.y}px`,
-                left: `${menuPosition.x}px`,
-              }}
-              onClick={e => e.stopPropagation()}
-            >
-              <button className="context-menu-item" onClick={() => handlePurgeData(type)}>
-                {t('telemetry.purge_data')}
+          {!readOnly && (
+            <>
+              <button
+                className={`favorite-btn ${favorites.has(type) ? 'favorited' : ''}`}
+                onClick={createToggleFavorite(type)}
+                aria-label={favorites.has(type) ? t('telemetry.remove_favorite') : t('telemetry.add_favorite')}
+              >
+                <UiIcon name={favorites.has(type) ? 'favorite' : 'favoriteOff'} size={15} />
               </button>
-            </div>
+              <button
+                className="graph-menu-btn"
+                onClick={e => handleMenuClick(e, type)}
+                aria-label={t('telemetry.more_options')}
+              >
+                ⋯
+              </button>
+              {openMenu === type && menuPosition && (
+                <div
+                  className="telemetry-context-menu"
+                  style={{
+                    position: 'fixed',
+                    top: `${menuPosition.y}px`,
+                    left: `${menuPosition.x}px`,
+                  }}
+                  onClick={e => e.stopPropagation()}
+                >
+                  <button className="context-menu-item" onClick={() => handlePurgeData(type)}>
+                    {t('telemetry.purge_data')}
+                  </button>
+                </div>
+              )}
+            </>
           )}
         </div>
       </div>
 
-      {mode === 'gauge' ? (
+      {displayMode === 'gauge' ? (
         latest ? (
           <TelemetryGauge
             value={toDisplayTemp(latest.value)}
@@ -406,13 +419,13 @@ const TelemetryGraphWidget: React.FC<TelemetryGraphWidgetProps> = ({
             timestamp={latest.timestamp}
             nodeId={nodeId}
             onRangeChange={handleRangeChange}
-            canEditRange={canEditSettings}
+            canEditRange={canEditSettings && !readOnly}
             formatValue={display.formatValue}
           />
         ) : (
           <div className="telemetry-no-data">{t('telemetry.no_data')}</div>
         )
-      ) : mode === 'numeric' ? (
+      ) : displayMode === 'numeric' ? (
         latest ? (
           <TelemetryNumericLabel
             value={toDisplayTemp(latest.value)}
@@ -543,7 +556,16 @@ const TelemetryGraphWidget: React.FC<TelemetryGraphWidgetProps> = ({
 };
 
 const TelemetryGraphs: React.FC<TelemetryGraphsProps> = React.memo(
-  ({ nodeId, temperatureUnit = 'C', telemetryHours = 24, baseUrl = '', showTimeRangeSelector = false }) => {
+  ({
+    nodeId,
+    temperatureUnit = 'C',
+    telemetryHours = 24,
+    baseUrl = '',
+    sourceId: sourceIdProp,
+    labelOverrides,
+    readOnly = false,
+    showTimeRangeSelector = false,
+  }) => {
     const { t } = useTranslation();
     const csrfFetch = useCsrfFetch();
     const { showToast } = useToast();
@@ -554,11 +576,12 @@ const TelemetryGraphs: React.FC<TelemetryGraphsProps> = React.memo(
     // anySource is the closest mirror of "holds settings:write somewhere",
     // matching the general unscoped gate used elsewhere in this component tree.
     const canEditSettings = hasPermission('settings', 'write', { anySource: true });
-    const { sourceId } = useSource();
+    const { sourceId: contextSourceId } = useSource();
     // The telemetry endpoints require a sourceId; mirror useTelemetry's
     // fallback so purge targets the same source the charts read (#4963).
     const fallbackSourceId = useResolvedSourceId();
-    const effectiveSourceId = sourceId ?? fallbackSourceId;
+    const effectiveSourceId = sourceIdProp ?? contextSourceId ?? fallbackSourceId;
+    const sourceId = effectiveSourceId;
     const [openMenu, setOpenMenu] = useState<string | null>(null);
     const [menuPosition, setMenuPosition] = useState<{
       x: number;
@@ -586,6 +609,17 @@ const TelemetryGraphs: React.FC<TelemetryGraphsProps> = React.memo(
     });
 
     const effectiveHours = showTimeRangeSelector ? selectedHours : telemetryHours;
+    // Sub-hour windows (e.g. the 15-minute preset) read awkwardly as
+    // fractional hours, so render those with a minutes-based title instead.
+    // Compute this before handling loading/empty/error states so the header
+    // and range selector never disappear while a different window is loaded.
+    const titleText = effectiveHours < 1
+      ? t('telemetry.title_minutes', { count: Math.round(effectiveHours * 60) })
+      : t('telemetry.title', { count: effectiveHours });
+    const getDisplayLabel = useCallback(
+      (type: string) => labelOverrides?.[type]?.trim() || getTelemetryLabel(type),
+      [labelOverrides],
+    );
 
     const handleSelectRange = useCallback((hours: number) => {
       setSelectedHours(hours);
@@ -600,6 +634,7 @@ const TelemetryGraphs: React.FC<TelemetryGraphsProps> = React.memo(
     const {
       data: telemetryData = [],
       isLoading: loading,
+      isFetching: refreshing,
       error: telemetryError,
       refetch: refetchTelemetry,
     } = useTelemetry({
@@ -973,22 +1008,6 @@ const TelemetryGraphs: React.FC<TelemetryGraphsProps> = React.memo(
       return colors[type] || '#8884d8';
     };
 
-    if (loading) {
-      return <div className="telemetry-loading">{t('telemetry.loading')}</div>;
-    }
-
-    if (error) {
-      return (
-        <div className="telemetry-empty" style={{ color: '#f38ba8' }}>
-          {t('common.error')}: {error}
-        </div>
-      );
-    }
-
-    if (telemetryData.length === 0) {
-      return <div className="telemetry-empty">{t('telemetry.no_data')}</div>;
-    }
-
     const groupedData = groupByType(telemetryData);
 
     // Calculate global time range across all telemetry data (excluding solar)
@@ -1047,7 +1066,7 @@ const TelemetryGraphs: React.FC<TelemetryGraphsProps> = React.memo(
       // telemetry update, making it hard to track a specific graph. New
       // metrics now slot into their alphabetical position instead of jumping
       // around.
-      .sort(([typeA], [typeB]) => compareTelemetryGraphs(typeA, typeB, favorites, getTelemetryLabel));
+      .sort(([typeA], [typeB]) => compareTelemetryGraphs(typeA, typeB, favorites, getDisplayLabel));
 
     // Group by category (#4930) so weather graphs sit next to weather
     // graphs, power next to power, and so on. `Favorites` is a pinned
@@ -1072,37 +1091,60 @@ const TelemetryGraphs: React.FC<TelemetryGraphsProps> = React.memo(
       sectionedData.push({ category: cat, entries });
     }
 
-    // Sub-hour windows (e.g. the 15-minute preset) read awkwardly as
-    // fractional hours, so render those with a minutes-based title instead.
-    const titleText = effectiveHours < 1
-      ? t('telemetry.title_minutes', { count: Math.round(effectiveHours * 60) })
-      : t('telemetry.title', { count: effectiveHours });
-
     return (
       <div className="telemetry-graphs">
         <div className="telemetry-graphs-header">
           <h3 className="telemetry-title">{titleText}</h3>
           {showTimeRangeSelector && (
-            <div
-              className="telemetry-range-selector"
-              role="group"
-              aria-label={t('telemetry.time_range')}
-            >
-              {TELEMETRY_RANGE_PRESETS.map(preset => (
-                <button
-                  key={preset.label}
-                  type="button"
-                  className={`telemetry-range-btn ${effectiveHours === preset.hours ? 'active' : ''}`}
-                  onClick={() => handleSelectRange(preset.hours)}
-                  aria-pressed={effectiveHours === preset.hours}
-                >
-                  {preset.label}
-                </button>
-              ))}
+            <div className="telemetry-graphs-controls">
+              <div
+                className="telemetry-range-selector"
+                role="group"
+                aria-label={t('telemetry.time_range')}
+              >
+                {TELEMETRY_RANGE_PRESETS.map(preset => (
+                  <button
+                    key={preset.label}
+                    type="button"
+                    className={`telemetry-range-btn ${effectiveHours === preset.hours ? 'active' : ''}`}
+                    onClick={() => handleSelectRange(preset.hours)}
+                    aria-pressed={effectiveHours === preset.hours}
+                  >
+                    {preset.label}
+                  </button>
+                ))}
+              </div>
+              <button
+                type="button"
+                className="telemetry-range-btn telemetry-refresh-btn"
+                onClick={() => void refetchTelemetry()}
+                disabled={refreshing}
+                aria-busy={refreshing}
+                title={t('common.refresh')}
+              >
+                <UiIcon
+                  name="refresh"
+                  size={14}
+                  className={refreshing ? 'telemetry-refresh-icon spinning' : 'telemetry-refresh-icon'}
+                />
+                {t('common.refresh')}
+              </button>
             </div>
           )}
         </div>
-        {sectionedData.map(({ category, entries }) => (
+        {loading ? (
+          <div className="telemetry-loading" role="status">{t('telemetry.loading')}</div>
+        ) : error ? (
+          <div className="telemetry-empty" role="alert" style={{ color: '#f38ba8' }}>
+            {t('common.error')}: {error}
+          </div>
+        ) : telemetryData.length === 0 ? (
+          <div className="telemetry-empty" role="status">
+            {showTimeRangeSelector ? t('telemetry.no_data_in_range') : t('telemetry.no_data')}
+          </div>
+        ) : (
+          <>
+          {sectionedData.map(({ category, entries }) => (
           <section
             key={category}
             className="telemetry-category"
@@ -1138,18 +1180,21 @@ const TelemetryGraphs: React.FC<TelemetryGraphsProps> = React.memo(
                   menuPosition={menuPosition}
                   handlePurgeData={handlePurgeData}
                   chartColors={chartColors}
-                  getTelemetryLabel={getTelemetryLabel}
+                  getTelemetryLabel={getDisplayLabel}
                   getColor={getColor}
                   prepareChartData={prepareChartData}
                   timeFormat={timeFormat}
                   hours={effectiveHours}
                   t={t as (key: string, opts?: Record<string, unknown>) => string}
                   canEditSettings={canEditSettings}
+                  readOnly={readOnly}
                 />
               ))}
             </div>
           </section>
-        ))}
+          ))}
+          </>
+        )}
       </div>
     );
   }
